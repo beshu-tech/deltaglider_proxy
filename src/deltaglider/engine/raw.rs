@@ -83,6 +83,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     pub async fn put_delta_raw(
         &self,
+        _ticket: &crate::transfer::CommitTicket,
         lock: &super::conditional::ObjectWriteGuard,
         bucket: &str,
         prefix: &str,
@@ -135,6 +136,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// the write goes through. Outside it, multi-instance refuses.
     pub async fn put_reference_raw(
         &self,
+        _ticket: &crate::transfer::CommitTicket,
         bucket: &str,
         prefix: &str,
         body: crate::storage::PutBody<'_>,

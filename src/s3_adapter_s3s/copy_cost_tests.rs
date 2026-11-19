@@ -116,6 +116,12 @@ impl Fixture {
         copy::copy_object(&self.svc, request(copy_input(source, dest, replace))).await
     }
 
+    /// A write count as a request holds it: the copies below run under one.
+    fn counted() -> Arc<crate::maintenance::gate::CommitCount> {
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        Arc::new(gate.begin_write("b").commit_count())
+    }
+
     /// The same copy through the store (the path every copy took before).
     async fn copy_through_store(&self, source: (&str, &str), dest: (&str, &str)) {
         let engine = self.state.engine.load();
@@ -130,6 +136,7 @@ impl Fixture {
             "COPY",
             &head,
             &precondition,
+            Some(Fixture::counted()),
         )
         .await
         .unwrap();
@@ -473,6 +480,7 @@ async fn a_source_that_changes_under_a_fast_copy_answers_slowdown() {
             content_type: None,
             user_metadata: Default::default(),
             precondition: &precondition,
+            commit: Some(Fixture::counted()),
         },
     )
     .await
@@ -736,6 +744,7 @@ async fn a_source_that_changes_under_a_server_side_copy_answers_slowdown() {
                 content_type: None,
                 user_metadata: Default::default(),
                 precondition: &precondition,
+                commit: Some(Fixture::counted()),
             },
         )
         .await
@@ -824,4 +833,73 @@ async fn a_large_reference_object_copies_from_one_verified_spool_file() {
         .count();
     assert_eq!(reference_gets, 1, "{:#?}", fake.requests());
     assert_eq!(engine.retrieve("c2", "x/a.zip").await.unwrap().0, body);
+}
+
+/// D1 (6b): a client CopyObject whose request is dropped while its write is
+/// in flight keeps the bucket's write count until the write returns; a
+/// drain that starts meanwhile returns only after the write landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_client_copy_keeps_its_write_count_until_its_write_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = crate::storage::FaultyFs::new(
+        crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let faults = faulty.faults.clone();
+    let f = Fixture::new(
+        DynStorageBackend::new_box(faulty),
+        crate::config::Config::default(),
+    )
+    .await;
+    let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let hook_release = release.clone();
+    faults.hook(
+        crate::storage::FaultPoint::PutDelta,
+        "c1/run/copy.zip",
+        Arc::new(move || {
+            let r = hook_release.clone();
+            futures::FutureExt::boxed(async move { r.notified().await })
+        }),
+    );
+    let mut req = request(copy_input(("b", &f.keys[1]), ("c1", "run/copy.zip"), None));
+    req.extensions
+        .insert(crate::maintenance::gate::RequestWriteCount::admitted_for_test(&gate, "c1"));
+    let cut = tokio::time::timeout(
+        std::time::Duration::from_millis(800),
+        copy::copy_object(&f.svc, req),
+    )
+    .await;
+    assert!(cut.is_err(), "the copy must still wait for its write");
+    assert!(
+        faults.fired(crate::storage::FaultPoint::PutDelta, "c1/run/copy.zip") > 0,
+        "the copy never reached its write"
+    );
+    assert!(
+        gate.inflight_writes("c1") > 0,
+        "the count ended while the write was still pending"
+    );
+    let drain_gate = gate.clone();
+    let drain = tokio::spawn(async move {
+        crate::maintenance::worker::drain_inflight_writes_within(
+            &drain_gate,
+            "c1",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!drain.is_finished(), "the drain returned before the write");
+    assert!(f.engine().head("c1", "run/copy.zip").await.is_err());
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), drain)
+        .await
+        .expect("the drain ends once the write landed")
+        .unwrap()
+        .expect("drained");
+    assert!(
+        f.engine().head("c1", "run/copy.zip").await.is_ok(),
+        "the write landed whole"
+    );
 }

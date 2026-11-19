@@ -93,6 +93,8 @@ pub(super) async fn copy_object(
         &dest_metadata,
         source_meta.file_size,
     );
+    // Taken here: the commit's second count covers the write, not the reads.
+    let commit = crate::maintenance::gate::request_commit_count(&req.extensions);
     let as_stored = source_meta.is_delta() == tries_delta
         && (source_meta.is_delta()
             || matches!(
@@ -114,6 +116,7 @@ pub(super) async fn copy_object(
             content_type,
             user_metadata,
             precondition: &precondition,
+            commit: commit.clone(),
         };
         if tries_delta {
             crate::api::handlers::object_helpers::store_client_delta_copy(&svc.state, copy).await?
@@ -134,6 +137,7 @@ pub(super) async fn copy_object(
                 directive,
                 &source_meta,
                 &precondition,
+                commit,
             )
             .await?
         }
@@ -152,6 +156,7 @@ pub(super) async fn copy_object(
 
 /// A CopyObject through the store: read (and reconstruct) the source, then
 /// store it as a client write of the destination.
+#[allow(clippy::too_many_arguments)]
 async fn copy_through_store(
     svc: &DeltaGliderS3Service,
     engine: &crate::deltaglider::DynEngine,
@@ -160,6 +165,7 @@ async fn copy_through_store(
     directive: &str,
     source_meta: &FileMetadata,
     precondition: &crate::deltaglider::Precondition,
+    commit: Option<Arc<crate::maintenance::gate::CommitCount>>,
 ) -> s3s::S3Result<crate::types::StoreResult> {
     let (body, metadata) = read_copy_source(
         engine,
@@ -188,6 +194,7 @@ async fn copy_through_store(
             user_metadata,
             precondition,
             early_quota: None,
+            commit,
         },
     )
     .await?)

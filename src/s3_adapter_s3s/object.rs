@@ -563,6 +563,8 @@ pub(super) async fn put_object(
         input.content_md5.as_deref(),
     )
     .await?;
+    // Taken after the body is read: the commit's second count covers the write only.
+    let commit = crate::maintenance::gate::request_commit_count(&req.extensions);
     let result = crate::api::handlers::object_helpers::store_client_write(
         &svc.state,
         crate::api::handlers::object_helpers::ClientWrite {
@@ -576,6 +578,7 @@ pub(super) async fn put_object(
                 if_none_match: input.if_none_match,
             },
             early_quota: Some(early_quota),
+            commit,
         },
     )
     .await?;

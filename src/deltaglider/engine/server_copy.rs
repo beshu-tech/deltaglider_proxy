@@ -21,8 +21,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// the object as it is (no delta). `lock`: the destination's write
     /// lock. `prior`: what the destination key holds, when the caller read
     /// it (`None`: read here).
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_passthrough_within(
         &self,
+        _ticket: &crate::transfer::CommitTicket,
         lock: &super::conditional::ObjectWriteGuard,
         src: (&str, &str),
         dst: (&str, &str),

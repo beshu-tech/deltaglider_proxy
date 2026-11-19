@@ -562,6 +562,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     pub async fn store_known_prior(
         &self,
+        _ticket: &crate::transfer::CommitTicket,
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
@@ -2229,6 +2230,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// same guard covers a drop during the Complete request.
     pub async fn finish_passthrough_multipart(
         &self,
+        _ticket: &crate::transfer::CommitTicket,
         lock: &ObjectWriteGuard,
         handle: &PassthroughMultipartHandle,
         mut parts: Vec<UploadedPart>,
@@ -2876,6 +2878,7 @@ mod delta_ceiling_tests {
             .unwrap();
             engine
                 .store_conditional(
+                    &crate::transfer::CommitTicket::for_test(),
                     "b",
                     key,
                     body,
@@ -3232,6 +3235,7 @@ mod review2_tests {
         assert_eq!(engine.spool.free_mib(), 0, "the rest of the spool is taken");
         engine
             .store_conditional(
+                &crate::transfer::CommitTicket::for_test(),
                 "b",
                 "x/a.png",
                 body,

@@ -206,11 +206,22 @@ pub(crate) type CopyLock = Arc<crate::deltaglider::ObjectWriteGuard>;
 /// - delta fast path seed + ship (`delta_passthrough_copy`)
 /// - stripped-delta heal re-PUT (`heal_stripped_dest_delta`)
 /// - spooled store (`spooled_copy`)
-pub(crate) async fn detached_commit<T: Send + 'static>(
+/// - a client CopyObject and PutObject store, and the client server-side copy
+///   (`store_client_write`, `store_client_server_copy`)
+/// - every backend DELETE of a delete batch (`counted_delete` in the engine)
+///
+/// The engine's commit entry points take the [`CommitTicket`] that only this
+/// helper makes.
+pub(crate) async fn detached_commit<T, F>(
     count: Option<Arc<crate::maintenance::gate::CommitCount>>,
     pin: Option<chrono::DateTime<chrono::Utc>>,
-    commit: futures::future::BoxFuture<'static, T>,
-) -> T {
+    commit: F,
+) -> T
+where
+    T: Send + 'static,
+    F: FnOnce(CommitTicket) -> futures::future::BoxFuture<'static, T>,
+{
+    let commit = commit(CommitTicket(()));
     let pinned = async move {
         match pin {
             Some(at) => crate::types::with_created_at(at, commit).await,
@@ -228,6 +239,30 @@ pub(crate) async fn detached_commit<T: Send + 'static>(
         Ok(out) => out,
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         Err(e) => panic!("a copy's commit task ended without a result: {e}"),
+    }
+}
+
+/// [`detached_commit`] for a writer that holds no maintenance count and
+/// need not outlive its caller (the CLI, a test): runs `commit` inline with
+/// its ticket.
+pub(crate) async fn inline_commit<T, Fut>(commit: impl FnOnce(CommitTicket) -> Fut) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    commit(CommitTicket(())).await
+}
+
+/// Proof that a final write runs inside [`detached_commit`]: only it makes
+/// one. The engine's commit entry points take it, so a commit point that
+/// skips the helper (and its write count) does not compile.
+#[derive(Debug)]
+pub struct CommitTicket(());
+
+#[cfg(test)]
+impl CommitTicket {
+    /// For a test that calls a commit entry point directly.
+    pub(crate) fn for_test() -> Self {
+        Self(())
     }
 }
 
@@ -339,6 +374,11 @@ pub(crate) mod admitted {
         hooks: DeleteHooks<'_>,
     ) -> Vec<DeleteOutcome> {
         check(proof, bucket);
+        let count = Arc::new(proof.commit_count());
+        let hooks = DeleteHooks {
+            count: Some(&count),
+            ..hooks
+        };
         engine.delete_batch(bucket, items, hooks).await
     }
 }
@@ -583,7 +623,7 @@ async fn copy_object_once(
         source_head.file_size,
     ) {
         if let Some(shipped) =
-            delta_passthrough_copy(engine, lock, request, source_head, prior, fields).await?
+            delta_passthrough_copy(engine, lock, request, source_head, prior, fields, true).await?
         {
             return Ok(shipped.outcome);
         }
@@ -648,22 +688,25 @@ async fn copy_object_once(
         detached_commit(
             request.commit_count.cloned(),
             pin_of(&request, source_head),
-            async move {
-                engine
-                    .store_known_prior(
-                        &lock,
-                        &bucket,
-                        &key,
-                        // The retrieved Vec moves into the body: no copy.
-                        &Bytes::from(data),
-                        content_type,
-                        user_metadata,
-                        etag,
-                        prior,
-                    )
-                    .await
-            }
-            .boxed(),
+            move |ticket| {
+                async move {
+                    engine
+                        .store_known_prior(
+                            &ticket,
+                            &lock,
+                            &bucket,
+                            &key,
+                            // The retrieved Vec moves into the body: no copy.
+                            &Bytes::from(data),
+                            content_type,
+                            user_metadata,
+                            etag,
+                            prior,
+                        )
+                        .await
+                }
+                .boxed()
+            },
         )
         .await
         .map_err(|e| CopyError::engine("destination store failed", e))?
@@ -861,22 +904,24 @@ async fn stream_copy_passthrough(
         detached_commit(
             request.commit_count.cloned(),
             pin_of(&request, source_head),
-            async move {
-                match engine
-                    .finish_passthrough_multipart(&lock, &handle, parts, assembled)
-                    .await
-                {
-                    Ok(result) => {
-                        abort_guard.disarm();
-                        Ok(result)
-                    }
-                    Err(e) => {
-                        abort_guard.abort().await;
-                        Err(e)
+            move |ticket| {
+                async move {
+                    match engine
+                        .finish_passthrough_multipart(&ticket, &lock, &handle, parts, assembled)
+                        .await
+                    {
+                        Ok(result) => {
+                            abort_guard.disarm();
+                            Ok(result)
+                        }
+                        Err(e) => {
+                            abort_guard.abort().await;
+                            Err(e)
+                        }
                     }
                 }
-            }
-            .boxed(),
+                .boxed()
+            },
         )
         .await
     };
@@ -1677,12 +1722,22 @@ async fn server_side_copy(
         detached_commit(
             request.commit_count.cloned(),
             pin_of(&request, source_head),
-            async move {
-                engine
-                    .copy_passthrough_within(&lock, (&sb, &sk), (&db, &dk), &head, metadata, prior)
-                    .await
-            }
-            .boxed(),
+            move |ticket| {
+                async move {
+                    engine
+                        .copy_passthrough_within(
+                            &ticket,
+                            &lock,
+                            (&sb, &sk),
+                            (&db, &dk),
+                            &head,
+                            metadata,
+                            prior,
+                        )
+                        .await
+                }
+                .boxed()
+            },
         )
         .await
         .map_err(|e| CopyError::engine("server-side copy failed", e))?
@@ -1715,6 +1770,7 @@ pub(crate) struct ShippedDelta {
 /// CopyObject answers a single-part ETag). `Ok(None)`: the gate fell back,
 /// the caller copies through the store. The caller holds the object's
 /// write lock (`lock`) and ran the quota gate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn client_delta_copy(
     engine: &Arc<DynEngine>,
     lock: &CopyLock,
@@ -1723,6 +1779,7 @@ pub(crate) async fn client_delta_copy(
     source_head: &crate::types::FileMetadata,
     content_type: Option<String>,
     mut user_metadata: std::collections::HashMap<String, String>,
+    commit_count: Option<&Arc<crate::maintenance::gate::CommitCount>>,
 ) -> Result<Option<crate::types::StoreResult>, CopyError> {
     strip_rule_provenance(&mut user_metadata);
     let request = ObjectTransferRequest {
@@ -1735,7 +1792,7 @@ pub(crate) async fn client_delta_copy(
         operation: "client copy",
         upload_concurrency: None,
         keep_created_at: false,
-        commit_count: None,
+        commit_count,
     };
     let fields = DestinationFields {
         content_type,
@@ -1744,7 +1801,7 @@ pub(crate) async fn client_delta_copy(
         passthrough_reason: None,
     };
     let Some(shipped) =
-        delta_passthrough_copy(engine, lock, request, source_head, None, fields).await?
+        delta_passthrough_copy(engine, lock, request, source_head, None, fields, false).await?
     else {
         return Ok(None);
     };
@@ -1804,6 +1861,9 @@ async fn delta_passthrough_copy(
     source_head: &crate::types::FileMetadata,
     known_prior: Option<&crate::deltaglider::CounterPrior>,
     fields: DestinationFields,
+    // Read the source before the commit task (background copies: a cut
+    // cancels the reads). A client copy reads inside it: no extra request.
+    read_ahead: bool,
 ) -> Result<Option<ShippedDelta>, CopyError> {
     use crate::types::{ObjectKey, StorageInfo};
 
@@ -1909,7 +1969,7 @@ async fn delta_passthrough_copy(
     // the commit, so a caller cut still cancels the reads; a pre-lock gate on
     // the destination reference says whether the seed bytes are needed. An
     // inline commit (no count) reads inside it, after the locked gate.
-    let pre_read = if request.commit_count.is_some() {
+    let pre_read = if read_ahead && request.commit_count.is_some() {
         let pre_ref = match engine
             .reference_meta(request.destination_bucket, &dest_prefix)
             .await
@@ -1952,98 +2012,101 @@ async fn delta_passthrough_copy(
     let ship_bucket = counter_dest_bucket.clone();
     let ship_prefix = dest_prefix.clone();
     let pin = pin_of(&request, source_head);
-    let shipped: Result<Option<u64>, CopyError> = detached_commit(
-        request.commit_count.cloned(),
-        pin,
-        async move {
-            let lock = &ship_lock;
-            ship_engine
-                .with_dest_prefix_lock(&ship_bucket, &ship_prefix, || async move {
-                    // Re-read the dest reference UNDER the lock and re-run the SAME pure
-                    // gate — identical sha + enc precedence to the first read. A read
-                    // that fails is not "no reference": seeding on it would overwrite
-                    // a live reference.bin. Fall back to reconstruct + store, which
-                    // surfaces the backend error itself.
-                    let dest_ref = match engine2.reference_meta(&dest_bucket, &dest_prefix2).await {
-                        Ok(meta) => meta.map(|m| DestRefFacts {
-                            file_sha256: m.file_sha256.clone(),
-                            enc: enc_fingerprint(&m),
-                        }),
-                        Err(_) => return Ok(None),
-                    };
-                    let decision = can_delta_passthrough(&src, dest_ref.as_ref());
-                    if matches!(decision, DeltaPassthroughDecision::Fallback { .. }) {
-                        return Ok(None);
-                    }
-                    let seed = decision == DeltaPassthroughDecision::SeedThenShip;
-                    let (delta_bytes, seed_source) = match pre_read {
-                        Some(read) => read,
-                        None => match read_fast_path_source(
-                            &engine2,
-                            &src_bucket2,
-                            &src_prefix2,
-                            &src_filename2,
-                            &meta_generation2,
-                            &src.ref_sha256,
-                            seed,
-                        )
-                        .await?
-                        {
-                            Some(read) => read,
-                            None => return Ok(None),
-                        },
-                    };
-                    let mut seeded = 0;
-                    if seed {
-                        // The seed moves the reference through the proxy and writes
-                        // it with the fenced PUT. A server-side copy is NOT used:
-                        // the seed must be create-only, and MinIO/silo ignores
-                        // `If-None-Match: *` on CopyObject (verified 2026-10-13: the
-                        // copy overwrote an existing key and answered 200), so a
-                        // conditional copy cannot stand in for the fenced write.
-                        // The reference was asserted to match src.ref_sha256
-                        // (defense layer 2). One that vanished from the destination
-                        // since a pre-lock read was not read: fall back.
-                        let Some((ref_data, ref_meta)) = seed_source else {
+    let shipped: Result<Option<u64>, CopyError> =
+        detached_commit(request.commit_count.cloned(), pin, move |ticket| {
+            async move {
+                let ticket = &ticket;
+                let lock = &ship_lock;
+                ship_engine
+                    .with_dest_prefix_lock(&ship_bucket, &ship_prefix, || async move {
+                        // Re-read the dest reference UNDER the lock and re-run the SAME pure
+                        // gate — identical sha + enc precedence to the first read. A read
+                        // that fails is not "no reference": seeding on it would overwrite
+                        // a live reference.bin. Fall back to reconstruct + store, which
+                        // surfaces the backend error itself.
+                        let dest_ref =
+                            match engine2.reference_meta(&dest_bucket, &dest_prefix2).await {
+                                Ok(meta) => meta.map(|m| DestRefFacts {
+                                    file_sha256: m.file_sha256.clone(),
+                                    enc: enc_fingerprint(&m),
+                                }),
+                                Err(_) => return Ok(None),
+                            };
+                        let decision = can_delta_passthrough(&src, dest_ref.as_ref());
+                        if matches!(decision, DeltaPassthroughDecision::Fallback { .. }) {
                             return Ok(None);
+                        }
+                        let seed = decision == DeltaPassthroughDecision::SeedThenShip;
+                        let (delta_bytes, seed_source) = match pre_read {
+                            Some(read) => read,
+                            None => match read_fast_path_source(
+                                &engine2,
+                                &src_bucket2,
+                                &src_prefix2,
+                                &src_filename2,
+                                &meta_generation2,
+                                &src.ref_sha256,
+                                seed,
+                            )
+                            .await?
+                            {
+                                Some(read) => read,
+                                None => return Ok(None),
+                            },
                         };
-                        // The bytes, not the recorded size: a reference that records
-                        // none (`0`) still counts its real size (#187).
-                        let ref_len = ref_data.len() as u64;
+                        let mut seeded = 0;
+                        if seed {
+                            // The seed moves the reference through the proxy and writes
+                            // it with the fenced PUT. A server-side copy is NOT used:
+                            // the seed must be create-only, and MinIO/silo ignores
+                            // `If-None-Match: *` on CopyObject (verified 2026-10-13: the
+                            // copy overwrote an existing key and answered 200), so a
+                            // conditional copy cannot stand in for the fenced write.
+                            // The reference was asserted to match src.ref_sha256
+                            // (defense layer 2). One that vanished from the destination
+                            // since a pre-lock read was not read: fall back.
+                            let Some((ref_data, ref_meta)) = seed_source else {
+                                return Ok(None);
+                            };
+                            // The bytes, not the recorded size: a reference that records
+                            // none (`0`) still counts its real size (#187).
+                            let ref_len = ref_data.len() as u64;
+                            engine2
+                                .put_reference_raw(
+                                    ticket,
+                                    &dest_bucket,
+                                    &dest_prefix2,
+                                    crate::storage::PutBody::Bytes(Bytes::from(ref_data)),
+                                    &ref_meta,
+                                )
+                                .await?;
+                            // Counted at its write: a ship that fails below leaves it.
+                            engine2.record_seeded_reference(&dest_bucket, ref_len);
+                            seeded = ref_len;
+                        }
                         engine2
-                            .put_reference_raw(
+                            .put_delta_raw(
+                                ticket,
+                                lock,
                                 &dest_bucket,
                                 &dest_prefix2,
-                                crate::storage::PutBody::Bytes(Bytes::from(ref_data)),
-                                &ref_meta,
+                                &dest_filename2,
+                                crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
+                                &meta,
+                                &counter_prior,
                             )
                             .await?;
-                        // Counted at its write: a ship that fails below leaves it.
-                        engine2.record_seeded_reference(&dest_bucket, ref_len);
-                        seeded = ref_len;
-                    }
-                    engine2
-                        .put_delta_raw(
-                            lock,
-                            &dest_bucket,
-                            &dest_prefix2,
-                            &dest_filename2,
-                            crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
-                            &meta,
-                            &counter_prior,
-                        )
-                        .await?;
-                    // The fast path bypasses the engine's store, so it records its
-                    // commit itself, at the commit (before the next await): the
-                    // delta, overwrite-aware.
-                    engine2.record_fast_path_copy(lock, &dest_bucket, &counter_prior, &meta, 0);
-                    Ok(Some(seeded))
-                })
-                .await
-        }
-        .boxed(),
-    )
-    .await;
+                        // The fast path bypasses the engine's store, so it records its
+                        // commit itself, at the commit (before the next await): the
+                        // delta, overwrite-aware.
+                        engine2.record_fast_path_copy(lock, &dest_bucket, &counter_prior, &meta, 0);
+                        Ok(Some(seeded))
+                    })
+                    .await
+            }
+            .boxed()
+        })
+        .await;
     let Some(seeded_reference_bytes) = shipped? else {
         return Ok(None);
     };
@@ -2123,10 +2186,9 @@ async fn heal_stripped_dest_delta(
     // Re-assert the stripped signature INSIDE the lock: if the object changed since
     // the pre-check, another writer already re-stamped it — nothing to heal.
     // A commit point: it runs counted and detached, like the copy's other writes.
-    detached_commit(
-        request.commit_count.cloned(),
-        pin,
+    detached_commit(request.commit_count.cloned(), pin, move |ticket| {
         async move {
+            let ticket = &ticket;
             let (bucket, key) = (&bucket, &key);
             let (lock, meta) = (&lock, &meta);
             engine
@@ -2148,6 +2210,7 @@ async fn heal_stripped_dest_delta(
                     };
                     match engine
                         .put_delta_raw(
+                            ticket,
                             lock,
                             bucket,
                             &dest_key.prefix,
@@ -2170,8 +2233,8 @@ async fn heal_stripped_dest_delta(
                 })
                 .await;
         }
-        .boxed(),
-    )
+        .boxed()
+    })
     .await;
 }
 
@@ -2285,20 +2348,23 @@ async fn spooled_copy(
         detached_commit(
             request.commit_count.cloned(),
             pin_of(request, source_head),
-            async move {
-                engine
-                    .store_ingested(
-                        &lock,
-                        &bucket,
-                        &key,
-                        body,
-                        content_type,
-                        user_metadata,
-                        etag,
-                    )
-                    .await
-            }
-            .boxed(),
+            move |ticket| {
+                async move {
+                    engine
+                        .store_ingested(
+                            &ticket,
+                            &lock,
+                            &bucket,
+                            &key,
+                            body,
+                            content_type,
+                            user_metadata,
+                            etag,
+                        )
+                        .await
+                }
+                .boxed()
+            },
         )
         .await
         .map_err(|e| CopyError::engine("destination spooled store failed", e))?
@@ -2606,6 +2672,7 @@ mod tests {
             &stale_head,
             None,
             DestinationFields::of_transfer(&request, &stale_head),
+            true,
         )
         .await;
         match result {
@@ -2636,6 +2703,7 @@ mod tests {
             &fresh_head,
             None,
             DestinationFields::of_transfer(&request, &fresh_head),
+            true,
         )
         .await
         .expect("fresh HEAD must not error");
@@ -2729,6 +2797,7 @@ mod tests {
             &head,
             None,
             DestinationFields::of_transfer(&request, &head),
+            true,
         )
         .await;
         faults.disarm_all();
@@ -2914,7 +2983,7 @@ mod tests {
                     .await,
             );
             let fields = DestinationFields::of_transfer(&request, &head);
-            delta_passthrough_copy(&eng, &lock, request, &head, None, fields).await
+            delta_passthrough_copy(&eng, &lock, request, &head, None, fields, true).await
         };
         let cut = tokio::time::timeout(std::time::Duration::from_millis(500), copy).await;
         assert!(
@@ -4637,5 +4706,91 @@ mod request_count_tests {
         // A PUT or a server-side copy (also a PUT request).
         let puts = count(&fake, "PUT /dst/");
         assert!(puts <= 3, "{puts} writes for one throttled copy");
+    }
+}
+
+/// D1 (6b): a background delete whose run is dropped keeps the write count
+/// until its DELETE returns.
+#[cfg(test)]
+mod counted_delete_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::{DeleteItem, DeltaGliderEngine};
+    use crate::storage::DynStorageBackend;
+    use futures::FutureExt;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_background_delete_keeps_its_write_count_until_the_delete_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let faulty = crate::storage::FaultyFs::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let faults = faulty.faults.clone();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        engine.create_bucket("dst").await.unwrap();
+        engine
+            .store("dst", "p/k.jpg", &[7u8; 64], None, Default::default())
+            .await
+            .unwrap();
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        let admitted =
+            crate::maintenance::gate::admit_all(Some(&gate), &["dst"]).expect("admitted");
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hook_release = release.clone();
+        faults.hook(
+            crate::storage::FaultPoint::DeletePassthrough,
+            "dst/p/k.jpg",
+            Arc::new(move || {
+                let r = hook_release.clone();
+                async move { r.notified().await }.boxed()
+            }),
+        );
+        let cut = tokio::time::timeout(
+            Duration::from_millis(800),
+            admitted::delete_batch(
+                &admitted,
+                &engine,
+                "dst",
+                vec![DeleteItem::new("p/k.jpg")],
+                Default::default(),
+            ),
+        )
+        .await;
+        assert!(cut.is_err(), "the delete must still wait");
+        drop(admitted);
+        assert!(
+            faults.fired(crate::storage::FaultPoint::DeletePassthrough, "dst/p/k.jpg") > 0,
+            "the delete never reached the backend"
+        );
+        assert!(
+            gate.inflight_background_writes("dst") > 0,
+            "the count ended while the DELETE was still pending"
+        );
+        let drain_gate = gate.clone();
+        let drain = tokio::spawn(async move {
+            crate::maintenance::worker::drain_inflight_writes_within(
+                &drain_gate,
+                "dst",
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!drain.is_finished(), "the drain returned before the DELETE");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("the drain ends once the DELETE returned")
+            .unwrap()
+            .expect("drained");
+        assert!(engine.head("dst", "p/k.jpg").await.is_err(), "deleted");
     }
 }

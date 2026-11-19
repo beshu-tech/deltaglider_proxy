@@ -30,6 +30,7 @@ use super::AppState;
 use crate::api::errors::S3Error;
 use crate::event_outbox::NewEvent;
 use crate::storage::StorageError;
+use futures::FutureExt;
 use std::sync::Arc;
 
 /// Append a single object event to the outbox. Silently noops when
@@ -71,6 +72,10 @@ pub(crate) struct ClientWrite<'a> {
     /// The verdict of the quota gate that ran before the body was read
     /// (PutObject, form POST); `None` when none ran (CopyObject).
     pub early_quota: Option<QuotaVerdict>,
+    /// The request's write count: the store runs in its own task that holds
+    /// it, so a dropped request never ends the count before the write
+    /// returns. `None`: no count (form POST).
+    pub commit: Option<Arc<crate::maintenance::gate::CommitCount>>,
 }
 
 /// THE client write of a whole body: the quota gate on the body's exact
@@ -86,18 +91,27 @@ pub(crate) async fn store_client_write(
     if exact_quota_check_after_body(write.early_quota) {
         check_quota_for_write(state, write.bucket, write.key, size).await?;
     }
-    let result = state
-        .engine
-        .load()
-        .store_conditional(
-            write.bucket,
-            write.key,
-            write.body,
-            write.content_type,
-            write.user_metadata,
-            write.precondition,
-        )
-        .await?;
+    let engine = state.engine.load_full();
+    let (bucket, key) = (write.bucket.to_string(), write.key.to_string());
+    let (body, content_type, user_metadata) = (write.body, write.content_type, write.user_metadata);
+    let precondition = write.precondition.clone();
+    let result = crate::transfer::detached_commit(write.commit, None, move |ticket| {
+        async move {
+            engine
+                .store_conditional(
+                    &ticket,
+                    &bucket,
+                    &key,
+                    body,
+                    content_type,
+                    user_metadata,
+                    &precondition,
+                )
+                .await
+        }
+        .boxed()
+    })
+    .await?;
     object_created(state, write.bucket, write.key, size, &result).await;
     Ok(result)
 }
@@ -113,6 +127,8 @@ pub(crate) struct ClientStoredCopy<'a> {
     pub content_type: Option<String>,
     pub user_metadata: std::collections::HashMap<String, String>,
     pub precondition: &'a crate::deltaglider::Precondition,
+    /// The request's write count (see [`ClientWrite::commit`]).
+    pub commit: Option<Arc<crate::maintenance::gate::CommitCount>>,
 }
 
 /// [`store_client_write`] of a CopyObject whose source is a delta: the
@@ -144,6 +160,7 @@ pub(crate) async fn store_client_delta_copy(
             copy.source_head,
             copy.content_type,
             copy.user_metadata,
+            copy.commit.as_ref(),
         )
         .await
         .map_err(crate::transfer::CopyError::into_s3_error)?
@@ -191,22 +208,36 @@ pub(crate) async fn store_client_server_copy(
         let guard = engine
             .lock_and_check(copy.bucket, copy.key, copy.precondition)
             .await?;
-        engine
-            .copy_passthrough_within(
-                &guard,
-                copy.source,
-                (copy.bucket, copy.key),
-                copy.source_head,
-                metadata,
-                None,
-            )
-            .await
-            .map_err(|e| match e {
-                crate::deltaglider::EngineError::Storage(StorageError::PreconditionFailed(_)) => {
-                    S3Error::copy_source_changed()
-                }
-                e => e.into(),
-            })?
+        let guard = Arc::new(guard);
+        let (engine, lock) = (engine.clone(), guard.clone());
+        let (src, dst) = (
+            (copy.source.0.to_string(), copy.source.1.to_string()),
+            (copy.bucket.to_string(), copy.key.to_string()),
+        );
+        let head = copy.source_head.clone();
+        crate::transfer::detached_commit(copy.commit, None, move |ticket| {
+            async move {
+                engine
+                    .copy_passthrough_within(
+                        &ticket,
+                        &lock,
+                        (&src.0, &src.1),
+                        (&dst.0, &dst.1),
+                        &head,
+                        metadata,
+                        None,
+                    )
+                    .await
+            }
+            .boxed()
+        })
+        .await
+        .map_err(|e| match e {
+            crate::deltaglider::EngineError::Storage(StorageError::PreconditionFailed(_)) => {
+                S3Error::copy_source_changed()
+            }
+            e => e.into(),
+        })?
     };
     let Some(result) = result else {
         return Ok(None);
@@ -731,6 +762,7 @@ mod write_path_tests {
                 user_metadata: Default::default(),
                 precondition: &crate::deltaglider::Precondition::none(),
                 early_quota: None,
+                commit: None,
             },
         )
         .await

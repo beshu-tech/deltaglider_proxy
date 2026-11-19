@@ -327,10 +327,22 @@ async fn store_ingested(
     user_metadata: HashMap<String, String>,
 ) -> Result<StoreResult, TransferError> {
     let lock = engine.lock_object_write(bucket, key).await;
-    engine
-        .store_ingested(&lock, bucket, key, body, content_type, user_metadata, None)
-        .await
-        .map_err(TransferError::Dest)
+    crate::transfer::inline_commit(|ticket| async move {
+        engine
+            .store_ingested(
+                &ticket,
+                &lock,
+                bucket,
+                key,
+                body,
+                content_type,
+                user_metadata,
+                None,
+            )
+            .await
+    })
+    .await
+    .map_err(TransferError::Dest)
 }
 
 #[cfg(test)]

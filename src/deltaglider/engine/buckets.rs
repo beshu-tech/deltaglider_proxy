@@ -5,7 +5,7 @@
 use super::delete::ReferenceHint;
 use super::*;
 
-impl<S: StorageBackend> DeltaGliderEngine<S> {
+impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
     // === Bucket operations (delegate to storage) ===
 
     /// Make durable every object write that the storage deferred

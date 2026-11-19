@@ -204,6 +204,7 @@ async fn a_reference_write_records_its_body_length() {
                 Ok::<_, EngineError>(
                     engine
                         .put_reference_raw(
+                            &crate::transfer::CommitTicket::for_test(),
                             "releases",
                             "v1",
                             crate::storage::PutBody::Bytes(bytes::Bytes::copy_from_slice(body)),
@@ -241,6 +242,7 @@ async fn fast_path_seed_holds_the_lock() {
         .with_dest_prefix_lock("releases", "v1", || async {
             Ok(engine
                 .put_reference_raw(
+                    &crate::transfer::CommitTicket::for_test(),
                     "releases",
                     "v1",
                     crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
@@ -255,6 +257,7 @@ async fn fast_path_seed_holds_the_lock() {
     // Outside the scope, multi-instance refuses the raw write.
     assert!(engine
         .put_reference_raw(
+            &crate::transfer::CommitTicket::for_test(),
             "releases",
             "v1",
             crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
@@ -276,6 +279,7 @@ async fn fast_path_seed_holds_the_lock() {
     );
     let err = engine
         .put_delta_raw(
+            &crate::transfer::CommitTicket::for_test(),
             &engine.lock_object_write("releases", "v1/app.zip").await,
             "releases",
             "v1",

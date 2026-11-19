@@ -647,6 +647,9 @@ async fn run_copy_loop(
     // would leak the counter and wedge every later job on the bucket (H12).
     let write = gate.begin_write(&req.dest_bucket);
     let write = &write;
+    // Each commit holds this second count to its end, whatever becomes of
+    // this loop (the handler future is dropped when the browser closes).
+    let commit = &Arc::new(write.commit_count());
     let mut folders: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
     for (idx, it) in req.items.iter().enumerate() {
         let dk = dest_key(&req.dest_prefix, &it.relative);
@@ -693,6 +696,7 @@ async fn run_copy_loop(
                         Some(proof) => {
                             copy_one(
                                 proof,
+                                commit,
                                 s3,
                                 engine,
                                 (&req.source_bucket, &it.source_key),
@@ -808,6 +812,7 @@ async fn copy_one(
     // The proof of the caller's count of the destination bucket: a copy
     // runs only inside one.
     write: crate::maintenance::gate::DestWrite<'_>,
+    commit: &Arc<crate::maintenance::gate::CommitCount>,
     s3: &Arc<AppState>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     (src_bucket, src_key): (&str, &str),
@@ -843,7 +848,7 @@ async fn copy_one(
         operation: "admin bulk copy",
         upload_concurrency: None,
         keep_created_at: false,
-        commit_count: None,
+        commit_count: Some(commit),
     };
     // `no_overwrite`: the existence check runs inside the transfer's own
     // lock hold, so nothing can land between the check and the write.
@@ -1038,6 +1043,7 @@ async fn delete_moved_sources(
     // RAII drain slot — released on drop even if the handler future is
     // cancelled mid-loop (H12).
     let _write = gate.begin_write(source_bucket);
+    let count = Arc::new(_write.commit_count());
     let mut keys = Vec::new();
     let mut batch = Vec::new();
     for (it, source) in items.iter().zip(copied) {
@@ -1080,6 +1086,7 @@ async fn delete_moved_sources(
             DeleteHooks {
                 proceed: Some(&proceed),
                 on_outcome: Some(&emit),
+                count: Some(&count),
             },
         )
         .await;
@@ -1522,6 +1529,8 @@ pub(crate) async fn run_bulk_delete(
     // RAII drain slot — released on drop even if the handler future is
     // cancelled mid-loop (H12).
     let _write = gate.begin_write(bucket);
+    // Each backend DELETE holds this second count to its end.
+    let count = Arc::new(_write.commit_count());
     // Counted and reported under one lock, so the totals go out in order.
     let totals = std::sync::Mutex::new(DeleteProgress::default());
     let tally = |deleted: bool| {
@@ -1565,6 +1574,7 @@ pub(crate) async fn run_bulk_delete(
             DeleteHooks {
                 proceed: Some(&proceed),
                 on_outcome: Some(&emit),
+                count: Some(&count),
             },
         )
         .await;
@@ -2617,6 +2627,95 @@ mod tests {
                 "a copy that adds nothing was refused: {:?}",
                 res.failures
             );
+        }
+    }
+
+    /// D1 (6b): a bulk copy whose handler is dropped while its write is in
+    /// flight keeps the bucket's write count until the write returns.
+    mod bulk_copy_commit {
+        use super::super::{run_copy_loop, AdminObjectPath, BulkActor, BulkPlan, CopyItem};
+        use crate::api::handlers::AppState;
+        use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+        use crate::storage::DynStorageBackend;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_dropped_bulk_copy_keeps_its_write_count_until_its_write_lands() {
+            let dir = tempfile::tempdir().unwrap();
+            let faulty = crate::storage::FaultyFs::new(
+                crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let faults = faulty.faults.clone();
+            let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+            let engine: DynEngine = DeltaGliderEngine::new_with_backend(
+                Arc::new(backend),
+                &crate::config::Config::default(),
+                None,
+            );
+            for b in ["b", "dst"] {
+                engine.create_bucket(b).await.unwrap();
+            }
+            let keys = crate::deltaglider::store_deltas(&engine, "run", 3).await;
+            let registry = engine.bucket_policy_registry();
+            let plan = BulkPlan {
+                source_bucket: registry.client_bucket("b").unwrap(),
+                dest_bucket: registry.client_bucket("dst").unwrap(),
+                dest_prefix: AdminObjectPath::try_from("copy/".to_string()).unwrap(),
+                items: vec![CopyItem {
+                    source_key: AdminObjectPath::try_from(keys[1].clone()).unwrap(),
+                    relative: AdminObjectPath::try_from("x.zip".to_string()).unwrap(),
+                }],
+                no_overwrite: false,
+                in_place: Vec::new(),
+            };
+            let state = AppState::for_tests(engine);
+            let release = Arc::new(tokio::sync::Notify::new());
+            let hook_release = release.clone();
+            faults.hook(
+                crate::storage::FaultPoint::PutDelta,
+                "dst/copy/x.zip",
+                Arc::new(move || {
+                    let r = hook_release.clone();
+                    futures::FutureExt::boxed(async move { r.notified().await })
+                }),
+            );
+            let cut = tokio::time::timeout(
+                Duration::from_millis(800),
+                run_copy_loop(&state, &plan, &BulkActor::Unrestricted, false),
+            )
+            .await;
+            assert!(cut.is_err(), "the copy must still wait for its write");
+            assert!(
+                faults.fired(crate::storage::FaultPoint::PutDelta, "dst/copy/x.zip") > 0,
+                "the copy never reached its write"
+            );
+            let gate = state.maintenance_gate.clone();
+            assert!(
+                gate.inflight_writes("dst") > 0,
+                "the count ended while the write was still pending"
+            );
+            let drain_gate = gate.clone();
+            let drain = tokio::spawn(async move {
+                crate::maintenance::worker::drain_inflight_writes_within(
+                    &drain_gate,
+                    "dst",
+                    Duration::from_secs(30),
+                )
+                .await
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!drain.is_finished(), "the drain returned before the write");
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), drain)
+                .await
+                .expect("the drain ends once the write landed")
+                .unwrap()
+                .expect("drained");
+            let engine = state.engine.load_full();
+            assert!(engine.head("dst", "copy/x.zip").await.is_ok(), "landed");
         }
     }
 

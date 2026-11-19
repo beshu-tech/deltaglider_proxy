@@ -191,6 +191,7 @@ async fn a_raw_delta_write_drops_the_other_form_through_the_helper() {
             .with_dest_prefix_lock("b", "run", || async {
                 Ok(engine
                     .put_delta_raw(
+                        &crate::transfer::CommitTicket::for_test(),
                         &lock,
                         "b",
                         "run",
@@ -401,6 +402,7 @@ async fn the_baseline_in_the_reference_cache_is_the_client_buffer() {
     let body = Bytes::from(noise(21, 64 * 1024));
     let r = engine
         .store_conditional(
+            &crate::transfer::CommitTicket::for_test(),
             "b",
             "rel/a.zip",
             crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(body.clone()),
@@ -450,6 +452,7 @@ async fn a_large_client_put_is_hashed_by_its_ingest_not_from_the_spool() {
     for (key, body) in [("rel/a.zip", &base), ("rel/b.zip", &v2)] {
         let r = engine
             .store_conditional(
+                &crate::transfer::CommitTicket::for_test(),
                 "b",
                 key,
                 ingested(&engine, body.clone(), None).await,
@@ -497,6 +500,7 @@ async fn a_proven_sha256_is_stored_not_recomputed() {
     ] {
         let r = engine
             .store_conditional(
+                &crate::transfer::CommitTicket::for_test(),
                 "b",
                 key,
                 ingested(&engine, noise(41, size), Some(proven)).await,
@@ -537,6 +541,7 @@ fn reference_gets(fake: &FakeS3) -> usize {
 async fn put_large(engine: &DynEngine, key: &str, body: &[u8]) -> StoreResult {
     engine
         .store_conditional(
+            &crate::transfer::CommitTicket::for_test(),
             "b",
             key,
             ingested(engine, body.to_vec(), None).await,
@@ -626,6 +631,7 @@ async fn a_large_put_refuses_a_corrupt_reference() {
     let engine = spooling_engine_at(&endpoint);
     let err = engine
         .store_conditional(
+            &crate::transfer::CommitTicket::for_test(),
             "b",
             "rel/v1.zip",
             ingested(&engine, variant(&base, 1), None).await,

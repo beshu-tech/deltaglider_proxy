@@ -1720,6 +1720,7 @@ async fn delete_planned(
         DeleteHooks {
             proceed: Some(proceed),
             on_outcome: Some(&on_outcome),
+            count: None,
         },
     )
     .await;

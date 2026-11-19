@@ -556,6 +556,7 @@ async fn delete_keys<'a>(
             DeleteHooks {
                 proceed: Some(proceed),
                 on_outcome: None,
+                count: None,
             },
         )
         .await

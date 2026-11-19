@@ -655,6 +655,14 @@ impl WriteGuard {
         }
     }
 
+    /// A second count of this write's bucket, for a commit that must land
+    /// after the caller is dropped (see [`CommitCount`]).
+    pub fn commit_count(&self) -> CommitCount {
+        CommitCount {
+            _guards: vec![self.another()],
+        }
+    }
+
     /// The proof of a write into `bucket`, if this count covers it
     /// (case-insensitive). A writer that takes a [`DestWrite`] cannot run
     /// outside the count of its destination bucket.
@@ -709,10 +717,34 @@ impl RequestWriteCount {
         }
     }
 
+    /// A request's count as the verified-request check makes it (tests).
+    #[cfg(test)]
+    pub(crate) fn admitted_for_test(gate: &Arc<MaintenanceGate>, bucket: &str) -> Self {
+        let count = Self::default();
+        count.admit(gate, bucket);
+        count
+    }
+
+    /// A second count of this request's write, held by a commit task until
+    /// the write returns, so a dropped request never ends it early. `None`:
+    /// the request is not counted (a read, or no gate).
+    pub fn commit_count(&self) -> Option<CommitCount> {
+        self.0.lock().as_ref().map(WriteGuard::commit_count)
+    }
+
     /// End the count (idempotent).
     pub fn release(&self) {
         self.0.lock().take();
     }
+}
+
+/// The request's second write count, for a commit task (`None`: the request
+/// is not counted).
+pub fn request_commit_count(extensions: &axum::http::Extensions) -> Option<Arc<CommitCount>> {
+    extensions
+        .get::<RequestWriteCount>()
+        .and_then(RequestWriteCount::commit_count)
+        .map(Arc::new)
 }
 
 /// Add `by` to `map[key]` (lowercased already); a count at 0 goes.

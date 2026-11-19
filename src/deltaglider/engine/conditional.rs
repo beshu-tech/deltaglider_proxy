@@ -372,8 +372,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// spooled body, the reservation of its storage writes: a body in
     /// memory is stored from its buffer (shared, never copied, down to the
     /// storage write), a spooled one from its file.
+    #[allow(clippy::too_many_arguments)]
     pub async fn store_conditional(
         &self,
+        ticket: &crate::transfer::CommitTicket,
         bucket: &str,
         key: &str,
         body: crate::deltaglider::ingest::IngestedBody,
@@ -383,7 +385,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<StoreResult, ConditionalError> {
         let guard = self.lock_and_check(bucket, key, precondition).await?;
         Ok(self
-            .store_ingested(&guard, bucket, key, body, content_type, user_metadata, None)
+            .store_ingested(
+                ticket,
+                &guard,
+                bucket,
+                key,
+                body,
+                content_type,
+                user_metadata,
+                None,
+            )
             .await?)
     }
 
@@ -396,6 +407,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[allow(clippy::too_many_arguments)]
     pub async fn store_ingested(
         &self,
+        _ticket: &crate::transfer::CommitTicket,
         lock: &ObjectWriteGuard,
         bucket: &str,
         key: &str,
@@ -595,6 +607,7 @@ mod tests {
         fake.clear();
         let stored = engine
             .store_conditional(
+                &crate::transfer::CommitTicket::for_test(),
                 "b",
                 "img/a.jpg",
                 crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(Bytes::from_static(
@@ -618,6 +631,7 @@ mod tests {
         fake.clear();
         engine
             .store_conditional(
+                &crate::transfer::CommitTicket::for_test(),
                 "b",
                 "img/a.jpg",
                 crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(Bytes::from_static(
@@ -807,6 +821,7 @@ mod tests {
             let lock = engine.lock_object_write("b", "d/c.zip").await;
             engine
                 .store_known_prior(
+                    &crate::transfer::CommitTicket::for_test(),
                     &lock,
                     "b",
                     "d/c.zip",
