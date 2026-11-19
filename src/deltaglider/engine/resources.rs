@@ -138,7 +138,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.spool_acquire_ungated(bytes).await
     }
 
-    /// [`Self::spool_acquire`] without the disk gate: for reads, the CLI
+    /// `spool_acquire` without the disk gate: for reads, the CLI
     /// (no disk monitor) and small codec sources.
     pub async fn spool_acquire_ungated(
         &self,
