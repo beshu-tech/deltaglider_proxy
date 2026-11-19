@@ -32,6 +32,7 @@ use crate::api::handlers::AppState;
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::Json;
+use futures::FutureExt as _;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -837,47 +838,57 @@ async fn copy_one(
     // The transfer takes the destination's object write lock itself (as
     // every write does), so the copy never lands inside a conditional
     // PUT's check-then-store. Taking it here too would wait forever: the
-    // lock is not re-entrant.
-    let transfer = crate::transfer::ObjectTransferRequest {
-        source_bucket: src_bucket,
-        source_key: src_key,
-        destination_bucket: dst_bucket,
-        destination_key: dst_key,
-        provenance: None,
-        strip_user_metadata_keys: &[],
-        operation: "admin bulk copy",
-        upload_concurrency: None,
-        keep_created_at: false,
-        commit_count: commit,
-    };
-    // `no_overwrite`: the existence check runs inside the transfer's own
-    // lock hold, so nothing can land between the check and the write.
-    let outcome = if no_overwrite {
-        crate::transfer::copy_object_if_absent(engine, transfer).await
-    } else {
-        crate::transfer::copy_object_with_retries(engine, transfer).await
-    }
-    .map_err(|e| {
-        if e.class == crate::transfer::CopyClass::DestinationExists {
-            CopyFault::Exists
-        } else {
-            CopyFault::failed(format!(
-                "copy {src_bucket}/{src_key} -> {dst_bucket}/{dst_key}: {e}"
-            ))
+    // lock is not re-entrant. The copy and its event are one detached unit:
+    // a dropped request cannot land the copy and lose the event.
+    let (engine, s3) = (engine.clone(), s3.clone());
+    let (sb, sk) = (src_bucket.to_string(), src_key.to_string());
+    let (db, dk) = (dst_bucket.to_string(), dst_key.to_string());
+    let inner = commit.clone();
+    crate::transfer::detached_commit(commit.clone(), None, move |_ticket| {
+        async move {
+            let transfer = crate::transfer::ObjectTransferRequest {
+                source_bucket: &sb,
+                source_key: &sk,
+                destination_bucket: &db,
+                destination_key: &dk,
+                provenance: None,
+                strip_user_metadata_keys: &[],
+                operation: "admin bulk copy",
+                upload_concurrency: None,
+                keep_created_at: false,
+                commit_count: &inner,
+            };
+            // `no_overwrite`: the existence check runs inside the transfer's own
+            // lock hold, so nothing can land between the check and the write.
+            let outcome = if no_overwrite {
+                crate::transfer::copy_object_if_absent(&engine, transfer).await
+            } else {
+                crate::transfer::copy_object_with_retries(&engine, transfer).await
+            }
+            .map_err(|e| {
+                if e.class == crate::transfer::CopyClass::DestinationExists {
+                    CopyFault::Exists
+                } else {
+                    CopyFault::failed(format!("copy {sb}/{sk} -> {db}/{dk}: {e}"))
+                }
+            })?;
+            emit_event(
+                &s3,
+                crate::event_outbox::EventKind::ObjectCopied,
+                &db,
+                &dk,
+                serde_json::json!({
+                    "content_length": outcome.content_length(),
+                    "source_bucket": sb,
+                    "source_key": sk,
+                }),
+            )
+            .await;
+            Ok::<(), CopyFault>(())
         }
-    })?;
-    emit_event(
-        s3,
-        crate::event_outbox::EventKind::ObjectCopied,
-        dst_bucket,
-        dst_key,
-        serde_json::json!({
-            "content_length": outcome.content_length(),
-            "source_bucket": src_bucket,
-            "source_key": src_key,
-        }),
-    )
-    .await;
+        .boxed()
+    })
+    .await?;
     Ok(head)
 }
 
@@ -1079,15 +1090,14 @@ async fn delete_moved_sources(
             crate::maintenance::gate::WriteKind::FreesSpace,
         )
     };
-    let emit = deleted_event_emitter(s3, source_bucket);
     let outcomes = engine
         .delete_batch(
             source_bucket,
             batch,
             DeleteHooks {
                 proceed: Some(&proceed),
-                on_outcome: Some(&emit),
-                counted: count.clone(),
+                post_commit: Some(deleted_event_emitter(s3, source_bucket)),
+                ..DeleteHooks::new(count.clone())
             },
         )
         .await;
@@ -1127,31 +1137,31 @@ async fn delete_moved_sources(
     (deleted, skipped_self)
 }
 
-/// The `on_outcome` hook of an admin delete batch: an `ObjectDeleted`
-/// outbox event for each key as its delete lands.
+/// The `post_commit` step of an admin delete batch: an `ObjectDeleted`
+/// outbox event for each key, inside the key's detached unit.
 fn deleted_event_emitter(
     s3: &Arc<AppState>,
     bucket: &str,
-) -> impl Fn(&str, &crate::deltaglider::DeleteOutcome) -> futures::future::BoxFuture<'static, ()>
-       + Send
-       + Sync {
+) -> Arc<crate::deltaglider::PostCommitDelete> {
     let (s3, bucket) = (s3.clone(), bucket.to_string());
-    move |key, outcome| {
-        if !matches!(outcome, crate::deltaglider::DeleteOutcome::Deleted(_)) {
-            return Box::pin(async {});
-        }
-        let (s3, bucket, key) = (s3.clone(), bucket.clone(), key.to_string());
-        Box::pin(async move {
-            emit_event(
-                &s3,
-                crate::event_outbox::EventKind::ObjectDeleted,
-                &bucket,
-                &key,
-                serde_json::json!({}),
-            )
-            .await
-        })
-    }
+    Arc::new(
+        move |key: &str, outcome: &crate::deltaglider::DeleteOutcome| {
+            if !matches!(outcome, crate::deltaglider::DeleteOutcome::Deleted(_)) {
+                return Box::pin(async {});
+            }
+            let (s3, bucket, key) = (s3.clone(), bucket.clone(), key.to_string());
+            Box::pin(async move {
+                emit_event(
+                    &s3,
+                    crate::event_outbox::EventKind::ObjectDeleted,
+                    &bucket,
+                    &key,
+                    serde_json::json!({}),
+                )
+                .await
+            })
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,10 +1570,9 @@ pub(crate) async fn run_bulk_delete(
     // One rule with the page check of a delete job and the request gate: a delete
     // passes a bucket whose job waits for disk space (it frees space).
     let proceed = || !gate.is_busy_for(bucket, crate::maintenance::gate::WriteKind::FreesSpace);
-    let emit_event = deleted_event_emitter(s3, bucket);
-    let emit = |key: &str, outcome: &DeleteOutcome| {
+    let emit = |_key: &str, outcome: &DeleteOutcome| -> futures::future::BoxFuture<'static, ()> {
         tally(counts_as_deleted(outcome));
-        emit_event(key, outcome)
+        Box::pin(async {})
     };
     let done = engine
         .delete_batch(
@@ -1575,6 +1584,7 @@ pub(crate) async fn run_bulk_delete(
             DeleteHooks {
                 proceed: Some(&proceed),
                 on_outcome: Some(&emit),
+                post_commit: Some(deleted_event_emitter(s3, bucket)),
                 counted: count.clone(),
             },
         )
@@ -3334,6 +3344,42 @@ mod tests {
                     all_gone(&state, &keys).await,
                     "streamed={streamed}: the batch stopped when its request went away"
                 );
+            }
+        }
+
+        /// The ObjectDeleted event of each key is part of the key's own
+        /// task: a request dropped mid-batch loses no event of a key that
+        /// went, and a request that is not dropped stores each once.
+        #[tokio::test]
+        async fn a_bulk_delete_keeps_one_event_per_key_when_the_client_goes_away() {
+            for dropped in [true, false] {
+                let (engine, fake) = s3_engine().await;
+                let keys = store_deltas(&engine, "e2e/run-1", 3).await;
+                let mut state = AppState::for_tests(engine);
+                Arc::get_mut(&mut state).unwrap().jobs_db = Some(Arc::new(
+                    tokio::sync::Mutex::new(crate::config_db::JobsDb::in_memory("bd").unwrap()),
+                ));
+                fake.set_delete_delay_ms(30);
+                let request = answer_bulk_delete(
+                    state.clone(),
+                    plan(&state, &keys),
+                    BulkActor::Unrestricted,
+                    accept(None),
+                );
+                if dropped {
+                    let cut = fake
+                        .cut_at(request, |r| r.starts_with("DELETE /b/e2e/"))
+                        .await;
+                    assert!(cut, "the request answered before the cut");
+                } else {
+                    request.await;
+                }
+                assert!(all_gone(&state, &keys).await, "dropped={dropped}");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let db = state.jobs_db.as_ref().unwrap();
+                crate::event_outbox::flush_appends(db).await;
+                let n = db.lock().await.event_outbox_count(None).unwrap();
+                assert_eq!(n, keys.len() as i64, "dropped={dropped}: one event per key");
             }
         }
 

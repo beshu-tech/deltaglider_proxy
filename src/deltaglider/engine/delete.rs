@@ -86,6 +86,10 @@ pub enum DeleteOutcome {
 pub type OnDeleteOutcome<'a> =
     dyn Fn(&str, &DeleteOutcome) -> futures::future::BoxFuture<'static, ()> + Send + Sync + 'a;
 
+/// The post-commit step of one deleted key (see [`DeleteHooks::post_commit`]).
+pub type PostCommitDelete =
+    dyn Fn(&str, &DeleteOutcome) -> futures::future::BoxFuture<'static, ()> + Send + Sync;
+
 /// Hooks of a [`DeltaGliderEngine::delete_batch`]. There is no `Default`:
 /// the caller says which count its deletes hold.
 #[derive(Clone)]
@@ -99,6 +103,11 @@ pub struct DeleteHooks<'a> {
     /// cut part-way has then published every key it deleted). Every key
     /// gets one call, in no particular order across folders.
     pub on_outcome: Option<&'a OnDeleteOutcome<'a>>,
+    /// Awaited INSIDE each key's detached unit once its delete ended, with
+    /// the key and its outcome: the bookkeeping that must not be lost when
+    /// the caller is dropped (the `ObjectDeleted` event). It owns what it
+    /// needs. Not called for a key refused before its delete.
+    pub post_commit: Option<std::sync::Arc<PostCommitDelete>>,
     /// The caller's write count: each key's whole delete (locks, backend
     /// DELETE, counters, cache) and each folder's reference reclaim run in
     /// their own task that holds it to the end, so a dropped caller never
@@ -112,6 +121,7 @@ impl<'a> DeleteHooks<'a> {
         Self {
             proceed: None,
             on_outcome: None,
+            post_commit: None,
             counted,
         }
     }
@@ -334,7 +344,7 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         for i in indexes {
             let item = &items[i];
             let outcome = if hooks.proceeds() {
-                self.delete_item(bucket, item, &hooks.counted).await
+                self.delete_item(bucket, item, hooks).await
             } else {
                 DeleteOutcome::Skipped
             };
@@ -374,26 +384,31 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         &self,
         bucket: &str,
         item: &DeleteItem,
-        counted: &Counted,
+        hooks: &DeleteHooks<'_>,
     ) -> DeleteOutcome {
         let (engine, bucket, key) = (self.clone(), bucket.to_string(), item.key.clone());
         let still_ours = item.still_ours.clone();
-        let result = crate::transfer::detached_commit(counted.clone(), None, move |ticket| {
+        let post_commit = hooks.post_commit.clone();
+        crate::transfer::detached_commit(hooks.counted.clone(), None, move |ticket| {
             async move {
-                engine
+                let result = engine
                     .delete_inner(&ticket, &bucket, &key, still_ours.as_deref())
-                    .await
+                    .await;
+                let outcome = match result {
+                    Ok(ConditionalDelete::Deleted(meta)) => DeleteOutcome::Deleted(meta),
+                    Ok(ConditionalDelete::Changed) => DeleteOutcome::Changed,
+                    Ok(ConditionalDelete::Gone) => DeleteOutcome::NotFound,
+                    Err(e) if e.is_not_found() => DeleteOutcome::NotFound,
+                    Err(e) => DeleteOutcome::Failed(e),
+                };
+                if let Some(post_commit) = post_commit {
+                    post_commit(&key, &outcome).await;
+                }
+                outcome
             }
             .boxed()
         })
-        .await;
-        match result {
-            Ok(ConditionalDelete::Deleted(meta)) => DeleteOutcome::Deleted(meta),
-            Ok(ConditionalDelete::Changed) => DeleteOutcome::Changed,
-            Ok(ConditionalDelete::Gone) => DeleteOutcome::NotFound,
-            Err(e) if e.is_not_found() => DeleteOutcome::NotFound,
-            Err(e) => DeleteOutcome::Failed(e),
-        }
+        .await
     }
 
     /// Delete one key with no reclaim check, as a batch cut before its

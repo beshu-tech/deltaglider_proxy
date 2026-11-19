@@ -43,7 +43,9 @@ mod usage;
 use locking::*;
 
 pub(crate) use construction::{build_raw_backend, effective_legacy_key_id};
-pub use delete::{DeleteHooks, DeleteItem, DeleteOutcome, BULK_DELETE_CONCURRENCY};
+pub use delete::{
+    DeleteHooks, DeleteItem, DeleteOutcome, PostCommitDelete, BULK_DELETE_CONCURRENCY,
+};
 pub(crate) use list::{collapse_by_delimiter, common_prefix_of, interleave_and_paginate};
 
 pub use locking::RefWriteProof;

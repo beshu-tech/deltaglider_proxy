@@ -1698,8 +1698,11 @@ async fn delete_planned(
         actions: deletes.iter().map(|d| (d.key.clone(), d.action)).collect(),
         pending: Default::default(),
     });
+    // Buffered inside each key's detached unit: a run cut mid-batch still
+    // publishes the key in flight (`DeleteEvents::drop` stores what is left).
     let publisher = events.clone();
-    let on_outcome = move |key: &str, outcome: &DeleteOutcome| publisher.publish(key, outcome);
+    let post_commit: Arc<crate::deltaglider::PostCommitDelete> =
+        Arc::new(move |key: &str, outcome: &DeleteOutcome| publisher.publish(key, outcome));
     let items = deletes
         .iter()
         .map(|d| {
@@ -1719,7 +1722,8 @@ async fn delete_planned(
         items,
         DeleteHooks {
             proceed: Some(proceed),
-            on_outcome: Some(&on_outcome),
+            on_outcome: None,
+            post_commit: Some(post_commit),
             // `admitted::delete_batch` supplies the admission's count.
             counted: crate::maintenance::gate::BY_ADMISSION.clone(),
         },
@@ -1798,7 +1802,7 @@ async fn delete_planned(
 }
 
 /// The delete events of one batch: its `on_outcome` hook buffers each
-/// deleted key's event, and [`DeleteEvents::flush`] stores the page's
+/// deleted key's event (in its post-commit step), and [`DeleteEvents::flush`] stores the page's
 /// events in one outbox insert (one commit, not one per key).
 struct DeleteEvents {
     db: Option<Arc<Mutex<JobsDb>>>,
@@ -3324,6 +3328,55 @@ mod tests {
         crate::event_outbox::flush_appends(&db).await;
         let rows = db.lock().await.event_outbox_since(0, 10).unwrap();
         assert_eq!(rows.len(), 1, "the deleted key lost its event");
+    }
+
+    /// A run cut while a key's DELETE is in flight: the key still goes (its
+    /// own task) and so does its `LifecycleExpired` event (D1, #171).
+    #[tokio::test]
+    async fn a_run_cut_in_a_delete_still_stores_that_keys_event() {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let keys = crate::deltaglider::store_deltas(&engine, "run", 3).await;
+        let db = Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::JobsDb::in_memory("pw").unwrap(),
+        ));
+        let mut deletes = Vec::new();
+        for key in &keys {
+            let meta = engine.head("b", key).await.unwrap();
+            deletes.push(super::PlannedDelete::of(key, &meta, "delete", true));
+        }
+        fake.set_delete_delay_ms(300);
+        let mut out = super::LifecycleRunOutcome::default();
+        let windows = crate::maintenance::gate::admit_all(None, &["b"]).unwrap();
+        let rule = rule();
+        let run = super::delete_planned(
+            Some(&db),
+            &engine,
+            &windows,
+            &rule,
+            deletes,
+            &|| true,
+            None,
+            &mut out,
+            10,
+        );
+        assert!(fake.cut_at(run, |r| r.starts_with("DELETE /b/run/")).await);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            crate::event_outbox::flush_appends(&db).await;
+            if db.lock().await.event_outbox_count(None).unwrap() > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deleted key lost its event"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        crate::event_outbox::flush_appends(&db).await;
+        let rows = db.lock().await.event_outbox_since(0, 10).unwrap();
+        assert_eq!(rows.len(), 1, "one event, for the one key that went");
+        assert_eq!(rows[0].key, keys[0]);
     }
 
     #[test]

@@ -1319,12 +1319,12 @@ mod tests {
         "takes the bulk loop's DestWrite",
     )];
 
-    /// Request-scoped writers that run inside their request, which
-    /// `RequestWriteCount` counts to its end (nothing outlives the request).
+    /// Request-scoped writers whose batch runs in a detached task that holds
+    /// the request's own count (`request_counted`) to its end.
     const REQUEST_COUNTED: [(&str, &str, &str); 1] = [(
         "src/s3_adapter_s3s/object.rs",
         "delete_objects",
-        "the batch runs inside the request, which the gate middleware counts",
+        "the batch runs in a detached task that holds the request's count",
     )];
 
     /// Code exempt from [`background_writers_are_admitted`], with why.
@@ -1509,7 +1509,8 @@ mod tests {
     }
 
     /// Source guard (D1, D2): only the CLI and the background jobs build a
-    /// `NoGateReason`; a server request path passes `request_counted`.
+    /// `NoGateReason`, or name `BY_ADMISSION` or `inline_commit`; a server
+    /// request path passes `request_counted` and `detached_commit`.
     #[test]
     fn no_gate_is_named_only_by_the_cli_and_the_jobs() {
         const ALLOWED: [&str; 5] = [
@@ -1519,19 +1520,36 @@ mod tests {
             "src/replication/",
             "src/transfer.rs",
         ];
-        let named: Vec<&str> = crate::source_scan::ast::src()
-            .iter()
-            .filter(|s| {
-                ["cli", "maintenance_job"]
+        const NAMES: [&str; 3] = ["cli", "maintenance_job", "inline_commit"];
+        let named = |src: &crate::source_scan::ast::Source| {
+            NAMES
+                .iter()
+                .any(|n| src.prod.calls_named(n).next().is_some())
+                || src
+                    .prod
+                    .paths
                     .iter()
-                    .any(|n| s.prod.calls_named(n).next().is_some())
-            })
+                    .any(|p| p.segs.last().is_some_and(|s| s == "BY_ADMISSION"))
+        };
+        let offenders: Vec<&str> = crate::source_scan::ast::src()
+            .iter()
+            .filter(|s| named(s))
             .map(|s| s.rel.as_str())
             .filter(|rel| !ALLOWED.iter().any(|a| rel.starts_with(a)))
             .collect();
         assert!(
-            named.is_empty(),
-            "a request path says NoGate (use request_counted): {named:?}"
+            offenders.is_empty(),
+            "a request path says NoGate, BY_ADMISSION or inline_commit \
+             (use request_counted and detached_commit): {offenders:?}"
+        );
+        // The scan sees the names it is about (not vacuous).
+        let fixture = crate::source_scan::ast::parse(
+            "src/api/x.rs",
+            "fn f() { let c = BY_ADMISSION.clone(); inline_commit(|t| async {}).await; }",
+        );
+        assert!(
+            named(&fixture),
+            "the scan missed BY_ADMISSION / inline_commit"
         );
     }
 

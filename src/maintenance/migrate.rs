@@ -556,6 +556,7 @@ async fn delete_keys(
             DeleteHooks {
                 proceed: Some(proceed),
                 on_outcome: None,
+                post_commit: None,
                 // The job holds the transient route itself.
                 counted: super::gate::Counted::NoGate(super::gate::NoGateReason::maintenance_job()),
             },
@@ -1616,6 +1617,10 @@ impl PageStep for CopyStep<'_, '_> {
                 .ok()
                 .map(|(meta, _)| meta),
         };
+        // The job holds the transient route itself: no admission to count it.
+        let no_gate = crate::maintenance::gate::Counted::NoGate(
+            crate::maintenance::gate::NoGateReason::maintenance_job(),
+        );
         let req = ObjectTransferRequest {
             source_bucket: bucket,
             source_key: key,
@@ -1629,7 +1634,7 @@ impl PageStep for CopyStep<'_, '_> {
             operation: "migrate",
             upload_concurrency: None,
             keep_created_at: true,
-            commit_count: &crate::maintenance::gate::BY_ADMISSION,
+            commit_count: &no_gate,
         };
         // No per-object fsync: `checkpoint` flushes the copies before any
         // progress that counts on them is saved.

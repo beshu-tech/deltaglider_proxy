@@ -189,6 +189,47 @@ async fn each_key_is_reported_as_it_ends() {
     );
 }
 
+/// `post_commit` runs inside the key's own task: a caller cut while the
+/// key's DELETE is in flight still gets the step, once, for the key that went.
+#[tokio::test]
+async fn the_post_commit_step_of_a_key_survives_a_cut_caller() {
+    let (engine, fake) = s3_engine().await;
+    let keys = store_deltas(&engine, "run", 3).await;
+    fake.set_delete_delay_ms(300);
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let post_commit: Arc<PostCommitDelete> = Arc::new(move |key: &str, _: &DeleteOutcome| {
+        sink.lock().push(key.to_string());
+        Box::pin(async {})
+    });
+    let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+    let counted =
+        crate::maintenance::gate::Counted::By(Arc::new(gate.begin_write("b").commit_count()));
+
+    let cut = fake
+        .cut_at(
+            engine.delete_batch(
+                "b",
+                items(&keys),
+                DeleteHooks {
+                    post_commit: Some(post_commit),
+                    ..DeleteHooks::new(counted)
+                },
+            ),
+            |r| r.starts_with("DELETE /b/run/"),
+        )
+        .await;
+    assert!(cut, "the batch was cut in its first DELETE");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while seen.lock().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "the step was lost");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(seen.lock().clone(), vec![keys[0].clone()]);
+}
+
 /// `proceed` answering `false` stops the batch between keys: the rest is
 /// skipped and the folder keeps its reference.bin.
 #[tokio::test]

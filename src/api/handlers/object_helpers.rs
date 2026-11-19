@@ -74,7 +74,7 @@ pub(crate) struct ClientWrite<'a> {
     pub early_quota: Option<QuotaVerdict>,
     /// The request's write count: the store runs in its own task that holds
     /// it, so a dropped request never ends the count before the write
-    /// returns. `None`: no count (form POST).
+    /// returns. The `ObjectCreated` event is part of that task.
     pub commit: crate::maintenance::gate::Counted,
 }
 
@@ -95,9 +95,12 @@ pub(crate) async fn store_client_write(
     let (bucket, key) = (write.bucket.to_string(), write.key.to_string());
     let (body, content_type, user_metadata) = (write.body, write.content_type, write.user_metadata);
     let precondition = write.precondition.clone();
+    let unit_state = state.clone();
+    // The store and its event are one unit: a dropped request cannot land
+    // the object and lose the event.
     let result = crate::transfer::detached_commit(write.commit, None, move |ticket| {
         async move {
-            engine
+            let result = engine
                 .store_conditional(
                     &ticket,
                     &bucket,
@@ -107,12 +110,15 @@ pub(crate) async fn store_client_write(
                     user_metadata,
                     &precondition,
                 )
-                .await
+                .await;
+            if let Ok(result) = &result {
+                object_created(&unit_state, &bucket, &key, size, result).await;
+            }
+            result
         }
         .boxed()
     })
     .await?;
-    object_created(state, write.bucket, write.key, size, &result).await;
     Ok(result)
 }
 
@@ -146,30 +152,47 @@ pub(crate) async fn store_client_delta_copy(
     let size = copy.source_head.file_size;
     check_quota_for_write(state, copy.bucket, copy.key, size).await?;
     let engine = state.engine.load_full();
-    let result = {
-        let guard = std::sync::Arc::new(
-            engine
-                .lock_and_check(copy.bucket, copy.key, copy.precondition)
-                .await?,
-        );
-        crate::transfer::client_delta_copy(
-            &engine,
-            &guard,
-            copy.source,
-            (copy.bucket, copy.key),
-            copy.source_head,
-            copy.content_type,
-            copy.user_metadata,
-            &copy.commit,
-        )
-        .await
-        .map_err(crate::transfer::CopyError::into_s3_error)?
-    };
-    let Some(result) = result else {
-        return Ok(None);
-    };
-    object_created(state, copy.bucket, copy.key, size, &result).await;
-    Ok(Some(result))
+    let unit_state = state.clone();
+    let owned = (
+        copy.source.0.to_string(),
+        copy.source.1.to_string(),
+        copy.bucket.to_string(),
+        copy.key.to_string(),
+        copy.source_head.clone(),
+        copy.precondition.clone(),
+    );
+    let (content_type, user_metadata) = (copy.content_type, copy.user_metadata);
+    let inner = copy.commit.clone();
+    // Lock, copy and event are one unit (see `store_client_write`).
+    crate::transfer::detached_commit(copy.commit, None, move |_ticket| {
+        async move {
+            let (sb, sk, db, dk, head, precondition) = owned;
+            let guard = std::sync::Arc::new(
+                engine
+                    .lock_and_check(&db, &dk, &precondition)
+                    .await
+                    .map_err(S3Error::from)?,
+            );
+            let result = crate::transfer::client_delta_copy(
+                &engine,
+                &guard,
+                (&sb, &sk),
+                (&db, &dk),
+                &head,
+                content_type,
+                user_metadata,
+                &inner,
+            )
+            .await
+            .map_err(crate::transfer::CopyError::into_s3_error)?;
+            if let Some(result) = &result {
+                object_created(&unit_state, &db, &dk, size, result).await;
+            }
+            Ok::<_, S3Error>(result)
+        }
+        .boxed()
+    })
+    .await
 }
 
 /// [`store_client_write`] of a CopyObject of a passthrough source into a
@@ -215,9 +238,10 @@ pub(crate) async fn store_client_server_copy(
             (copy.bucket.to_string(), copy.key.to_string()),
         );
         let head = copy.source_head.clone();
+        let unit_state = state.clone();
         crate::transfer::detached_commit(copy.commit, None, move |ticket| {
             async move {
-                engine
+                let copied = engine
                     .copy_passthrough_within(
                         &ticket,
                         &lock,
@@ -227,7 +251,12 @@ pub(crate) async fn store_client_server_copy(
                         metadata,
                         None,
                     )
-                    .await
+                    .await;
+                // The copy and its event are one unit (see `store_client_write`).
+                if let Ok(Some(result)) = &copied {
+                    object_created(&unit_state, &dst.0, &dst.1, size, result).await;
+                }
+                copied
             }
             .boxed()
         })
@@ -239,11 +268,7 @@ pub(crate) async fn store_client_server_copy(
             e => e.into(),
         })?
     };
-    let Some(result) = result else {
-        return Ok(None);
-    };
-    object_created(state, copy.bucket, copy.key, size, &result).await;
-    Ok(Some(result))
+    Ok(result)
 }
 
 /// The `ObjectCreated` event of a client write.
@@ -878,5 +903,173 @@ mod write_path_tests {
         enqueue_object_events(&f.state, &[event("c.zip")]).await;
         crate::event_outbox::flush_appends(&db).await;
         assert_eq!(outbox_keys(&f.state).await, ["a.zip", "b.zip", "c.zip"]);
+    }
+}
+
+/// A client write whose request is dropped while the backend write is in
+/// flight: the write lands in its own task, and so does its event (D1, #171).
+#[cfg(test)]
+mod dropped_write_tests {
+    use super::*;
+    use crate::deltaglider::store_deltas;
+    use crate::storage::FakeS3;
+    use std::time::Duration;
+
+    async fn state() -> (Arc<AppState>, Arc<FakeS3>) {
+        let (engine, fake) = crate::deltaglider::s3_engine().await;
+        let mut state = Arc::try_unwrap(AppState::for_tests(engine)).ok().unwrap();
+        state.jobs_db = Some(Arc::new(tokio::sync::Mutex::new(
+            crate::config_db::JobsDb::in_memory("dw").unwrap(),
+        )));
+        (Arc::new(state), fake)
+    }
+
+    fn counted() -> crate::maintenance::gate::Counted {
+        let gate = Arc::new(crate::maintenance::gate::MaintenanceGate::new());
+        crate::maintenance::gate::Counted::By(Arc::new(gate.begin_write("b").commit_count()))
+    }
+
+    async fn events(state: &Arc<AppState>) -> i64 {
+        let db = state.jobs_db.as_ref().unwrap();
+        crate::event_outbox::flush_appends(db).await;
+        let n = db.lock().await.event_outbox_count(None).unwrap();
+        n
+    }
+
+    /// The object exists and exactly one event is stored, a while after the cut.
+    async fn lands_with_one_event(state: &Arc<AppState>, key: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while state.engine.load().head("b", key).await.is_err() || events(state).await == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{key}: the write or its event was lost with the dropped request"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(events(state).await, 1, "{key}: exactly one event");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_put_still_has_its_event() {
+        let (state, fake) = state().await;
+        fake.set_put_delay_ms(300);
+        let body = crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(bytes::Bytes::from(
+            vec![7u8; 1000],
+        ));
+        let precondition = crate::deltaglider::Precondition::none();
+        let write = store_client_write(
+            &state,
+            ClientWrite {
+                bucket: "b",
+                key: "pics/a.jpg",
+                body,
+                content_type: None,
+                user_metadata: Default::default(),
+                precondition: &precondition,
+                early_quota: None,
+                commit: counted(),
+            },
+        );
+        assert!(
+            fake.cut_at(write, |r| r.starts_with("PUT /b/pics/a.jpg"))
+                .await
+        );
+        lands_with_one_event(&state, "pics/a.jpg").await;
+    }
+
+    #[tokio::test]
+    async fn a_put_that_is_not_dropped_has_one_event() {
+        let (state, _fake) = state().await;
+        let body = crate::deltaglider::ingest::IngestedBody::hashed_from_bytes(bytes::Bytes::from(
+            vec![7u8; 1000],
+        ));
+        store_client_write(
+            &state,
+            ClientWrite {
+                bucket: "b",
+                key: "pics/a.jpg",
+                body,
+                content_type: None,
+                user_metadata: Default::default(),
+                precondition: &crate::deltaglider::Precondition::none(),
+                early_quota: None,
+                commit: counted(),
+            },
+        )
+        .await
+        .unwrap();
+        lands_with_one_event(&state, "pics/a.jpg").await;
+    }
+
+    #[tokio::test]
+    async fn a_dropped_delta_copy_still_has_its_event() {
+        let (state, fake) = state().await;
+        let keys = store_deltas(&state.engine.load(), "run", 2).await;
+        let head = state.engine.load().head("b", &keys[0]).await.unwrap();
+        let before = events(&state).await;
+        fake.set_put_delay_ms(300);
+        let precondition = crate::deltaglider::Precondition::none();
+        let copy = store_client_delta_copy(
+            &state,
+            ClientStoredCopy {
+                source: ("b", &keys[0]),
+                bucket: "b",
+                key: "run/copy.zip",
+                source_head: &head,
+                content_type: None,
+                user_metadata: Default::default(),
+                precondition: &precondition,
+                commit: counted(),
+            },
+        );
+        assert!(fake.cut_at(copy, |r| r.starts_with("PUT /b/")).await);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while state.engine.load().head("b", "run/copy.zip").await.is_err()
+            || events(&state).await == before
+        {
+            assert!(tokio::time::Instant::now() < deadline, "copy or event lost");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(events(&state).await, before + 1, "exactly one event");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_server_copy_still_has_its_event() {
+        let (state, fake) = state().await;
+        let engine = state.engine.load_full();
+        engine
+            .store("b", "pics/a.jpg", &[9u8; 2000], None, Default::default())
+            .await
+            .unwrap();
+        let head = engine.head("b", "pics/a.jpg").await.unwrap();
+        let before = events(&state).await;
+        fake.set_put_delay_ms(300);
+        let precondition = crate::deltaglider::Precondition::none();
+        let copy = store_client_server_copy(
+            &state,
+            ClientStoredCopy {
+                source: ("b", "pics/a.jpg"),
+                bucket: "b",
+                key: "pics/b.jpg",
+                source_head: &head,
+                content_type: None,
+                user_metadata: Default::default(),
+                precondition: &precondition,
+                commit: counted(),
+            },
+        );
+        assert!(
+            fake.cut_at(copy, |r| r.starts_with("PUT /b/pics/b.jpg"))
+                .await
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while engine.head("b", "pics/b.jpg").await.is_err() || events(&state).await == before {
+            assert!(tokio::time::Instant::now() < deadline, "copy or event lost");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(events(&state).await, before + 1, "exactly one event");
     }
 }
