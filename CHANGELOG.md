@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.2.5 — 2026-11-19
+
 ### Changed
 
 - The proxy builds with Rust 1.100.0.
