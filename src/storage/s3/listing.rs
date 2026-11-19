@@ -634,6 +634,10 @@ const UPSTREAM_MAX_KEYS: u32 = 1000;
 /// page is on the first upstream page.
 const UPSTREAM_SLACK: u32 = 100;
 
+/// Upstream requests that one page of a suffix-unsafe delimiter spends before
+/// it ends short (once it holds an entry).
+const COLLAPSED_PAGE_REQUESTS: u32 = 10;
+
 /// A backend answered `IsTruncated=true` without a continuation token: the
 /// next request could only start the listing again from its first page.
 pub(super) fn truncated_without_token(bucket: &str) -> StorageError {
@@ -798,6 +802,124 @@ impl S3Backend {
     /// page's last key) read that upstream page again. So a page costs one
     /// upstream LIST, plus a probe when a late `.delta` key can sort into it.
     pub(super) async fn list_delegated_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<DelegatedListResult, StorageError> {
+        match delimiter {
+            Some(d) if !listing_facts::delimiter_is_suffix_safe(d) => {
+                self.list_collapsed_page(bucket, prefix, d, max_keys, continuation_token)
+                    .await
+            }
+            _ => {
+                self.list_upstream_page(bucket, prefix, delimiter, max_keys, continuation_token)
+                    .await
+            }
+        }
+    }
+
+    /// A LIST whose delimiter can match inside the stored `.delta` suffix
+    /// (L6): upstream would group by STORED names. The delimiter is never
+    /// sent. Flat pages (already logical) are collapsed with THE collapse of
+    /// the bulk path, and after a prefix `c` the next page starts past `c`
+    /// (`c` + U+10FFFF), so a folder of many keys costs one request. The page
+    /// counts COLLAPSED entries; it is truncated whenever upstream is not
+    /// exhausted. After `COLLAPSED_PAGE_REQUESTS` requests a page with an
+    /// entry ends short (never an empty truncated page). A late `.delta` key
+    /// below `c` is confirmed by the flat page itself (`confirmable_candidates`).
+    async fn list_collapsed_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        max_keys: u32,
+        continuation_token: Option<&str>,
+    ) -> Result<DelegatedListResult, StorageError> {
+        use crate::deltaglider::{collapse_by_delimiter, common_prefix_of};
+        // A token that is a CommonPrefix resumes past all its keys.
+        let mut cursor: Option<String> = continuation_token.map(|t| {
+            if common_prefix_of(prefix, delimiter, t).as_deref() == Some(t) {
+                format!("{t}\u{10FFFF}")
+            } else {
+                t.to_string()
+            }
+        });
+        let mut objects: Vec<(String, FileMetadata)> = Vec::new();
+        let mut prefixes = std::collections::BTreeSet::new();
+        let mut ambiguous: Vec<String> = Vec::new();
+        let mut upstream_requests = 0u32;
+        let mut exhausted = false;
+        while !exhausted {
+            if objects.len() + prefixes.len() > max_keys as usize {
+                break;
+            }
+            if upstream_requests >= COLLAPSED_PAGE_REQUESTS && objects.len() + prefixes.len() > 0 {
+                break;
+            }
+            let flat = Box::pin(self.list_upstream_page(
+                bucket,
+                prefix,
+                None,
+                UPSTREAM_MAX_KEYS,
+                cursor.as_deref(),
+            ))
+            .await?;
+            upstream_requests += flat.upstream_requests;
+            if let crate::storage::ListedForms::Reported { ambiguous: a } = flat.forms {
+                ambiguous.extend(a);
+            }
+            let last_key = flat.objects.last().map(|(k, _)| k.clone());
+            let (kept, cps) = collapse_by_delimiter(flat.objects, prefix, delimiter);
+            objects.extend(kept);
+            prefixes.extend(cps);
+            exhausted = !flat.is_truncated;
+            if let Some(last) = last_key {
+                cursor = Some(match common_prefix_of(prefix, delimiter, &last) {
+                    Some(c) => format!("{c}\u{10FFFF}"),
+                    None => last,
+                });
+            } else if !exhausted {
+                match flat.next_continuation_token {
+                    Some(t) => cursor = Some(t),
+                    None => return Err(truncated_without_token(bucket)),
+                }
+            }
+        }
+        ambiguous.sort();
+        ambiguous.dedup();
+        let mut page = crate::deltaglider::interleave_and_paginate(
+            objects,
+            prefixes.into_iter().collect(),
+            max_keys,
+            continuation_token,
+        );
+        if !exhausted && !page.is_truncated {
+            page.is_truncated = true;
+            page.next_continuation_token = page
+                .objects
+                .last()
+                .map(|(k, _)| k)
+                .into_iter()
+                .chain(page.common_prefixes.last())
+                .max()
+                .cloned();
+        }
+        Ok(DelegatedListResult {
+            objects: page.objects,
+            common_prefixes: page.common_prefixes,
+            is_truncated: page.is_truncated,
+            next_continuation_token: page.next_continuation_token,
+            upstream_requests,
+            forms: crate::storage::ListedForms::Reported { ambiguous },
+            reference_prefixes: None,
+        })
+    }
+
+    /// The upstream-backed page: the delimiter, when there is one, is sent.
+    async fn list_upstream_page(
         &self,
         bucket: &str,
         prefix: &str,
@@ -1521,22 +1643,38 @@ mod delegated_cost_tests {
                 "a_b/z",
             ],
             &["x.zip", "d/y", "d/reference.bin"],
+            &["d/y.delta", "a/x.zip.delta", "a/x.zip", "a/x.delta"],
+            &["x.delta", "x.y.delta", "xa.delta", "ta"],
         ];
         for keys in sets {
             assert_same_listings(keys).await;
         }
     }
 
+    /// One page after `token` as (objects, CommonPrefixes, truncated).
+    async fn page_after<B: crate::storage::StorageBackend>(
+        backend: &B,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        token: &str,
+    ) -> (Vec<String>, Vec<String>, bool) {
+        let p = backend
+            .list_objects_delegated("b", prefix, delimiter, max_keys, Some(token))
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            p.objects.into_iter().map(|(k, _)| k).collect(),
+            p.common_prefixes,
+            p.is_truncated,
+        )
+    }
+
     /// Both backends hold `keys` (S3 also the listing facts that every bucket
     /// has, the filesystem raw files listed from their stat); every prefix,
     /// delimiter (one or several characters) and page size lists the same.
-    ///
-    /// KNOWN LIMIT, kept OUT of these key sets: a `.delta` stored name. A
-    /// delimiter that occurs inside the suffix `.delta` makes S3 return a
-    /// prefix of the STORED name (`d/y.delta` with `.` gives `d/y.`; a
-    /// delimiter `l` hides `a/x.zip.delta` behind `a/x.zip.del`), where the
-    /// filesystem lists the key. That is older than this work and is not
-    /// fixed here.
+    /// A `.delta` stored name lists as its logical key on both (L6).
     async fn assert_same_listings(keys: &[&str]) {
         let mut s3_keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
         s3_keys.push(".dg/facts/x!!1.e.1.2.e".into());
@@ -1571,6 +1709,13 @@ mod delegated_cost_tests {
                 Some("dg"),
                 Some("/r"),
                 Some("/ref"),
+                Some("d"),
+                Some("e"),
+                Some("l"),
+                Some("t"),
+                Some("a"),
+                Some("x."),
+                Some("ta"),
             ] {
                 for max_keys in [1u32, 2, 3, 1000] {
                     let ctx = format!("{keys:?} {prefix:?} {delimiter:?} {max_keys}");
@@ -1580,6 +1725,17 @@ mod delegated_cost_tests {
                         walk_pages(&fs, prefix, delimiter, max_keys).await;
                     assert_eq!(s3_objects, fs_objects, "objects: {ctx}");
                     assert_eq!(s3_prefixes, fs_prefixes, "prefixes: {ctx}");
+                    // StartAfter: every entry listed, and a few invented tokens.
+                    let mut tokens: Vec<String> =
+                        fs_objects.iter().chain(&fs_prefixes).cloned().collect();
+                    tokens.extend(["a.".into(), "d/y.".into(), "x.q".into()]);
+                    for t in tokens {
+                        assert_eq!(
+                            page_after(&s3, prefix, delimiter, max_keys, &t).await,
+                            page_after(&fs, prefix, delimiter, max_keys, &t).await,
+                            "after {t:?}: {ctx}"
+                        );
+                    }
                 }
             }
         }
@@ -1642,19 +1798,81 @@ mod delegated_cost_tests {
         );
     }
 
-    /// A KNOWN LIMIT older than this work, pinned so that a fix is a decision
-    /// and the compatibility page stays true: a delimiter inside the suffix
-    /// `.delta` of a stored name gives a prefix of the stored name.
+    /// A delimiter inside the suffix `.delta` of a stored name groups by the
+    /// LOGICAL key (L6): the key of `d/y.delta` is
+    /// `d/y`, an object under `.`, and `l` does not hide
+    /// `a/x.zip`.
     #[tokio::test]
-    async fn a_delimiter_inside_the_delta_suffix_gives_a_prefix_of_the_stored_name() {
-        let keys = vec!["d/y.delta".to_string(), "a/x.zip.delta".to_string()];
+    async fn a_delimiter_inside_the_delta_suffix_groups_by_the_logical_key() {
+        let keys = vec![
+            "d/y.delta".to_string(),
+            "a/x.zip.delta".to_string(),
+            "a/z.txt".to_string(),
+        ];
         let (s3, _fake) = backend_with_keys(&keys).await;
         let (objects, prefixes) = walk_pages(&s3, "", Some("."), 1000).await;
-        assert!(objects.is_empty(), "{objects:?}");
-        assert!(prefixes.contains(&"d/y.".to_string()), "{prefixes:?}");
+        assert_eq!(objects, ["d/y"], "{prefixes:?}");
+        assert_eq!(prefixes, ["a/x.", "a/z."]);
         let (objects, prefixes) = walk_pages(&s3, "a/", Some("l"), 1000).await;
-        assert!(objects.is_empty(), "{objects:?}");
-        assert_eq!(prefixes, ["a/x.zip.del"]);
+        assert_eq!(objects, ["a/x.zip", "a/z.txt"], "{prefixes:?}");
+        assert!(prefixes.is_empty(), "{prefixes:?}");
+    }
+
+    /// More than a page of raw keys that collapse into one CommonPrefix never
+    /// gives `is_truncated = false` while keys remain, and a client token that
+    /// is that prefix resumes past it.
+    #[tokio::test]
+    async fn a_collapsed_prefix_of_many_keys_never_ends_the_listing_early() {
+        let mut keys: Vec<String> = (0..2500).map(|i| format!("a.{i:05}")).collect();
+        keys.push("b".into());
+        keys.push("c.delta".into());
+        let (s3, _fake) = backend_with_keys(&keys).await;
+        let page = s3
+            .list_objects_delegated("b", "", Some("."), 1, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.common_prefixes, ["a."]);
+        assert!(page.is_truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some("a."));
+        let (objects, prefixes) = walk_pages(&s3, "", Some("."), 1).await;
+        assert_eq!(objects, ["b", "c"]);
+        assert_eq!(prefixes, ["a."]);
+        let page = s3
+            .list_objects_delegated("b", "", Some("."), 1000, Some("a."))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            page.common_prefixes.is_empty(),
+            "{:?}",
+            page.common_prefixes
+        );
+        assert_eq!(page.objects.len(), 2);
+    }
+
+    /// The safe delimiter `/` costs what it cost before: one upstream LIST
+    /// per page, for a small page and for a walk of 3 pages.
+    #[tokio::test]
+    async fn a_safe_delimiter_costs_one_list_per_page() {
+        let keys: Vec<String> = (0..30).map(|i| format!("d{i:02}/x")).collect();
+        let (s3, fake) = backend_with_keys(&keys).await;
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = s3
+                .list_objects_delegated("b", "", Some("/"), 10, token.as_deref())
+                .await
+                .unwrap()
+                .unwrap();
+            pages += 1;
+            if !page.is_truncated {
+                break;
+            }
+            token = page.next_continuation_token;
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(lists(&fake), pages, "{:?}", fake.requests());
     }
 
     /// The one case where the backends differ: a folder that holds ONLY a
@@ -2105,8 +2323,8 @@ mod delegated_cost_tests {
         let (objects, prefixes) = walk_pages(&s3, "", Some("r"), 1000).await;
         assert_eq!(objects, ["a/x"]);
         assert_eq!(prefixes, ["a/r"], "shown: the probe could not tell");
-        let (_, prefixes) = walk_pages(&s3, "", Some("."), 1000).await;
-        assert_eq!(prefixes, [".", "a/reference."], "{prefixes:?}");
+        let (_, prefixes) = walk_pages(&s3, "", Some(".dg"), 1000).await;
+        assert_eq!(prefixes, [".dg"], "{prefixes:?}");
         let (_, prefixes) = walk_pages(&s3, "", Some("/"), 1000).await;
         assert_eq!(prefixes, ["a/"], "`.dg/` is never shown: {prefixes:?}");
         assert!(
@@ -2128,7 +2346,7 @@ mod delegated_cost_tests {
         ] {
             let (s3, fake) = backend_with_keys(&probe_keys()).await;
             fake.fail("LIST", "max-keys=16", status, code, u32::MAX);
-            for (prefix, delimiter) in [("", "r"), ("", ".")] {
+            for (prefix, delimiter) in [("", "r"), ("", ".dg")] {
                 let page = s3
                     .list_objects_delegated("b", prefix, Some(delimiter), 1000, None)
                     .await;

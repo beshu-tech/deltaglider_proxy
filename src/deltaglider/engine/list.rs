@@ -620,20 +620,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // exactly once across all pages.
 
         if let Some(delim) = delimiter {
-            // Collapse objects into CommonPrefixes where the key contains the delimiter
-            let mut collapsed_objects = Vec::new();
-            let mut seen_prefixes = std::collections::BTreeSet::new();
-
-            for (key, meta) in items {
-                let after = &key[prefix.len()..];
-                if let Some(pos) = after.find(delim) {
-                    let cp = format!("{}{}{}", prefix, &after[..pos], delim);
-                    seen_prefixes.insert(cp);
-                } else {
-                    collapsed_objects.push((key, meta));
-                }
-            }
-
+            let (collapsed_objects, seen_prefixes) = collapse_by_delimiter(items, prefix, delim);
             let collapsed_prefixes: Vec<String> = seen_prefixes.into_iter().collect();
             let page = interleave_and_paginate(
                 collapsed_objects,
@@ -663,6 +650,39 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             })
         }
     }
+}
+
+/// The CommonPrefix that `key` collapses into under `prefix` and `delimiter`:
+/// the key up to and including the first delimiter after the prefix. `None`
+/// when no delimiter follows the prefix, or the delimiter is empty.
+pub(crate) fn common_prefix_of(prefix: &str, delimiter: &str, key: &str) -> Option<String> {
+    if delimiter.is_empty() {
+        return None;
+    }
+    let after = key.get(prefix.len()..)?;
+    let pos = after.find(delimiter)?;
+    Some(format!("{prefix}{}{delimiter}", &after[..pos]))
+}
+
+/// THE delimiter collapse of a listing of LOGICAL keys (the bulk path and the
+/// S3 backend's suffix-unsafe delimiters both call it): the entries without a
+/// delimiter after the prefix, and the CommonPrefixes of the others.
+pub(crate) fn collapse_by_delimiter<O>(
+    items: impl IntoIterator<Item = (String, O)>,
+    prefix: &str,
+    delimiter: &str,
+) -> (Vec<(String, O)>, std::collections::BTreeSet<String>) {
+    let mut kept = Vec::new();
+    let mut prefixes = std::collections::BTreeSet::new();
+    for (key, meta) in items {
+        match common_prefix_of(prefix, delimiter, &key) {
+            Some(cp) => {
+                prefixes.insert(cp);
+            }
+            None => kept.push((key, meta)),
+        }
+    }
+    (kept, prefixes)
 }
 
 /// Pure: no stored key starts with `/` (`ObjectKey::parse` strips leading

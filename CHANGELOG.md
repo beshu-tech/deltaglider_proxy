@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- On an S3 backend, a LIST with a delimiter that occurs inside the suffix `.delta` (for example `.` or `l`) now groups common prefixes by the original key, as the filesystem backend does. Before, the proxy returned a prefix of the stored name (`d/y.` for the delta `d/y.delta`) and could hide an object such as `a/x.zip`. Such a LIST can cost more backend requests. A folder that holds only the proxy's own files is still shown, with any delimiter.
 - Windows XP style: the file details header keeps the layout of the other styles, and only its look changes. The Luna title bar holds the icon, the file name on one line and the close button; the full object key is under it. Before, a long file name broke out of the title bar, and the key was cut to one line.
 
 ## v2.2.4 — 2026-11-18

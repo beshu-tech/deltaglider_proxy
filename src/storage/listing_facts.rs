@@ -92,6 +92,19 @@ pub fn skip_past_facts(last_key: &str) -> Option<&'static str> {
     is_facts_key(last_key).then_some(PAST_FACTS)
 }
 
+/// Pure: can a delimiter be sent to a backend that lists STORED names, with
+/// the same answer as for the logical keys? A delta is stored as `key.delta`
+/// (and a foreign pair as `key.delta.delta`), so a delimiter that occurs
+/// inside `.delta`, or that ends with a leading part of it, can match in the
+/// suffix where the logical key has no match. `""` means no delimiter.
+pub fn delimiter_is_suffix_safe(delimiter: &str) -> bool {
+    const SUFFIX: &str = ".delta";
+    if delimiter.is_empty() {
+        return true;
+    }
+    !SUFFIX.contains(delimiter) && !(1..=SUFFIX.len()).any(|n| delimiter.ends_with(&SUFFIX[..n]))
+}
+
 /// Where a client listing continues when the page it read ends at `last_key`
 /// below a `.dg` directory: past the whole directory, which holds no listed
 /// key. It is `<dir>/.dg/` + U+10FFFF, never `.dg0`: a client key `a/.dg0`
@@ -162,7 +175,8 @@ pub fn shows_in_listing(key: &str) -> bool {
 /// cover a client key (`.` covers `.dg/x` and `.well-known/x`), so the listing
 /// looks under it before it shows it.
 ///
-/// This is the whole of what the text of a prefix can prove. Two shapes need a
+/// This is the whole of what the text of a prefix can prove, for any
+/// delimiter. Two shapes need a
 /// request per prefix to prove, and are NOT checked (a LIST page would cost
 /// one request per folder): a folder `f/` that holds only a baseline (an
 /// orphan; DeleteBucket reclaims it), and a prefix with an incomplete folder
@@ -719,6 +733,45 @@ mod tests {
         assert_eq!(token_for([&stale], "e1", 10), None);
         assert_eq!(token_for([&a, &a.clone()], "e1", 10), Some("t1".into()));
         assert_eq!(token_for([&a, &entry("e1", 10, "t2")], "e1", 10), None);
+    }
+
+    // THE rule of `delimiter_is_suffix_safe`: for a safe delimiter, the first
+    // match after the request prefix is the same in the stored name
+    // (`K.delta`, `K.delta.delta`) as in the logical key `K`.
+    proptest::proptest! {
+        #[test]
+        fn a_safe_delimiter_matches_the_stored_name_like_the_key(
+            key in "[.delta/x]{0,10}",
+            cut in 0usize..10,
+            delimiter in "[.delta/x]{1,4}",
+        ) {
+            proptest::prop_assume!(delimiter_is_suffix_safe(&delimiter));
+            let prefix = &key[..cut.min(key.len())];
+            for stored in [format!("{key}.delta"), format!("{key}.delta.delta")] {
+                proptest::prop_assert_eq!(
+                    key[prefix.len()..].find(&delimiter),
+                    stored[prefix.len()..].find(&delimiter),
+                    "{:?} {:?} {:?}", key, prefix, delimiter
+                );
+            }
+        }
+
+        #[test]
+        fn an_unsafe_delimiter_can_match_in_the_suffix_only(
+            delimiter in "[.delta/x]{1,4}",
+        ) {
+            if !delimiter_is_suffix_safe(&delimiter) {
+                // Some key has no match, and its stored name has one.
+                let witness = (0..=delimiter.len()).any(|n| {
+                    let key = &delimiter[..n];
+                    key.find(&delimiter).is_none()
+                        && [format!("{key}.delta"), format!("{key}.delta.delta")]
+                            .iter()
+                            .any(|s| s.find(&delimiter).is_some())
+                }) || [".delta", ".delta.delta"].iter().any(|s| s.contains(&delimiter));
+                proptest::prop_assert!(witness, "{delimiter:?}");
+            }
+        }
     }
 
     proptest::proptest! {

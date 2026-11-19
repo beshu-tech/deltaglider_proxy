@@ -24,7 +24,8 @@ pub use engine::store::{
     BLOCKING_HASH_THRESHOLD,
 };
 pub(crate) use engine::{
-    build_raw_backend, effective_legacy_key_id, interleave_and_paginate, CounterPrior, SpoolWait,
+    build_raw_backend, collapse_by_delimiter, common_prefix_of, effective_legacy_key_id,
+    interleave_and_paginate, CounterPrior, SpoolWait,
 };
 #[cfg(test)]
 pub(crate) use engine::{s3_engine, store_deltas};
