@@ -31,8 +31,12 @@ const FONT_TITLE_XP = "'Trebuchet MS', Tahoma, Verdana, 'DejaVu Sans', sans-seri
 const FONT_MONO_XP = "'Lucida Console', 'Courier New', 'JetBrains Mono Variable', monospace";
 /** `--font-display` of each style: the face of headings and display numbers (`.dg-display`). */
 export const FONT_DISPLAY: Record<ThemeStyle, string> = { instrument: 'var(--font-ui)', editorial: FONT_SERIF, xp: FONT_TITLE_XP };
+/** Manrope's space is narrow: at 11-13 px "2h 55m ago" reads as one token. A metric of the face, so it travels with it. */
+const FONT_UI_SPACING = '0.12em';
 /** The styles that replace the UI and code faces too (the others keep Manrope and JetBrains Mono). */
-const FONT_FACES: Partial<Record<ThemeStyle, { ui: string; mono: string }>> = { xp: { ui: FONT_UI_XP, mono: FONT_MONO_XP } };
+const FONT_FACES: Partial<Record<ThemeStyle, { ui: string; uiSpacing: string; mono: string }>> = {
+  xp: { ui: FONT_UI_XP, uiSpacing: 'normal', mono: FONT_MONO_XP },
+};
 
 /** Pure: the custom-property name of a palette token (`BG_CARD` → `--dg-bg-card`). */
 export function cssVarName(token: keyof ColorTokens | string): string {
@@ -83,14 +87,14 @@ export function themeSelector(style: ThemeStyle, mode: 'dark' | 'light'): string
 export function themeStylesheet(): string {
   const styles = Object.keys(PALETTES) as ThemeStyle[];
   return [
-    `:root { --font-ui: ${FONT_UI}; --font-mono: ${FONT_MONO}; --font-display: ${FONT_DISPLAY[DEFAULT_THEME_STYLE]}; }`,
+    `:root { --font-ui: ${FONT_UI}; --font-ui-spacing: ${FONT_UI_SPACING}; --font-mono: ${FONT_MONO}; --font-display: ${FONT_DISPLAY[DEFAULT_THEME_STYLE]}; }`,
     ...styles
       .filter((st) => st !== DEFAULT_THEME_STYLE)
       .flatMap((st) => {
         const faces = FONT_FACES[st];
         return [
           `[data-theme-style="${st}"] { --font-display: ${FONT_DISPLAY[st]}; }`,
-          ...(faces ? [`[data-theme-style="${st}"] { --font-ui: ${faces.ui}; --font-mono: ${faces.mono}; }`] : []),
+          ...(faces ? [`[data-theme-style="${st}"] { --font-ui: ${faces.ui}; --font-ui-spacing: ${faces.uiSpacing}; --font-mono: ${faces.mono}; }`] : []),
         ];
       }),
     ...styles.flatMap((st) =>

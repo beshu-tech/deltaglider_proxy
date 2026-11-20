@@ -16,7 +16,6 @@ import {
 } from '@ant-design/icons';
 import { THEME_STYLES, useTheme } from '../ThemeContext';
 import TruncatedName from './TruncatedName';
-import { SPACE } from './shared-styles';
 
 interface Props {
   identityLabel: string;
@@ -146,15 +145,9 @@ export default function AccountMenu({
       {open && (
         <div className="account-menu-panel">
           {/* Who is signed in, and how. Outside the menu: it is text, not an item. */}
-          <div
-            style={{ padding: `2px ${SPACE.xxs}px ${SPACE.sm}px`, marginBottom: SPACE.xs, borderBottom: '1px solid color-mix(in srgb, currentColor 14%, transparent)' }}
-          >
-            <TruncatedName text={label} style={{ fontWeight: 700, fontSize: 13 }} />
-            {identityDetail && (
-              <div style={{ fontSize: 11, opacity: 0.7, marginTop: 2, lineHeight: 1.4, wordBreak: 'break-word' }}>
-                {identityDetail}
-              </div>
-            )}
+          <div className="account-menu-identity">
+            <TruncatedName text={label} className="account-menu-identity-name" />
+            {identityDetail && <div className="account-menu-identity-detail">{identityDetail}</div>}
           </div>
           <div ref={itemsRef} role="menu" aria-label="Account" onKeyDown={onMenuKeyDown}>
           <div className="account-menu-section account-menu-section--first" role="group" aria-label="Navigation">

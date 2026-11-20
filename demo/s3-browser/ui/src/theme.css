@@ -35,9 +35,9 @@ body {
   font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  /* Manrope's space is narrow: at 11-13 px "2h 55m ago" reads as one token.
-     Inherited by every element, AntD tables and portals included. */
-  word-spacing: 0.12em;
+  /* The UI face's own word spacing (themeVars.ts). Inherited by every
+     element, AntD tables and portals included. */
+  word-spacing: var(--font-ui-spacing);
 }
 /* Monospace has a full-width space already. Components set mono inline
    (`fontFamily: 'var(--font-mono)'`), so match the inline style too; the
@@ -48,7 +48,7 @@ code, kbd, pre, samp, .ant-typography code,
 }
 /* A UI-font child inside a mono element gets the UI spacing back. */
 [style*="font-mono"] [style*="font-ui"], [style*="monospace"] [style*="font-ui"] {
-  word-spacing: 0.12em;
+  word-spacing: var(--font-ui-spacing);
 }
 
 
@@ -78,6 +78,14 @@ code, kbd, pre, samp, .ant-typography code,
   /* Sidebar bucket and backend names, and the vertical padding of a bucket row. */
   --sidebar-name-font: var(--font-mono);
   --bucket-row-pad-y: 8px;
+  /* The identity band at the top of the account menu. */
+  --menu-identity-bg: transparent;
+  --menu-identity-text: var(--menu-item-text);
+  --menu-identity-shadow: none;
+  /* Menus (account menu, share menu): corners and the hovered row's ink. */
+  --menu-radius: 12px;
+  --menu-item-radius: 6px;
+  --menu-item-hover-text: var(--menu-item-text);
 }
 
 /* ───── Theme-only tints ───── */
@@ -608,7 +616,7 @@ code, kbd, pre, samp, .ant-typography code,
   right: 0;
   z-index: 20;
   padding: 12px;
-  border-radius: 14px;
+  border-radius: var(--menu-radius);
   border: 1px solid var(--menu-border);
   background: var(--menu-panel-bg);
   box-shadow: var(--menu-shadow);
@@ -626,6 +634,30 @@ code, kbd, pre, samp, .ant-typography code,
   right: 0;
 }
 
+/* Who is signed in: a band across the top of the panel (the panel's padding is 12 px). */
+.account-menu-identity {
+  margin: -12px -12px 8px;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--menu-border);
+  border-radius: inherit;
+  border-end-start-radius: 0;
+  border-end-end-radius: 0;
+  background: var(--menu-identity-bg);
+  color: var(--menu-identity-text);
+  text-shadow: var(--menu-identity-shadow);
+}
+.account-menu-identity-name {
+  font-size: 13px;
+  font-weight: 700;
+}
+.account-menu-identity-detail {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  opacity: 0.7;
+  word-break: break-word;
+}
+
 /* A plain menu row: no fill at rest, a tint on hover. */
 .account-menu-item {
   appearance: none;
@@ -637,7 +669,7 @@ code, kbd, pre, samp, .ant-typography code,
   margin: 0 0 2px;
   padding: 8px 10px;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--menu-item-radius);
   cursor: pointer;
   text-align: left;
   font-size: 13px;
@@ -650,8 +682,71 @@ code, kbd, pre, samp, .ant-typography code,
 .account-menu-item:last-child {
   margin-bottom: 0;
 }
-.account-menu-item:hover {
+.account-menu-item:is(:hover, :focus-visible) {
   background: var(--menu-item-hover);
+  color: var(--menu-item-hover-text);
+}
+
+/* The share split button's expiry menu: the same panel and rows as the account menu. */
+.dg-share-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  min-width: 100%;
+  width: max-content;
+  margin-top: 4px;
+  padding: 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--menu-border);
+  border-radius: var(--menu-radius);
+  background: var(--menu-panel-bg);
+  box-shadow: var(--menu-shadow);
+  backdrop-filter: var(--surface-blur);
+  -webkit-backdrop-filter: var(--surface-blur);
+}
+.dg-share-menu-label {
+  padding: 6px 10px 8px;
+  color: var(--dg-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.dg-share-menu-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: var(--menu-item-radius);
+  color: var(--menu-item-text);
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.dg-share-menu-option[aria-selected='true'] {
+  font-weight: 600;
+}
+.dg-share-menu-option:is(:hover, :focus-visible) {
+  background: var(--menu-item-hover);
+  color: var(--menu-item-hover-text);
+}
+.dg-share-menu-check {
+  width: 12px;
+  font-size: 12px;
+  color: var(--dg-accent-blue);
+  visibility: hidden;
+}
+.dg-share-menu-option[aria-selected='true'] .dg-share-menu-check {
+  visibility: visible;
+}
+.dg-share-menu-option:is(:hover, :focus-visible) .dg-share-menu-check {
+  color: inherit;
+}
+.dg-share-menu-default {
+  margin-left: auto;
+  padding-left: 12px;
+  font-size: 12px;
+  font-weight: 400;
+  opacity: 0.7;
 }
 
 .account-menu-section {
@@ -1402,6 +1497,12 @@ code, kbd, pre, samp, .ant-typography code,
   --xp-seg-mask: repeating-linear-gradient(90deg, #000 0 7px, transparent 7px 9px);
   --sidebar-name-font: var(--font-ui);
   --bucket-row-pad-y: 4px;
+  --menu-identity-bg: var(--xp-title-bg);
+  --menu-identity-text: var(--xp-title-text);
+  --menu-identity-shadow: var(--xp-title-shadow);
+  --menu-radius: 0;
+  --menu-item-radius: 0;
+  --menu-item-hover-text: var(--xp-select-text);
 }
 [data-theme-style="xp"][data-theme="light"] {
   --xp-window-border: #0831d9;
@@ -1653,46 +1754,30 @@ code, kbd, pre, samp, .ant-typography code,
   border-radius: 2px;
 }
 
-/* ── Windows: dialogs and drawers get the Luna title bar ── */
+/* ── Windows: dialogs and drawers get the Luna title bar ──
+   The modal's geometry and title-bar fill are AntD tokens (theme.ts, xpTheme); here only paint. */
 [data-theme-style="xp"] .ant-modal-container {
-  padding: 0;
-  overflow: hidden;
-  background: var(--dg-bg-base);
   border: 1px solid var(--xp-window-border);
   border-radius: 8px 8px 0 0;
   box-shadow: var(--dg-float-shadow);
 }
-[data-theme-style="xp"] .ant-modal-header,
 [data-theme-style="xp"] .ant-drawer-header {
   margin: 0;
   padding: 6px 36px 6px 10px;
   background: var(--xp-title-bg);
   border: 0;
-  border-radius: 7px 7px 0 0;
   min-height: 30px;
   display: flex;
   align-items: center;
 }
-[data-theme-style="xp"] .ant-drawer-header {
-  border-radius: 0;
-}
 [data-theme-style="xp"] :is(.ant-modal-title, .ant-drawer-title) {
   color: var(--xp-title-text);
   text-shadow: var(--xp-title-shadow);
+}
+[data-theme-style="xp"] .ant-drawer-title {
   font-size: 14px;
 }
-[data-theme-style="xp"] .ant-modal-body {
-  padding: 16px 20px;
-}
-[data-theme-style="xp"] .ant-modal-footer {
-  padding: 0 20px 16px;
-}
 [data-theme-style="xp"] :is(.ant-modal-close, .ant-drawer-close) {
-  top: 4px;
-  inset-inline-end: 5px;
-  width: 22px;
-  height: 22px;
-  margin: 0;
   background: var(--xp-close-bg);
   border: 1px solid var(--dg-bg-card);
   border-radius: 3px;
@@ -1700,7 +1785,11 @@ code, kbd, pre, samp, .ant-typography code,
 }
 [data-theme-style="xp"] .ant-drawer-close {
   position: absolute;
-  inset-inline-start: auto;
+  top: 4px;
+  inset-inline: auto 5px;
+  width: 22px;
+  height: 22px;
+  margin: 0;
 }
 [data-theme-style="xp"] :is(.ant-modal-close, .ant-drawer-close):hover {
   background: var(--xp-close-bg);
@@ -1958,18 +2047,8 @@ code, kbd, pre, samp, .ant-typography code,
 }
 
 /* ── Account menu: the XP start-menu panel, blue hot-track rows ── */
-[data-theme-style="xp"] .account-menu-panel {
-  padding: 2px;
-  border-radius: 0;
-}
 [data-theme-style="xp"] .account-menu-item {
-  border-radius: 0;
-  padding: 6px 12px;
   transition: none;
-}
-[data-theme-style="xp"] .account-menu-item:is(:hover, :focus-visible) {
-  background: var(--xp-select-bg);
-  color: var(--xp-select-text);
 }
 [data-theme-style="xp"] .account-menu-trigger,
 [data-theme-style="xp"] .account-menu-wrap--compact .account-menu-trigger {
@@ -2009,17 +2088,6 @@ code, kbd, pre, samp, .ant-typography code,
   letter-spacing: 0;
   font-size: 12px;
   font-weight: 700;
-}
-/* The Start-menu header: the user block of the account menu is a title bar. */
-[data-theme-style="xp"] .account-menu-panel > :first-child {
-  margin: -2px -2px 2px;
-  padding: 8px 12px;
-  background: var(--xp-title-bg);
-  color: var(--xp-title-text);
-  text-shadow: var(--xp-title-shadow);
-}
-[data-theme-style="xp"] .account-menu-panel > :first-child * {
-  color: var(--xp-title-text) !important;
 }
 /* The bulk-action bar: a docked toolbar, not a floating pill. */
 [data-theme-style="xp"] [role='toolbar'][aria-label='Selection actions'] {

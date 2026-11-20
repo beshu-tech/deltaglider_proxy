@@ -207,7 +207,26 @@ function xpTheme(isDark: boolean) {
     components: {
       ...COMPONENTS,
       Button: { fontWeight: 400, primaryShadow: 'none', defaultShadow: 'none', dangerShadow: 'none' },
-      Modal: { ...COMPONENTS.Modal, borderRadiusLG: 8 },
+      // The Luna window: a 32 px title bar (padding 5 + 14 px title) with a 22 px close button
+      // centred in it; AntD derives the close position from padding, title size and controlHeight.
+      Modal: {
+        ...COMPONENTS.Modal,
+        borderRadiusLG: 8,
+        padding: 5,
+        fontSizeHeading5: 14,
+        controlHeight: 22,
+        contentPadding: 0,
+        contentBg: c.BG_BASE,
+        headerBg: 'var(--xp-title-bg)',
+        titleColor: 'var(--xp-title-text)',
+        titleFontSize: 14,
+        headerPadding: '5px 36px 5px 10px',
+        headerMarginBottom: 0,
+        bodyPadding: 16,
+        footerPadding: '0 16px 16px',
+        footerMarginTop: 0,
+        confirmBodyPadding: 16,
+      },
     },
   };
 }

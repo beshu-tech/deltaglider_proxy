@@ -24,7 +24,7 @@ import { passthroughReason, passthroughSentence } from '../passthroughReason';
 import { useNavigation } from '../NavigationContext';
 import { bucketSettingsUrl } from '../urlState';
 import { objectStorageHeadline } from '../deltaSummary';
-import { cssVar, tint } from '../themeVars';
+import { tint } from '../themeVars';
 import { Z } from '../theme';
 
 const SHARE_DURATIONS = [
@@ -120,19 +120,9 @@ function InfoRow({ label, value, title }: { label: string; value: string; title?
 function ShareDurationButton({
   durations,
   onSelect,
-  accentBlue,
-  border,
-  textMuted,
-  textPrimary,
-  bgSidebar,
 }: {
   durations: { label: string; seconds: number }[];
   onSelect: (seconds: number) => void;
-  accentBlue: string;
-  border: string;
-  textMuted: string;
-  textPrimary: string;
-  bgSidebar: string;
 }) {
   // The AntD primary of the theme, the same as Download beside it: the raw
   // accent was a brighter teal in the dark theme and read as hovered.
@@ -188,58 +178,28 @@ function ShareDurationButton({
       >
         <span style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>&#9660;</span>
       </button>
-      {/* Duration dropdown */}
+      {/* Duration dropdown: the menu family's classes (theme.css), wide enough for its longest row. */}
       {open && (
-        <div
-          role="listbox"
-          aria-label="Link expiry duration"
-          style={{
-            position: 'absolute',
-            top: '100%',
-            left: 0,
-            right: 0,
-            marginTop: 4,
-            background: bgSidebar,
-            border: `1px solid ${border}`,
-            borderRadius: 8,
-            boxShadow: cssVar('FLOAT_SHADOW'),
-            zIndex: Z.menu,
-            overflow: 'hidden',
-          }}
-        >
-          <div style={{ padding: `${SPACE.sm}px ${SPACE.md}px ${SPACE.xs}px`, fontSize: 12, fontWeight: 600, color: textMuted, fontFamily: 'var(--font-ui)' }}>
-            Link expires after
-          </div>
+        <div role="listbox" aria-label="Link expiry duration" className="dg-share-menu" style={{ zIndex: Z.menu }}>
+          <div className="dg-share-menu-label">Link expires after</div>
           {durations.map((d) => {
             // The main Share button uses the last (longest) duration: the
             // list marks it, so the default is visible before a choice.
             const isDefault = d.seconds === durations[durations.length - 1].seconds;
             return (
-            <div
-              key={d.seconds}
-              role="option"
-              className="dg-hover-tint"
-              tabIndex={0}
-              aria-selected={isDefault}
-              onClick={() => { onSelect(d.seconds); setOpen(false); }}
-              onKeyDown={activateOnKey(() => { onSelect(d.seconds); setOpen(false); })}
-              style={{
-                padding: `${SPACE.sm}px ${SPACE.md}px`,
-                cursor: 'pointer',
-                fontSize: 13,
-                fontFamily: 'var(--font-ui)',
-                color: textPrimary,
-                display: 'flex',
-                alignItems: 'center',
-                gap: SPACE.sm,
-                fontWeight: isDefault ? 600 : 400,
-                borderTop: `1px solid ${border}`,
-              }}
-            >
-              <CheckOutlined aria-hidden="true" style={{ fontSize: 12, width: 12, color: accentBlue, visibility: isDefault ? 'visible' : 'hidden' }} />
-              <span>{d.label}</span>
-              {isDefault && <span style={{ marginLeft: 'auto', fontSize: 12, color: textMuted }}>Default</span>}
-            </div>
+              <div
+                key={d.seconds}
+                role="option"
+                className="dg-share-menu-option"
+                tabIndex={0}
+                aria-selected={isDefault}
+                onClick={() => { onSelect(d.seconds); setOpen(false); }}
+                onKeyDown={activateOnKey(() => { onSelect(d.seconds); setOpen(false); })}
+              >
+                <CheckOutlined aria-hidden="true" className="dg-share-menu-check" />
+                <span>{d.label}</span>
+                {isDefault && <span className="dg-share-menu-default">Default</span>}
+              </div>
             );
           })}
         </div>
@@ -619,11 +579,6 @@ export default function InspectorPanel({
                   <ShareDurationButton
                     durations={SHARE_DURATIONS}
                     onSelect={(seconds) => handleCopyLink(seconds)}
-                    accentBlue={ACCENT_BLUE}
-                    border={BORDER}
-                    textMuted={TEXT_MUTED}
-                    textPrimary={TEXT_PRIMARY}
-                    bgSidebar={BG_SIDEBAR}
                   />
                 </div>
               </div>
