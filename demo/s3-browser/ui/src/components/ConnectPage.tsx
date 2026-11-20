@@ -58,7 +58,7 @@ interface Props {
 const LOGIN_CARD_SHADOW = 'var(--login-shadow)';
 
 export default function ConnectPage({ onConnect, showError }: Props) {
-  const { BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
+  const { TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, ACCENT_BLUE } = useColors();
   const { isDark, toggleTheme } = useTheme();
   const [accessKey, setAccessKey] = useState('');
   const [secretKey, setSecretKey] = useState('');
@@ -336,30 +336,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   const isBootstrap = choices.primary === 'password';
   const isOpenSignedOutReconnect = authMode === 'open' && openSignedOut;
 
-  const inputStyle = {
-    background: 'var(--input-bg)',
-    borderColor: BORDER,
-    borderRadius: 10,
-    height: 44,
-    fontFamily: "var(--font-mono)" as const,
-    fontSize: 13,
-  };
-  const loginInputStyle = {
-    ...inputStyle,
-    background: 'color-mix(in srgb, var(--input-bg) 82%, transparent)',
-    borderColor: 'color-mix(in srgb, var(--glass-border) 82%, var(--focus-ring) 18%)',
-    borderRadius: 16,
-    height: 52,
-    fontSize: 14,
-  };
-  const recoveryInputStyle = {
-    ...inputStyle,
-    background: 'color-mix(in srgb, var(--input-bg) 62%, var(--login-panel-bg) 38%)',
-    borderColor: 'color-mix(in srgb, var(--login-card-border) 86%, var(--focus-ring) 14%)',
-    color: TEXT_PRIMARY,
-    borderRadius: 12,
-  };
-
   if (detecting) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
@@ -429,8 +405,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     placeholder="config DB key"
                     autoFocus
                     rows={2}
-                    className="dg-recovery-hash-input"
-                    style={{ ...recoveryInputStyle, height: 'auto', fontSize: 13, fontFamily: "var(--font-mono)" }}
+                    className="dg-login-input dg-recovery-hash-input"
                   />
                 </div>
                 <Button
@@ -564,7 +539,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     onPressEnter={handleConnect}
                     autoFocus={externalProviders.length === 0}
                     autoComplete="current-password"
-                    style={loginInputStyle}
+                    className="dg-login-input"
                   />
                   <Text className="dg-login-hint">
                     For first-time setup and recovery
@@ -583,7 +558,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                       autoComplete="username"
                       spellCheck={false}
                       autoFocus={externalProviders.length === 0}
-                      style={loginInputStyle}
+                      className="dg-login-input"
                     />
                   </div>
 
@@ -598,7 +573,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                       onChange={setSecretKey}
                       onPressEnter={handleConnect}
                       autoComplete="current-password"
-                      style={loginInputStyle}
+                      className="dg-login-input"
                     />
                   </div>
                 </div>

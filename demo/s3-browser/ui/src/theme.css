@@ -86,6 +86,11 @@ code, kbd, pre, samp, .ant-typography code,
   --window-title-shadow: none;
   --login-title: none;
   /* The login card's corner theme toggle and its primary action. */
+  /* The login card's text fields. */
+  --login-input-height: 52px;
+  --login-input-radius: 16px;
+  --login-input-bg: color-mix(in srgb, var(--input-bg) 82%, transparent);
+  --login-input-border: color-mix(in srgb, var(--glass-border) 82%, var(--focus-ring) 18%);
   --login-toggle-inset: 18px;
   --login-toggle-size: 24px;
   --login-toggle-radius: 50%;
@@ -1460,6 +1465,22 @@ code, kbd, pre, samp, .ant-typography code,
   font: 500 12px/1.4 var(--font-ui);
 }
 
+/* The login card's fields: the outer box (an affix wrapper, or the input itself). */
+.dg-login-input:is(.ant-input, .ant-input-affix-wrapper) {
+  height: var(--login-input-height);
+  border-color: var(--login-input-border);
+  border-radius: var(--login-input-radius);
+  background: var(--login-input-bg);
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+.dg-login-input.ant-input-affix-wrapper > .ant-input {
+  background: transparent;
+}
+.dg-login-input.dg-recovery-hash-input {
+  height: auto;
+  font-size: 13px;
+}
 .dg-recovery-hash-input,
 .dg-recovery-hash-input .ant-input {
   color: var(--login-hero-text) !important;
@@ -1730,6 +1751,10 @@ code, kbd, pre, samp, .ant-typography code,
   --window-title-text: var(--xp-title-text);
   --window-title-shadow: var(--xp-title-shadow);
   --login-title: 'Log On to DeltaGlider';
+  --login-input-height: 34px;
+  --login-input-radius: 2px;
+  --login-input-bg: var(--dg-bg-card);
+  --login-input-border: var(--xp-field-border);
   --login-toggle-inset: 3px 5px auto auto;
   --login-toggle-size: 22px;
   --login-toggle-radius: 3px;
@@ -2153,11 +2178,6 @@ code, kbd, pre, samp, .ant-typography code,
   font-style: italic;
   letter-spacing: 0.06em;
   text-shadow: none;
-}
-[data-theme-style="xp"] .dg-login-card :is(.ant-input, .ant-input-affix-wrapper) {
-  border-radius: 2px;
-  border-color: var(--xp-field-border);
-  background: var(--dg-bg-card);
 }
 [data-theme-style="xp"] .dg-login-sso-button {
   border: 1px solid var(--xp-btn-border);

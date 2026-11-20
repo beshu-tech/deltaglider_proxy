@@ -56,6 +56,7 @@ interface BaseProps {
   placeholder?: string;
   size?: 'small' | 'middle' | 'large';
   style?: CSSProperties;
+  className?: string;
   autoComplete?: string;
   /**
    * Render a plain (always-visible) `Input` instead of `Input.Password`. Used
@@ -109,7 +110,7 @@ const BLANK_KEEPS_PLACEHOLDER = '(leave blank to keep existing)';
 const NEW_PLACEHOLDER = 'Secret';
 
 export default function MaskedSecretInput(props: MaskedSecretInputProps) {
-  const { onChange, placeholder, size, style, autoComplete = 'new-password', reveal } = props;
+  const { onChange, placeholder, size, style, className, autoComplete = 'new-password', reveal } = props;
 
   // In sentinel mode a masked field renders EMPTY (never the sentinel, never a
   // real token); once the operator types it unmasks and shows the live value.
@@ -161,6 +162,7 @@ export default function MaskedSecretInput(props: MaskedSecretInputProps) {
       aria-invalid={props['aria-invalid']}
       status={props.status}
       style={style}
+      className={className}
     />
   );
 }
