@@ -1466,7 +1466,7 @@ code, kbd, pre, samp, .ant-typography code,
   --xp-close-bg: linear-gradient(180deg, #d9715a 0%, #bf4a30 55%, #9e3219 100%);
   --xp-min-bg: linear-gradient(180deg, #4d7fd6 0%, #2f5cb8 55%, #223f8c 100%);
   --xp-taskbar-bg: linear-gradient(180deg, #1c2542 0%, #2f3b66 9%, #1c2542 18%, #1c2542 92%, #0f1428 100%);
-  --xp-tray-bg: linear-gradient(180deg, #0f1a38 0%, #1c2c58 20%, #162349 100%);
+  --xp-tray-bg: linear-gradient(180deg, #1a2a58 0%, #31498a 9%, #1a2a58 18%, #1a2a58 92%, #0f1428 100%);
   --xp-start-bg: linear-gradient(180deg, #4aa83b 0%, #348a27 25%, #2b7620 80%, #225f19 100%);
   --xp-start-border: #0f3a0a;
   --xp-scroll-track: #141a2c;
