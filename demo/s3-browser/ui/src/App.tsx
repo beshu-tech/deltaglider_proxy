@@ -545,6 +545,7 @@ export default function App() {
             isMobile={isMobile}
             proxyVersion={identity?.version}
             proxyBuildTime={identity?.build_time}
+            onHomeClick={navigateToBrowse}
           />
         )}
 

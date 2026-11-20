@@ -98,6 +98,8 @@ interface Props {
   isMobile: boolean;
   proxyVersion?: string;
   proxyBuildTime?: string;
+  /** The product wordmark in the footer opens the file browser. */
+  onHomeClick?: () => void;
 }
 
 export default function Sidebar({
@@ -116,6 +118,7 @@ export default function Sidebar({
   isMobile,
   proxyVersion,
   proxyBuildTime,
+  onHomeClick,
 }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -407,6 +410,11 @@ export default function Sidebar({
     fontFamily: "var(--font-ui)",
   };
 
+  const goHome = () => {
+    onHomeClick?.();
+    if (isMobile) onClose();
+  };
+
   const renderBucketRow = (b: BucketInfo) => {
     const isUnavailable = Boolean(b.unavailable);
     // On the upload page "Upload files" is the one current entry (D32): the
@@ -431,7 +439,7 @@ export default function Sidebar({
             flex: 1,
             minWidth: 0,
             gap: 8,
-            padding: `${SPACE.xs}px ${SPACE.sm}px`,
+            padding: `var(--bucket-row-pad-y) ${SPACE.sm}px`,
             borderRadius: 6,
             marginBottom: 2,
             cursor: isUnavailable ? 'not-allowed' : 'pointer',
@@ -448,7 +456,7 @@ export default function Sidebar({
             title={false}
             style={{
               lineHeight: '20px',
-              fontFamily: "var(--font-mono)",
+              fontFamily: 'var(--sidebar-name-font)',
               fontSize: 13,
               fontWeight: isCurrent ? 600 : 400,
             }}
@@ -532,7 +540,7 @@ export default function Sidebar({
           <TruncatedName
             text={label}
             title={false}
-            style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 12, fontWeight: 600 }}
+            style={{ flex: 1, fontFamily: 'var(--sidebar-name-font)', fontSize: 12, fontWeight: 600 }}
           />
           {hidesActive && <span aria-hidden="true" className="dg-bucket-group-active-dot" />}
           <span style={{ flexShrink: 0, fontSize: 11, color: TEXT_MUTED, fontVariantNumeric: 'tabular-nums' }}>
@@ -641,7 +649,8 @@ export default function Sidebar({
         )}
 
         {canUpload && (
-          <div style={{ padding: '4px 0', borderTop: `1px solid ${token.colorBorderSecondary}`, marginTop: 4 }}>
+          // No line under group cards: the last card's border already ends the list.
+          <div style={{ padding: '4px 0', marginTop: 4, borderTop: groups ? undefined : `1px solid ${token.colorBorderSecondary}` }}>
             <button
               className={onUploadPage ? 'btn-reset' : 'btn-reset dg-hover-text'}
               onClick={onUploadClick}
@@ -679,7 +688,15 @@ export default function Sidebar({
           }}
           title={proxyBuildTime ? `Built ${formatBuildTime(proxyBuildTime)}` : undefined}
         >
-          <span className="dg-wordmark" style={{ fontSize: 12, color: TEXT_SECONDARY }}>DeltaGlider</span>
+          <button
+            type="button"
+            className="btn-reset dg-wordmark dg-hover-text"
+            onClick={goHome}
+            title="Open the file browser"
+            style={{ fontSize: 12, color: TEXT_SECONDARY }}
+          >
+            DeltaGlider
+          </button>
           {proxyVersion && <span style={{ fontVariantNumeric: 'tabular-nums' }}>v{proxyVersion}</span>}
         </div>
       </div>{/* end bottom group */}

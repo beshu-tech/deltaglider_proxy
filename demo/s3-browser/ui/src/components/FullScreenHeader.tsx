@@ -60,12 +60,15 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
         gap: 8,
         userSelect: 'none',
       }}>
-        <span className="hide-mobile dg-wordmark" style={{
-          fontSize: 13,
-          color: colors.TEXT_MUTED,
-        }}>
+        <button
+          type="button"
+          className="btn-reset hide-mobile dg-wordmark dg-hover-text"
+          onClick={onBack}
+          title="Open the file browser"
+          style={{ fontSize: 13, color: colors.TEXT_MUTED }}
+        >
           DeltaGlider
-        </span>
+        </button>
         <span className="hide-mobile" style={{
           width: 1,
           height: 14,

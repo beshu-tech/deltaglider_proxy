@@ -75,6 +75,9 @@ code, kbd, pre, samp, .ant-typography code,
   --display-variation: normal;
   /* The radius of a dashboard card and of the inspector's panels (CARD_RADIUS in shared-styles.ts). */
   --card-radius: 12px;
+  /* Sidebar bucket and backend names, and the vertical padding of a bucket row. */
+  --sidebar-name-font: var(--font-mono);
+  --bucket-row-pad-y: 8px;
 }
 
 /* ───── Theme-only tints ───── */
@@ -1397,6 +1400,8 @@ code, kbd, pre, samp, .ant-typography code,
   --card-radius: 3px;
   --xp-flag: linear-gradient(#f0502a 0 0) 0 0 / 46% 46% no-repeat, linear-gradient(#7ac143 0 0) 100% 0 / 46% 46% no-repeat, linear-gradient(#1b9be0 0 0) 0 100% / 46% 46% no-repeat, linear-gradient(#fdb913 0 0) 100% 100% / 46% 46% no-repeat;
   --xp-seg-mask: repeating-linear-gradient(90deg, #000 0 7px, transparent 7px 9px);
+  --sidebar-name-font: var(--font-ui);
+  --bucket-row-pad-y: 4px;
 }
 [data-theme-style="xp"][data-theme="light"] {
   --xp-window-border: #0831d9;
@@ -1790,6 +1795,9 @@ code, kbd, pre, samp, .ant-typography code,
   text-transform: none;
   text-shadow: 1px 1px 2px var(--xp-start-border);
 }
+[data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark:hover {
+  filter: brightness(1.1);
+}
 [data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark::before {
   content: '';
   width: 16px;
@@ -2035,7 +2043,7 @@ code, kbd, pre, samp, .ant-typography code,
   overflow: hidden;
 }
 [data-theme-style="xp"] .ant-layout-sider nav[aria-label='Bucket list'] > :first-child {
-  margin: 0 !important;
+  margin: 0 0 8px !important;
   padding: 6px 10px !important;
   background: var(--xp-pane-head-bg);
 }

@@ -65,7 +65,7 @@ test('every brand lockup uses the wordmark style', () => {
   const sites: Record<string, RegExp> = {
     'components/ConnectPage.tsx': /className="dg-login-brand">DeltaGlider</,
     'components/FullScreenHeader.tsx': /className="[^"]*dg-wordmark[^"]*"[^>]*>\s*DeltaGlider\s*</,
-    'components/Sidebar.tsx': /className="dg-wordmark"[^>]*>DeltaGlider</,
+    'components/Sidebar.tsx': /className="[^"]*dg-wordmark[^"]*"[^>]*>\s*DeltaGlider\s*</,
   };
   const missing = Object.entries(sites)
     .filter(([file, re]) => !re.test(readFileSync(join(SRC, file), 'utf8')))
