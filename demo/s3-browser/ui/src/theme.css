@@ -151,6 +151,7 @@ code, kbd, pre, samp, .ant-typography code,
   --insp-title-size: 16px;
   --insp-title-lh: 1.5;
   --insp-title-text: var(--dg-text-primary);
+  --insp-key-gap: 2px;
   --insp-close-size: 24px;
   --insp-close-offset: 0;
   /* The floating selection toolbar of the file browser. */
@@ -620,7 +621,7 @@ code, kbd, pre, samp, .ant-typography code,
   overflow-wrap: break-word;
 }
 .dg-inspector-key {
-  margin-top: 2px;
+  margin-top: var(--insp-key-gap);
   color: var(--dg-text-muted);
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1793,6 +1794,8 @@ code, kbd, pre, samp, .ant-typography code,
   --insp-title-size: 13px;
   --insp-title-lh: 28px;
   --insp-title-text: var(--xp-title-text);
+  /* The key sits on the toolbar under the bar: as far from the bar as from the header's edge. */
+  --insp-key-gap: 6px;
   --insp-close-size: 21px;
   --insp-close-offset: 4px;
   --floating-bar-border: var(--xp-menu-border);
