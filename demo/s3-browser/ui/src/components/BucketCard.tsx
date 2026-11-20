@@ -718,7 +718,7 @@ export default function BucketCard({
               type="error"
               showIcon
               data-testid="bucket-read-only"
-              style={{ marginTop: 12, borderRadius: 6, fontSize: 12 }}
+              style={{ marginTop: 12, fontSize: 12 }}
               // The server's reason is the title; the description holds
               // only the action (the badge text repeated the reason).
               title={<LinkifiedText text={readOnly} />}

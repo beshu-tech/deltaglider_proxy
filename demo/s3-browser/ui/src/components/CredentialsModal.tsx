@@ -32,7 +32,7 @@ export default function CredentialsModal({ accessKey, secretKey, title, note, on
       keyboard={false}
       footer={<Button type="primary" onClick={onClose}>I have copied it</Button>}
     >
-      {note && <Alert type="info" showIcon title={note} style={{ marginBottom: 16, borderRadius: 8 }} />}
+      {note && <Alert type="info" showIcon title={note} style={{ marginBottom: 16 }} />}
       <Text type="secondary" style={{ fontSize: 13, fontWeight: 600, display: 'block', marginBottom: 4 }}>Access key</Text>
       <Space.Compact block style={{ marginBottom: 12, alignItems: 'center' }}>
         <Text code style={{ fontFamily: 'var(--font-mono)', flex: 1, wordBreak: 'break-all' }}>{accessKey}</Text>

@@ -80,7 +80,7 @@ export default function AtomicWritesNotice({
       type="warning"
       showIcon
       data-testid="atomic-writes-missing"
-      style={{ borderRadius: 6, fontSize: 12, marginBottom: SPACE.xs }}
+      style={{ fontSize: 12, marginBottom: SPACE.xs }}
       title={<LinkifiedText text={encryptionUnavailableReason(backend, state, proxyUnavailable) ?? ''} />}
       description={<CheckAgainButton backend={backend} />}
     />

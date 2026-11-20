@@ -692,7 +692,6 @@ export default function ObjectTable({
           showIcon
           banner
           title="Showing first 10,000 objects. Navigate into a folder to see more."
-          style={{ borderRadius: 0 }}
         />
       )}
 

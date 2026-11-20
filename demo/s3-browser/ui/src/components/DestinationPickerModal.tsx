@@ -134,7 +134,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
           title={edited
             ? `The selected objects are already in this folder. Choose another folder or bucket to ${mode} them.`
             : `Type the folder or choose the bucket to ${mode} the selected objects to.`}
-          style={{ borderRadius: SPACE.xs, marginBottom: mode === 'move' ? SPACE.sm : 0 }}
+          style={{ marginBottom: mode === 'move' ? SPACE.sm : 0 }}
         />
       )}
 

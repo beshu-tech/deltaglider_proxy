@@ -443,7 +443,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         );
       })}
 
-      <Button type="dashed" icon={<PlusOutlined />} onClick={() => onChange([...permissions, { _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: [] }])} block style={{ borderRadius: 8, marginBottom: 16 }}>
+      <Button type="dashed" icon={<PlusOutlined />} onClick={() => onChange([...permissions, { _uiId: freshPermissionRowId(), effect: 'Allow', actions: [], resources: [] }])} block style={{ marginBottom: 16 }}>
         Add permission rule
       </Button>
     </>

@@ -435,7 +435,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
         {isEdit ? `${readOnly ? 'View' : 'Edit'}: ${group?.name}` : 'New group'}
       </Title>
 
-      {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16, borderRadius: 8 }} />}
+      {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16 }} />}
 
       <FormField label="Name" helpText={readOnly ? undefined : IAM_NAME_HELP} error={nameError} style={{ marginBottom: 24 }}>
         <Input data-testid="group-name" autoFocus={!isEdit} {...nameField.inputProps} placeholder="e.g. developers" disabled={readOnly} style={{ ...inputRadius }} />

@@ -158,7 +158,6 @@ export default function MasterDetailPanel<T>({
               onChange={e => onSearchChange(e.target.value)}
               allowClear
               size="small"
-              style={{ borderRadius: 6 }}
             />
           </div>
 

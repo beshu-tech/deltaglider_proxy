@@ -144,7 +144,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
       <Alert
         type="warning"
         showIcon
-        style={{ marginBottom: 12, borderRadius: 8 }}
+        style={{ marginBottom: 12 }}
         title="While the migration runs"
         description={
           <span style={{ fontSize: 12 }} data-testid="migrate-while-running">
@@ -222,7 +222,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         <Alert
           type="error"
           showIcon
-          style={{ marginBottom: 12, borderRadius: 8 }}
+          style={{ marginBottom: 12 }}
           title={`Backend ${targetInfo.name} is unavailable: ${healthWord(targetInfo.health)}`}
           description={
             <span style={{ fontSize: 12 }}>
@@ -236,7 +236,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         <Alert
           type="error"
           showIcon
-          style={{ marginBottom: 12, borderRadius: 8 }}
+          style={{ marginBottom: 12 }}
           title={`Objects will be stored unencrypted at rest on ${targetInfo.name}`}
           description={
             <div style={{ fontSize: 12 }}>
@@ -278,7 +278,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         <Alert
           type="error"
           showIcon
-          style={{ marginTop: 8, borderRadius: 8 }}
+          style={{ marginTop: 8 }}
           title="Destination objects can be deleted"
           description={
             <span style={{ fontSize: 12 }}>
@@ -293,7 +293,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         <Alert
           type="error"
           showIcon
-          style={{ marginTop: 12, borderRadius: 8 }}
+          style={{ marginTop: 12 }}
           title="The migration did not start"
           description={<span style={{ fontSize: 12 }}>{startError}</span>}
         />

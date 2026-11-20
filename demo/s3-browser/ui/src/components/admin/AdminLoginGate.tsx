@@ -21,7 +21,7 @@ export function AdminAccessDenied({ onBack }: { onBack: () => void }) {
           your account&apos;s permissions. To change settings, ask an administrator to grant your account the
           &quot;admin&quot; action.
         </Text>
-        <Button type="primary" onClick={onBack} style={{ borderRadius: 10 }}>Back to Browser</Button>
+        <Button type="primary" onClick={onBack}>Back to Browser</Button>
       </div>
     </div>
   );
@@ -82,7 +82,7 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
             showIcon
             title="File browser session active"
             description="You are signed in for S3 browsing only. Use the admin password (or OAuth if configured) below to open a full administrator session."
-            style={{ marginBottom: 16, borderRadius: 8 }}
+            style={{ marginBottom: 16 }}
           />
         )}
         {/* OAuth provider buttons */}
@@ -96,7 +96,7 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
             </div>
           </div>
         )}
-        {loginError && <Alert type="error" title={loginError} showIcon style={{ marginBottom: 16, borderRadius: 8 }} />}
+        {loginError && <Alert type="error" title={loginError} showIcon style={{ marginBottom: 16 }} />}
         <Input.Password
           aria-label="Admin password"
           placeholder="Admin password"
@@ -105,11 +105,11 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
           onPressEnter={handleLogin}
           size="large"
           autoFocus={externalProviders.length === 0}
-          style={{ borderRadius: 10, marginBottom: 16 }}
+          style={{ marginBottom: 16 }}
         />
         <Space style={{ width: '100%' }} orientation="vertical">
           <Button type="primary" htmlType="submit" block size="large" loading={loginLoading} disabled={!password}
-            style={{ borderRadius: 10, height: 44, fontWeight: 600 }}>
+            style={{ height: 44, fontWeight: 600 }}>
             Sign In
           </Button>
           <Button type="text" block onClick={onBack} style={{ color: colors.TEXT_MUTED }}>Cancel</Button>

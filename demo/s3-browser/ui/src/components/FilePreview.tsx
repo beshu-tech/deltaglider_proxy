@@ -148,7 +148,6 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
           showIcon
           title={`File too large for preview (${formatBytes(object.size)})`}
           description={`The preview is limited to ${formatBytes(previewLimit)}. Use the Download button to view the full file.`}
-          style={{ borderRadius: 8 }}
         />
       )}
 
@@ -158,7 +157,6 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
           showIcon
           title="Preview not available for this file type"
           description="Use the Download button to save the file locally."
-          style={{ borderRadius: 8 }}
         />
       )}
 

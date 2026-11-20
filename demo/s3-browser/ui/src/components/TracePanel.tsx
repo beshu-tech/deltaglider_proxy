@@ -218,7 +218,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
               icon={<ExperimentOutlined />}
               loading={running}
               onClick={run}
-              style={{ borderRadius: 8, fontWeight: 600 }}
+              style={{ fontWeight: 600 }}
             >
               Test request
             </Button>

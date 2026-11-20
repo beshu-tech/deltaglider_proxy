@@ -440,7 +440,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   loading={recoveryLoading}
                   disabled={!recoveryPassword.trim()}
                   onClick={handleRecover}
-                  style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 16, letterSpacing: '0.02em', marginTop: 4 }}
+                  style={{ height: 48, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 16, letterSpacing: '0.02em', marginTop: 4 }}
                 >
                   Try key
                 </Button>

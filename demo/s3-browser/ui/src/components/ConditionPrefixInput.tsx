@@ -282,7 +282,7 @@ export default function ConditionPrefixInput({ value, onChange, bucket = '', sty
         onMouseDown={(e) => e.preventDefault()}
         onClick={addRow}
         block
-        style={{ marginTop: 8, borderRadius: 8 }}
+        style={{ marginTop: 8 }}
       >
         Add prefix
       </Button>

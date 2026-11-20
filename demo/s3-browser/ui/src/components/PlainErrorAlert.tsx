@@ -25,7 +25,7 @@ export default function PlainErrorAlert({ error, style }: { error: PlainError; s
           </details>
         ) : undefined
       }
-      style={{ borderRadius: 8, ...style }}
+      style={style}
     />
   );
 }

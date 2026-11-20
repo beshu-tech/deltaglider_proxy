@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Drawer, Button, Modal, message, Skeleton, Spin, theme } from 'antd';
-import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CheckOutlined, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
+import { Drawer, Button, Modal, message, Skeleton, Space, Spin } from 'antd';
+import { CaretDownOutlined, DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CheckOutlined, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
 import { deleteObject, getDownloadUrl, getPresignedUrl, headObject, getBucket } from '../s3client';
 import { GlobalOutlined } from '@ant-design/icons';
 import { formatBytes, getFileName, downloadFromUrl, relativeTime } from '../utils';
@@ -124,60 +124,34 @@ function ShareDurationButton({
   durations: { label: string; seconds: number }[];
   onSelect: (seconds: number) => void;
 }) {
-  // The AntD primary of the theme, the same as Download beside it: the raw
-  // accent was a brighter teal in the dark theme and read as hovered.
-  const { token } = theme.useToken();
-  const primary = { background: token.colorPrimary, color: token.colorTextLightSolid };
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
   useOnClickOutside([ref], () => setOpen(false), open);
+  // AntD primary buttons, like Download beside it: every style's button skin applies as is.
 
   return (
-    <div ref={ref} className="dg-share-split" style={{ display: 'flex', width: '100%' }}>
-      {/* Main button — default 7 days */}
-      <button
-        onClick={() => { onSelect(durations[durations.length - 1].seconds); setOpen(false); }}
-        style={{
-          flex: 1,
-          height: 40,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: SPACE.xs,
-          ...primary,
-          border: 'none',
-          borderRadius: '10px 0 0 10px',
-          fontWeight: 600,
-          fontSize: 14,
-          fontFamily: 'var(--font-ui)',
-          cursor: 'pointer',
-        }}
-        aria-label="Share link (7 days)"
-      >
-        <LinkOutlined /> Share
-      </button>
-      {/* Chevron toggle */}
-      <button
-        onClick={() => setOpen(!open)}
-        aria-label="Choose link duration"
-        aria-expanded={open}
-        style={{
-          width: 32,
-          height: 40,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          ...primary,
-          border: 'none',
-          borderLeft: `1px solid ${tint(token.colorBgContainer, 33)}`,
-          borderRadius: '0 10px 10px 0',
-          cursor: 'pointer',
-          fontSize: 11,
-        }}
-      >
-        <span style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>&#9660;</span>
-      </button>
+    <div ref={ref}>
+      <Space.Compact block>
+        <Button
+          type="primary"
+          size="large"
+          icon={<LinkOutlined />}
+          onClick={() => { onSelect(durations[durations.length - 1].seconds); setOpen(false); }}
+          aria-label="Share link (7 days)"
+          style={{ flex: 1, fontWeight: 600 }}
+        >
+          Share
+        </Button>
+        <Button
+          type="primary"
+          size="large"
+          icon={<CaretDownOutlined rotate={open ? 180 : 0} />}
+          onClick={() => setOpen(!open)}
+          aria-label="Choose link duration"
+          aria-expanded={open}
+        />
+      </Space.Compact>
       {/* Duration dropdown: the menu family's classes (theme.css), wide enough for its longest row. */}
       {open && (
         <div role="listbox" aria-label="Link expiry duration" className="dg-share-menu" style={{ zIndex: Z.menu }}>
@@ -500,33 +474,13 @@ export default function InspectorPanel({
             dialogTabWrap (installed by ThemeProvider). */}
         <div className="animate-slide-in" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           {/* Header */}
-          <div className="dg-inspector-header" style={{
-            padding: `${SPACE.md}px ${SPACE.lg}px`,
-            borderBottom: `1px solid ${BORDER}`,
-            display: 'flex',
-            alignItems: 'flex-start',
-            gap: 12,
-          }}>
-            <div style={{
-              width: 40,
-              height: 40,
-              borderRadius: CARD_RADIUS,
-              background: `linear-gradient(135deg, ${tint(ACCENT_BLUE, 8)}, ${tint(ACCENT_BLUE, 3)})`,
-              border: `1px solid ${tint(ACCENT_BLUE, 13)}`,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              flexShrink: 0,
-            }}>
-              <FileOutlined aria-hidden="true" style={{ fontSize: 20, color: ACCENT_BLUE }} />
+          <div className="dg-inspector-header">
+            <div className="dg-inspector-icon">
+              <FileOutlined aria-hidden="true" />
             </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <h2 style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, overflowWrap: 'break-word', margin: 0, fontFamily: "var(--font-ui)" }}>
-                {fileNameBreakHints(fileName)}
-              </h2>
-              <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: 2, overflowWrap: 'anywhere', fontFamily: "var(--font-mono)" }}>
-                {withBreakHints(object.key)}
-              </div>
+            <div className="dg-inspector-names">
+              <h2 className="dg-inspector-title">{fileNameBreakHints(fileName)}</h2>
+              <div className="dg-inspector-key">{withBreakHints(object.key)}</div>
             </div>
             <Button
               type="text"
@@ -534,7 +488,7 @@ export default function InspectorPanel({
               onClick={onClose}
               size="small"
               aria-label="Close inspector"
-              style={{ color: TEXT_MUTED, flexShrink: 0 }}
+              className="dg-inspector-close"
             />
           </div>
 
@@ -549,7 +503,6 @@ export default function InspectorPanel({
                 onClick={() => onPreview(object)}
                 style={{
                   fontWeight: 600,
-                  borderRadius: CARD_RADIUS,
                   fontFamily: "var(--font-ui)",
                   marginBottom: 8,
                 }}
@@ -569,7 +522,6 @@ export default function InspectorPanel({
                   style={{
                     flex: 1,
                     fontWeight: 600,
-                    borderRadius: CARD_RADIUS,
                     fontFamily: "var(--font-ui)",
                   }}
                 >
@@ -798,17 +750,9 @@ export default function InspectorPanel({
             <div style={{ padding: `${SPACE.md}px ${SPACE.lg}px`, borderTop: `1px solid ${BORDER}` }}>
               <Button
                 block
-                className="dg-danger-action"
                 icon={<DeleteOutlined />}
                 onClick={() => confirmDelete(objectDeleteConfirmText(object.key), handleDelete)}
-                style={{
-                  background: 'transparent',
-                  borderColor: BORDER,
-                  color: ACCENT_RED,
-                  borderRadius: CARD_RADIUS,
-                  fontFamily: "var(--font-ui)",
-                  fontWeight: 600,
-                }}
+                style={{ color: ACCENT_RED, fontWeight: 600 }}
               >
                 Delete object
               </Button>
@@ -895,7 +839,6 @@ export default function InspectorPanel({
                     onClick={handleCopyUrl}
                     style={{
                       fontWeight: 600,
-                      borderRadius: CARD_RADIUS,
                       fontFamily: "var(--font-ui)",
                       minWidth: 180,
                     }}

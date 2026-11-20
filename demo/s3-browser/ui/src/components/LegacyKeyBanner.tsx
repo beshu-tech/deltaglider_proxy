@@ -83,7 +83,7 @@ export default function LegacyKeyBanner({
     <Alert
       type="info"
       showIcon
-      style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
+      style={{ marginTop: 8, fontSize: 12 }}
       title="Decrypt-only shim active"
       description={
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>

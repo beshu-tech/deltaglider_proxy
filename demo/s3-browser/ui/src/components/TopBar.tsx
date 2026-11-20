@@ -1,6 +1,6 @@
 import { useRef, useState, useEffect } from 'react';
 import { flushSync } from 'react-dom';
-import { Layout, Space, Button, Input, theme } from 'antd';
+import { Layout, Space, Button, Input } from 'antd';
 import type { InputRef } from 'antd';
 import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined, SettingOutlined, SunOutlined, MoonOutlined, CloudUploadOutlined } from '@ant-design/icons';
 import { metaKeyLabel } from '../platform';
@@ -90,7 +90,6 @@ function SearchInput({
         background: 'var(--input-bg)',
         borderColor: BORDER,
         color: TEXT_PRIMARY,
-        borderRadius: SPACE.xs,
         fontFamily: "var(--font-mono)",
         fontSize: 13,
         ...style,
@@ -100,7 +99,6 @@ function SearchInput({
 }
 
 export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, onOpenSettings, deltaSummary = null, bucketMissing = false, onUpload }: Props) {
-  const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
   const { isDark, toggleTheme } = useTheme();
   // Open when the URL already carries a filter (?q= from a deep link, reload
@@ -150,7 +148,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
         padding: isMobile ? `0 ${SPACE.sm}px` : `0 ${SPACE.md}px`,
         height: 52,
         lineHeight: '52px',
-        background: token.colorBgContainer,
+        background: 'var(--toolbar-bg)',
         borderBottom: `1px solid ${BORDER}`,
       }}
     >

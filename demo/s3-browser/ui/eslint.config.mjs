@@ -171,6 +171,12 @@ const UI_RULES = {
       message: 'Put destructive row actions in <RowActionsMenu> (⋯ with a confirmation), not a red trash button.',
     },
     {
+      // A control's corners are the style's AntD radius token: an inline radius kept XP's 3 px corners out.
+      selector:
+        "JSXOpeningElement[name.name=/^(Button|Input|Select|Alert|Segmented|InputNumber|DatePicker|AutoComplete)$/] > JSXAttribute[name.name='style'] Property[key.name=/^border.*Radius$/]",
+      message: "Don't set a radius on an AntD control: the theme's radius tokens (theme.ts) give each style its corners.",
+    },
+    {
       // axe aria-progressbar-name: a progress bar with no name reads as "progress bar, 40%".
       selector: "JSXOpeningElement[name.name='Progress']:not(:has(JSXAttribute[name.name='aria-label']))",
       message: 'Give <Progress> an aria-label that says what is progressing.',

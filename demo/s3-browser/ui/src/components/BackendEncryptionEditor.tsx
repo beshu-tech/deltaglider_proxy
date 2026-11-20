@@ -354,7 +354,7 @@ export default function BackendEncryptionEditor({
             <Alert
               type="info"
               showIcon
-              style={{ borderRadius: 6, fontSize: 12, marginBottom: 8 }}
+              style={{ fontSize: 12, marginBottom: 8 }}
               title="Applies to newly written objects only"
               description={
                 <span>
@@ -376,7 +376,7 @@ export default function BackendEncryptionEditor({
               type="warning"
               showIcon
               icon={<WarningOutlined />}
-              style={{ borderRadius: 6, fontSize: 12 }}
+              style={{ fontSize: 12 }}
               title="Disabling encryption"
               description={
                 <span>
@@ -395,7 +395,7 @@ export default function BackendEncryptionEditor({
                 type="error"
                 showIcon
                 icon={<WarningOutlined />}
-                style={{ borderRadius: 6, fontSize: 12, marginBottom: 8 }}
+                style={{ fontSize: 12, marginBottom: 8 }}
                 title="If you lose this key, encrypted objects on this backend are unrecoverable."
                 description="Copy the key to a password manager or a secrets vault BEFORE you click Apply. The full backup (the Backup card on the System page) includes this key while it is in the config file, but not a key that an environment variable supplies, and a backup on the same host is lost with the host."
               />
@@ -458,7 +458,7 @@ export default function BackendEncryptionEditor({
                   type="info"
                   showIcon
                   icon={<CheckCircleOutlined />}
-                  style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
+                  style={{ marginTop: 8, fontSize: 12 }}
                   title="Ready to apply."
                 />
               )}

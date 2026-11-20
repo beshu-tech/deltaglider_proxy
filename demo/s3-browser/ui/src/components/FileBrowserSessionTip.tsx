@@ -69,7 +69,6 @@ export default function FileBrowserSessionTip({ visible, userKey = '' }: Props) 
       style={{
         margin: narrow ? '0 12px 8px' : '0 24px 12px',
         padding: narrow ? '4px 12px' : undefined,
-        borderRadius: 10,
         border: `1px solid ${colors.BORDER}`,
         background: tint(colors.ACCENT_BLUE, 3),
       }}

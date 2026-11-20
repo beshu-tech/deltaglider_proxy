@@ -106,6 +106,12 @@ export const lightTheme = {
  * darkTheme / lightTheme above; Editorial reads its palette the same way and
  * adds its shapes: pill buttons, 12 px fields, 20 px cards and 24 px modals.
  */
+/** Per-style component defaults beyond tokens: an XP drawer is a window, closed at the end of its title bar. */
+export function antdComponentConfig(style: ThemeStyle) {
+  if (style !== 'xp') return {};
+  return { drawer: { closable: { placement: 'end' as const }, styles: { header: { padding: '5px 5px 5px 10px' } } } };
+}
+
 export function antdTheme(style: ThemeStyle, isDark: boolean) {
   if (style === 'instrument') return isDark ? darkTheme : lightTheme;
   if (style === 'xp') return xpTheme(isDark);
@@ -227,6 +233,12 @@ function xpTheme(isDark: boolean) {
         footerMarginTop: 0,
         confirmBodyPadding: 16,
       },
+      // A 31 px drawer title bar: 14 px title, 5 px padding, a 22 px close (fontSizeLG + paddingXS).
+      Drawer: { fontSizeLG: 14, paddingXS: 8 },
+      Alert: { borderRadiusLG: 3 },
+      Card: { headerHeight: 0 },
+      // The orange hot-track under the active tab is 3 px.
+      Tabs: { lineWidthBold: 3 },
     },
   };
 }

@@ -101,7 +101,7 @@ export default function BucketKeySetup({ bucket, backend, usedKeyIds = [], onCha
         type="error"
         showIcon
         icon={<WarningOutlined />}
-        style={{ borderRadius: 6, fontSize: 12 }}
+        style={{ fontSize: 12 }}
         title="If you lose this key, the objects that it encrypts are unrecoverable."
         description={
           <span>

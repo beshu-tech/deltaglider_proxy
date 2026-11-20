@@ -32,8 +32,8 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
       padding: phone ? '0 8px' : '0 24px',
       gap: 8,
       height: 52,
-      borderBottom: `1px solid ${colors.BORDER}`,
-      background: colors.BG_CARD,
+      borderBottom: '1px solid var(--chrome-border)',
+      background: 'var(--chrome-bg)',
       flexShrink: 0,
     }}>
       {/* Left: optional menu button + back button */}
@@ -44,7 +44,7 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
         icon={<ArrowLeftOutlined />}
         onClick={onBack}
         style={{
-          color: colors.TEXT_SECONDARY,
+          color: 'var(--chrome-text)',
           fontWeight: 500,
           fontFamily: 'var(--font-ui)',
         }}
@@ -65,7 +65,7 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
           className="btn-reset hide-mobile dg-wordmark dg-hover-text"
           onClick={onBack}
           title="Open the file browser"
-          style={{ fontSize: 13, color: colors.TEXT_MUTED }}
+          style={{ fontSize: 13, color: 'var(--chrome-muted)' }}
         >
           DeltaGlider
         </button>
@@ -81,7 +81,7 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
         <span className="dg-wordmark-product" style={{
           fontSize: 13,
           whiteSpace: 'nowrap',
-          color: colors.ACCENT_BLUE,
+          color: 'var(--chrome-accent)',
         }}>
           {title}
         </span>
@@ -97,7 +97,7 @@ export default function FullScreenHeader({ title, onBack, leading, extra, onShow
             title="Keyboard shortcuts (press ?)"
             aria-label="Keyboard shortcuts"
             onClick={onShowShortcuts}
-            style={{ color: colors.TEXT_MUTED }}
+            style={{ color: 'var(--chrome-muted)' }}
           />
         )}
         {accountMenu}

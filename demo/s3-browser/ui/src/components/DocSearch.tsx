@@ -121,7 +121,6 @@ export default function DocSearch({ docs, onSelect }: Props) {
         onBlur={() => setTimeout(() => setFocused(false), 200)}
         size="small"
         style={{
-          borderRadius: 6,
           fontSize: 12,
           fontFamily: 'var(--font-ui)',
           background: 'var(--input-bg)',

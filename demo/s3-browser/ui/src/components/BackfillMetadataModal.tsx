@@ -110,7 +110,7 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
       <Alert
         type="warning"
         showIcon
-        style={{ marginBottom: 12, borderRadius: 8 }}
+        style={{ marginBottom: 12 }}
         title="While a bucket is being processed"
         description={
           <span style={{ fontSize: 12 }}>

@@ -533,7 +533,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       <Space orientation="vertical" size={0} style={{ width: '100%' }}>
 
         {saveResult && (
-          <Alert type={saveResult.ok ? 'success' : 'error'} title={saveResult.message} showIcon closable={{ onClose: () => setSaveResult(null) }} style={{ borderRadius: 8, marginBottom: 12 }} />
+          <Alert type={saveResult.ok ? 'success' : 'error'} title={saveResult.message} showIcon closable={{ onClose: () => setSaveResult(null) }} style={{ marginBottom: 12 }} />
         )}
 
         {/* Storage backends — the page's subject, first. */}
@@ -616,7 +616,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 </div>
               )}
               {testResult?.name === b.name && (
-                <Alert type={testResult.ok ? 'success' : 'error'} title={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
+                <Alert type={testResult.ok ? 'success' : 'error'} title={testResult.message} showIcon style={{ marginTop: 8 }} />
               )}
               {/* Loud connection-health fault. Only DEFINITIVE faults
                  (credentials rejected / unreachable) gate requests with 503;
@@ -632,7 +632,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       ? `${healthLabel(b.health)}. Requests are NOT blocked — the backend is reachable but fails some requests. Re-probed every 30s.`
                       : `${healthLabel(b.health)}. Buckets routed to this backend answer 503 until it recovers — re-probed every 30s, or use 'Test connection' after fixing it.`
                   }
-                  style={{ marginTop: 8, borderRadius: 6 }}
+                  style={{ marginTop: 8 }}
                 />
               )}
               {/* Conditional-write verdict from the startup capability gate
@@ -647,7 +647,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   data-testid="backend-atomic-writes-checking"
                   title={CHECKING_TITLE}
                   description="Its encrypted buckets need atomic writes. Until the check ends, writes to them get a 503 answer, which clients retry. Reads keep working."
-                  style={{ marginTop: 8, borderRadius: 6 }}
+                  style={{ marginTop: 8 }}
                 />
               )}
               {(b.read_only_buckets ?? []).length > 0 && (
@@ -666,7 +666,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       </div>
                     </>
                   }
-                  style={{ marginTop: 8, borderRadius: 6 }}
+                  style={{ marginTop: 8 }}
                 />
               )}
               {b.capability?.verdict === 'cas-verified' && b.capability.via === 'probe' && (
@@ -678,7 +678,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       ? 'Conditional writes: verified by live probe (this backend wants the ETag unquoted in If-Match, as Ceph RGW does) — safe for multi-instance client writes'
                       : 'Conditional writes: verified by live probe — safe for multi-instance client writes'
                   }
-                  style={{ marginTop: 8, borderRadius: 6 }}
+                  style={{ marginTop: 8 }}
                 />
               )}
               {b.capability?.verdict === 'non-cas' && (
@@ -696,7 +696,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       }
                     />
                   }
-                  style={{ marginTop: 8, borderRadius: 6 }}
+                  style={{ marginTop: 8 }}
                 />
               )}
               {b.capability?.verdict === 'unknown' && (
@@ -715,7 +715,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       </div>
                     </>
                   }
-                  style={{ marginTop: 8, borderRadius: 6 }}
+                  style={{ marginTop: 8 }}
                 />
               )}
               {/* Per-backend encryption subsection: shows the current
@@ -832,10 +832,10 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               <PlainErrorAlert error={formError} style={{ marginTop: 16 }} />
             )}
             <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-              <Button data-testid="backend-create" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} style={{ borderRadius: 8, fontWeight: 600 }}>
+              <Button data-testid="backend-create" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} style={{ fontWeight: 600 }}>
                 Create backend
               </Button>
-              <Button onClick={() => { setShowForm(false); resetForm(); }} style={{ borderRadius: 8 }}>Cancel</Button>
+              <Button onClick={() => { setShowForm(false); resetForm(); }}>Cancel</Button>
             </div>
           </div>
         )}

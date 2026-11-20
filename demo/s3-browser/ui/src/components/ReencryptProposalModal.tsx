@@ -201,7 +201,7 @@ export default function ReencryptProposalModal({
       <Alert
         type={gateMayHold ? 'warning' : 'info'}
         showIcon
-        style={{ marginBottom: 12, borderRadius: 8 }}
+        style={{ marginBottom: 12 }}
         title="While a bucket is being processed"
         description={
           <span style={{ fontSize: 12 }} data-testid="reencrypt-while-running">
@@ -227,7 +227,7 @@ export default function ReencryptProposalModal({
           type="error"
           showIcon
           data-testid="reencrypt-atomic-refusal"
-          style={{ marginBottom: 12, borderRadius: 8 }}
+          style={{ marginBottom: 12 }}
           title={`${r.bucket}: not started`}
           description={<LinkifiedText text={r.error} />}
         />

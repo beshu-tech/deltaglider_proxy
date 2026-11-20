@@ -230,7 +230,6 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
               {liveErrors.join(' · ')}
             </span>
           }
-          style={{ borderRadius: 8 }}
         />
       )}
 

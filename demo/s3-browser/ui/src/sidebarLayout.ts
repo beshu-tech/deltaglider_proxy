@@ -3,7 +3,7 @@
  * bucket groups by backend (the operator can collapse them).
  * React-free so src/__tests__/sidebarLayout.test.ts can check it.
  */
-import { backendChipLabel, showBackendChips } from './bucketBackend';
+import { backendChipLabel } from './bucketBackend';
 import type { BucketInfo } from './types';
 
 /** Default 312 px: 25% wider than the old fixed 250 px, so typical bucket
@@ -53,7 +53,8 @@ export function groupKey(group: BucketGroup): string {
  * group of unknown backends last; buckets keep their list order.
  */
 export function groupBucketsByBackend(buckets: BucketInfo[]): BucketGroup[] | null {
-  if (!showBackendChips(buckets.map((b) => b.backend))) return null;
+  // Every known backend is named, one included: the list always says where a bucket lives.
+  if (!buckets.some((b) => backendChipLabel(b.backend))) return null;
   const byBackend = new Map<string | null, BucketInfo[]>();
   for (const b of buckets) {
     const backend = backendChipLabel(b.backend);

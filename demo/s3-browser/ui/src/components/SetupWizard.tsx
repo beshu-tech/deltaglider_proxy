@@ -556,7 +556,7 @@ function PickBackendStep({
         <Alert
           type="info"
           showIcon
-          style={{ marginBottom: 16, borderRadius: 8 }}
+          style={{ marginBottom: 16 }}
           title={`Environment variables set this proxy's backend (${envKind === 's3' ? 'S3-compatible' : 'filesystem'}). To choose another one, change them and restart the proxy.`}
         />
       )}
@@ -738,7 +738,7 @@ function ConfigureBackendStep({
         onClick={onTest}
         loading={testing}
         disabled={!state.s3AccessKey || !state.s3SecretKey}
-        style={{ marginTop: 12, borderRadius: 8 }}
+        style={{ marginTop: 12 }}
         block
       >
         Test connection
@@ -755,7 +755,7 @@ function ConfigureBackendStep({
         <Alert
           type={testResult.success ? 'success' : 'error'}
           showIcon
-          style={{ marginTop: 12, borderRadius: 8 }}
+          style={{ marginTop: 12 }}
           title={
             testResult.success
               ? `Connected — ${testResult.buckets?.length ?? 0} bucket(s) visible`
@@ -962,7 +962,6 @@ function ReviewStep({ yaml, cardStyle }: { yaml: string; cardStyle: React.CSSPro
             top: 8,
             right: 8,
             zIndex: Z.local,
-            borderRadius: 6,
           }}
         >
           {copied ? 'Copied!' : 'Copy'}
@@ -988,7 +987,7 @@ function ReviewStep({ yaml, cardStyle }: { yaml: string; cardStyle: React.CSSPro
       <Alert
         type="info"
         showIcon
-        style={{ marginTop: 12, borderRadius: 8 }}
+        style={{ marginTop: 12 }}
         title="What happens next"
         description={
           <ul style={{ margin: 0, paddingLeft: 16, fontSize: 13, lineHeight: 1.6 }}>

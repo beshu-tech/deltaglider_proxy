@@ -118,7 +118,6 @@ export default function BrowserScreen({
             banner
             title="This list can be out of date: the last refresh failed"
             description={plainError(s3.error, 'The proxy could not list the objects.').text}
-            style={{ borderRadius: 0 }}
           />
         )}
         {isEmpty ? (

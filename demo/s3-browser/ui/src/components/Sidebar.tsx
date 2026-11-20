@@ -521,7 +521,6 @@ export default function Sidebar({
         key={`group:${key}`}
         className="dg-bucket-group"
         data-collapsed={!expanded}
-        style={{ marginTop: index === 0 ? 0 : SPACE.xs }}
       >
         <button
           className="btn-reset dg-bucket-group-header"
@@ -531,17 +530,13 @@ export default function Sidebar({
           title={[backendFacts, hidesActive ? `Contains the open bucket ${activeBucket}` : null].filter(Boolean).join('\n')}
           onClick={() => toggleGroup(key)}
           style={{
-            '--dg-group-color': hidesActive ? ACCENT_BLUE_LIGHT : TEXT_PRIMARY,
+            '--dg-group-color': hidesActive ? ACCENT_BLUE_LIGHT : TEXT_MUTED,
             '--dg-group-hover-color': hidesActive ? ACCENT_BLUE_LIGHT : TEXT_PRIMARY,
           } as React.CSSProperties}
         >
           <RightOutlined aria-hidden="true" className="dg-bucket-group-chevron" />
           {TypeIcon && <TypeIcon aria-hidden="true" className="dg-bucket-group-type" />}
-          <TruncatedName
-            text={label}
-            title={false}
-            style={{ flex: 1, fontFamily: 'var(--sidebar-name-font)', fontSize: 12, fontWeight: 600 }}
-          />
+          <TruncatedName text={label} title={false} className="dg-eyebrow" style={{ flex: 1 }} />
           {hidesActive && <span aria-hidden="true" className="dg-bucket-group-active-dot" />}
           <span style={{ flexShrink: 0, fontSize: 11, color: TEXT_MUTED, fontVariantNumeric: 'tabular-nums' }}>
             {group.buckets.length}
@@ -574,17 +569,17 @@ export default function Sidebar({
   );
 
   const sidebarContent = (
-    <div className="dot-grid-bg" style={{ display: 'flex', flexDirection: 'column', height: '100%', background: BG_SIDEBAR }}>
+    <div className="dot-grid-bg dg-sidebar-body">
       {contextHolder}
 
       {/* BUCKETS. The title row and the filter stay put; only the list
           scrolls, so a group header can stick to the top of the list. The
           landmark holds all of it: the title row's Create bucket and the
           filter belong to the bucket list. */}
-      <nav aria-label="Bucket list" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-      <div style={{ padding: `${SPACE.lg}px ${SPACE.md}px 0`, flexShrink: 0 }}>
+      <nav aria-label="Bucket list" className="dg-bucket-pane">
+      <div className="dg-bucket-pane-head">
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: SPACE.sm }}>
-          <Text className="dg-eyebrow" style={{ color: TEXT_MUTED }}>
+          <Text className="dg-eyebrow">
             Buckets ({buckets.length})
           </Text>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE.xxs }}>
@@ -592,7 +587,7 @@ export default function Sidebar({
               <Button
                 type="text"
                 size="small"
-                style={{ color: TEXT_MUTED, fontSize: 12, fontFamily: 'var(--font-ui)' }}
+                style={{ color: 'var(--pane-head-text)', fontSize: 12, fontFamily: 'var(--font-ui)' }}
                 onClick={() => storeCollapsed(anyExpanded ? new Set(groupKeys) : new Set())}
               >
                 {anyExpanded ? 'Collapse all' : 'Expand all'}
@@ -605,7 +600,7 @@ export default function Sidebar({
                 icon={<PlusOutlined />}
                 aria-label="Create bucket"
                 title="Create bucket"
-                style={{ color: TEXT_MUTED, fontSize: 13 }}
+                style={{ color: 'var(--pane-head-text)', fontSize: 13 }}
                 onClick={() => setCreateBucketOpen(true)}
               />
             )}
@@ -649,8 +644,7 @@ export default function Sidebar({
         )}
 
         {canUpload && (
-          // No line under group cards: the last card's border already ends the list.
-          <div style={{ padding: '4px 0', marginTop: 4, borderTop: groups ? undefined : `1px solid ${token.colorBorderSecondary}` }}>
+          <div style={{ padding: '4px 0', marginTop: 4, borderTop: `1px solid ${token.colorBorderSecondary}` }}>
             <button
               className={onUploadPage ? 'btn-reset' : 'btn-reset dg-hover-text'}
               onClick={onUploadClick}
@@ -681,23 +675,17 @@ export default function Sidebar({
             bundle. Blank until whoami resolves. */}
         <div
           className="dg-sidebar-footer"
-          style={{
-            display: 'flex', alignItems: 'baseline', gap: 8,
-            padding: '12px 16px', borderTop: `1px solid ${BORDER}`,
-            fontSize: 12, fontFamily: 'var(--font-ui)', color: TEXT_MUTED,
-          }}
           title={proxyBuildTime ? `Built ${formatBuildTime(proxyBuildTime)}` : undefined}
         >
           <button
             type="button"
-            className="btn-reset dg-wordmark dg-hover-text"
+            className="btn-reset dg-wordmark"
             onClick={goHome}
             title="Open the file browser"
-            style={{ fontSize: 12, color: TEXT_SECONDARY }}
           >
             DeltaGlider
           </button>
-          {proxyVersion && <span style={{ fontVariantNumeric: 'tabular-nums' }}>v{proxyVersion}</span>}
+          {proxyVersion && <span className="dg-sidebar-version">v{proxyVersion}</span>}
         </div>
       </div>{/* end bottom group */}
     </div>
@@ -733,7 +721,7 @@ export default function Sidebar({
     <Sider
       width={sidebarWidth.width}
       style={{
-        background: BG_SIDEBAR,
+        background: 'var(--sider-bg)',
         borderRight: `1px solid ${BORDER}`,
         overflow: 'hidden',
         height: '100vh',

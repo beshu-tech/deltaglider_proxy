@@ -42,11 +42,11 @@ test('parseStoredWidth: a positive integer, else null', () => {
   for (const raw of [null, '', '0', '-5', '12.5', '1e3', 'wide']) assert.equal(parseStoredWidth(raw), null, String(raw));
 });
 
-test('groupBucketsByBackend: null unless the buckets span more than one backend', () => {
+test('groupBucketsByBackend: null only when no bucket has a known backend', () => {
   assert.equal(groupBucketsByBackend([]), null);
   assert.equal(groupBucketsByBackend([bucket('a'), bucket('b')]), null);
-  assert.equal(groupBucketsByBackend([bucket('a', 'x'), bucket('b', 'x')]), null);
-  assert.equal(groupBucketsByBackend([bucket('a', 'x'), bucket('b')]), null);
+  assert.deepEqual(groupBucketsByBackend([bucket('a', 'x'), bucket('b', 'x')])?.map((g) => g.backend), ['x']);
+  assert.deepEqual(groupBucketsByBackend([bucket('a', 'x'), bucket('b')])?.map((g) => g.backend), ['x', null]);
 });
 
 test('groupBucketsByBackend: name order (numeric, any case), unknown last, list order kept', () => {

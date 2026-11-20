@@ -78,10 +78,99 @@ code, kbd, pre, samp, .ant-typography code,
   /* Sidebar bucket and backend names, and the vertical padding of a bucket row. */
   --sidebar-name-font: var(--font-mono);
   --bucket-row-pad-y: 8px;
-  /* The identity band at the top of the account menu. */
-  --menu-identity-bg: transparent;
-  --menu-identity-text: var(--menu-item-text);
-  --menu-identity-shadow: none;
+  /* Window chrome: a title bar over the login card, drawers, the inspector and the
+     account menu's identity band. Zero height and no fill unless a style draws one. */
+  --window-title-height: 0px;
+  --window-title-bg: transparent;
+  --window-title-text: currentColor;
+  --window-title-shadow: none;
+  --login-title: none;
+  /* The login card's corner theme toggle and its primary action. */
+  --login-toggle-inset: 18px;
+  --login-toggle-size: 24px;
+  --login-toggle-radius: 50%;
+  --login-toggle-bg: color-mix(in srgb, var(--glass-bg) 48%, transparent);
+  --login-toggle-bg-hover: color-mix(in srgb, var(--glass-bg) 68%, var(--dg-accent-blue) 8%);
+  --login-toggle-border: color-mix(in srgb, var(--login-card-border) 78%, transparent);
+  --login-toggle-border-hover: color-mix(in srgb, var(--dg-accent-blue) 38%, var(--login-card-border));
+  --login-toggle-text: var(--dg-text-muted);
+  --login-toggle-text-hover: var(--dg-accent-blue);
+  --login-toggle-ring: none;
+  --login-submit-height: 54px;
+  --login-submit-radius: 16px;
+  --login-submit-border: 0;
+  --login-submit-bg: linear-gradient(135deg, var(--dg-accent-blue), color-mix(in srgb, var(--dg-accent-blue) 72%, var(--login-submit-blend)));
+  --login-submit-text: var(--dg-on-accent);
+  --login-submit-font: 800 16px/1 var(--font-ui);
+  --login-submit-shadow: 0 18px 38px color-mix(in srgb, var(--dg-accent-blue) 22%, transparent), inset 0 1px 0 color-mix(in srgb, var(--dg-on-accent) 30%, transparent);
+  --login-submit-shadow-hover: var(--login-submit-shadow);
+  --login-submit-disabled-bg: color-mix(in srgb, var(--glass-bg) 70%, transparent);
+  --login-submit-disabled-border: 1px solid color-mix(in srgb, var(--dg-accent-blue) 22%, var(--login-card-border));
+  --login-submit-disabled-text: color-mix(in srgb, var(--login-hero-text) 34%, transparent);
+  --eyebrow-size: 11px;
+  /* The browser sidebar: its fill, the bucket pane, and the footer (a taskbar in a style that draws one). */
+  --sider-bg: var(--dg-bg-sidebar);
+  --pane-flex: 1;
+  --pane-margin: 0;
+  --pane-head-pad: 24px 16px 0;
+  --pane-head-gap: 0;
+  --pane-head-bg: transparent;
+  --pane-head-text: var(--dg-text-muted);
+  --taskbar-height: auto;
+  --taskbar-pad: 12px 16px;
+  --taskbar-gap: 8px;
+  --taskbar-align: baseline;
+  --taskbar-justify: flex-start;
+  --taskbar-bg: transparent;
+  --taskbar-border: var(--dg-border);
+  --start-pad: 0;
+  --start-size: 12px;
+  --start-text: var(--dg-text-secondary);
+  --start-text-hover: var(--dg-text-primary);
+  --start-hover-filter: none;
+  --start-flag: none;
+  --start-flag-image: none;
+  --tray-pad: 0;
+  /* The browser's toolbar and the full-screen header of Admin and Docs. */
+  --toolbar-bg: var(--dg-bg-card);
+  --chrome-bg: var(--dg-bg-card);
+  --chrome-border: var(--dg-border);
+  --chrome-text: var(--dg-text-secondary);
+  --chrome-muted: var(--dg-text-muted);
+  --chrome-accent: var(--dg-accent-blue);
+  /* The inspector's header: file icon, name over key, close. */
+  --insp-head-gap: 12px;
+  --insp-head-pad: 16px 24px;
+  --insp-icon-box: 40px;
+  --insp-icon-offset: 0;
+  --insp-icon-size: 20px;
+  --insp-icon-bg: linear-gradient(135deg, color-mix(in srgb, var(--dg-accent-blue) 8%, transparent), color-mix(in srgb, var(--dg-accent-blue) 3%, transparent));
+  --insp-icon-border: 1px solid color-mix(in srgb, var(--dg-accent-blue) 13%, transparent);
+  --insp-icon-text: var(--dg-accent-blue);
+  --insp-title-lines: none;
+  --insp-title-size: 16px;
+  --insp-title-lh: 1.5;
+  --insp-title-text: var(--dg-text-primary);
+  --insp-close-size: 24px;
+  --insp-close-offset: 0;
+  /* The floating selection toolbar of the file browser. */
+  --floating-bar-border: var(--dg-border);
+  --floating-bar-radius: 10px;
+  --floating-bar-bg: var(--dg-bg-elevated);
+  --floating-bar-shadow: var(--dg-float-shadow);
+  /* Table header cells: the eyebrow look by default. */
+  --th-size: 11px;
+  --th-weight: 600;
+  --th-tracking: 0.06em;
+  --th-case: uppercase;
+  /* The ink of a selected table row; currentColor keeps each cell's own colours. */
+  --table-row-selected-text: currentColor;
+  /* Focus: the ring's line style, and how far a button's ring sits from its edge. */
+  --focus-ring-style: solid;
+  --button-focus-offset: var(--focus-ring-offset);
+  --scrollbar-size: 6px;
+  --scrollbar-buttons: none;
+  --progress-inset: 0;
   /* Menus (account menu, share menu): corners and the hovered row's ink. */
   --menu-radius: 12px;
   --menu-item-radius: 6px;
@@ -99,10 +188,7 @@ code, kbd, pre, samp, .ant-typography code,
   --glass-border: rgba(255, 255, 255, 0.06);
   --surface-hover: rgba(255, 255, 255, 0.04);
   /* Sidebar bucket groups: a card per backend, its header opaque (sticky). */
-  --group-bg: rgba(255, 255, 255, 0.025);
-  --group-border: rgba(255, 255, 255, 0.08);
-  --group-header-bg: #131c2e;
-  --group-rail: rgba(255, 255, 255, 0.10);
+  --group-header-bg: var(--sider-bg);
   --drop-glow: color-mix(in srgb, var(--dg-accent-blue) 15%, transparent);
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.04);
   --input-bg: rgba(255, 255, 255, 0.04);
@@ -150,10 +236,7 @@ code, kbd, pre, samp, .ant-typography code,
   --glass-bg: rgba(255, 255, 255, 0.7);
   --glass-border: rgba(0, 0, 0, 0.06);
   --surface-hover: rgba(0, 0, 0, 0.03);
-  --group-bg: rgba(255, 255, 255, 0.55);
-  --group-border: rgba(12, 22, 41, 0.10);
-  --group-header-bg: #e3e8f0;
-  --group-rail: rgba(12, 22, 41, 0.12);
+  --group-header-bg: var(--sider-bg);
   --drop-glow: color-mix(in srgb, var(--dg-accent-blue) 10%, transparent);
   --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 0 0 1px rgba(0, 0, 0, 0.04);
   --input-bg: rgba(0, 0, 0, 0.02);
@@ -199,8 +282,13 @@ code, kbd, pre, samp, .ant-typography code,
 
 /* ───── Scrollbar styling ───── */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+::-webkit-scrollbar-button:single-button {
+  display: var(--scrollbar-buttons);
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
 }
 ::-webkit-scrollbar-track {
   background: var(--scrollbar-track);
@@ -236,17 +324,19 @@ code, kbd, pre, samp, .ant-typography code,
 }
 /* Selected = AntD's class (the inspector row) or `aria-selected` (a row
    ticked in a grid, e.g. the object browser's checkboxes). */
-.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell) {
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell),
+.ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).ant-table-row:is(.ant-table-row-selected, [aria-selected='true']):is(:hover, .dg-row-cursor) > :is(td, .ant-table-cell) {
   background: var(--table-row-selected) !important;
+  color: var(--table-row-selected-text);
 }
 
 /* Table header refinement */
 .ant-table-wrapper .ant-table-thead > tr > th {
   font-family: var(--font-ui) !important;
-  font-weight: 600 !important;
-  letter-spacing: 0.06em !important;
-  text-transform: uppercase !important;
-  font-size: 11px !important;
+  font-weight: var(--th-weight) !important;
+  letter-spacing: var(--th-tracking) !important;
+  text-transform: var(--th-case) !important;
+  font-size: var(--th-size) !important;
 }
 
 /* Row hover accent bar */
@@ -279,7 +369,7 @@ code, kbd, pre, samp, .ant-typography code,
   background: var(--table-row-hover) !important;
 }
 .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row).dg-row-cursor {
-  outline: var(--focus-ring-width) solid var(--focus-ring);
+  outline: var(--focus-ring-width) var(--focus-ring-style) var(--focus-ring);
   outline-offset: calc(-1 * var(--focus-ring-width));
 }
 
@@ -332,7 +422,7 @@ code, kbd, pre, samp, .ant-typography code,
   --focus-ring-offset: 2px;
 }
 :focus-visible:not(input, textarea, select, [tabindex='-1']) {
-  outline: var(--focus-ring-width) solid var(--focus-ring) !important;
+  outline: var(--focus-ring-width) var(--focus-ring-style) var(--focus-ring) !important;
   outline-offset: var(--focus-ring-offset) !important;
 }
 /* Text fields (D2): the focused <input> of an AntD field sits inside a
@@ -345,8 +435,11 @@ code, kbd, pre, samp, .ant-typography code,
 .ant-select-focused:not(.ant-select-disabled),
 .ant-picker-focused,
 :is(input, textarea, select):focus-visible:not([class*="ant-"], [type='checkbox'], [type='radio'], [tabindex='-1']) {
-  outline: var(--focus-ring-width) solid var(--focus-ring) !important;
+  outline: var(--focus-ring-width) var(--focus-ring-style) var(--focus-ring) !important;
   outline-offset: 1px !important;
+}
+.ant-btn:focus-visible {
+  outline-offset: var(--button-focus-offset) !important;
 }
 /* Segmented (D3): rc-segmented makes BOTH its root and the radio of the
    selected item Tab stops. Call sites pass tabIndex={-1} to the root, so
@@ -354,7 +447,7 @@ code, kbd, pre, samp, .ant-typography code,
    itself has opacity 0, so its own ring never shows). */
 .ant-segmented-item:has(> .ant-segmented-item-input:focus-visible),
 .ant-segmented-item-focused {
-  outline: var(--focus-ring-width) solid var(--focus-ring) !important;
+  outline: var(--focus-ring-width) var(--focus-ring-style) var(--focus-ring) !important;
   outline-offset: 0 !important;
 }
 /* No outline animation anywhere: an element whose `transition` lists
@@ -368,7 +461,7 @@ code, kbd, pre, samp, .ant-typography code,
 /* AntD checkbox, radio: the focused element is a hidden <input>; the ring
    goes on the box that is drawn next to it. */
 :is(.ant-checkbox-input, .ant-radio-input):focus-visible + :is(.ant-checkbox-inner, .ant-radio-inner) {
-  outline: var(--focus-ring-width) solid var(--focus-ring) !important;
+  outline: var(--focus-ring-width) var(--focus-ring-style) var(--focus-ring) !important;
   outline-offset: var(--focus-ring-offset) !important;
 }
 /* The same ring drawn INSIDE the element, where an outside ring is clipped
@@ -482,39 +575,155 @@ code, kbd, pre, samp, .ant-typography code,
   transition: none !important;
 }
 
-/* One card per backend. The header is sticky inside the scrolling bucket
-   list, so the backend name stays on screen while its buckets scroll; it is
-   opaque for that reason. The rows are indented under a rail. */
-.dg-bucket-group {
-  border: 1px solid var(--group-border);
-  border-radius: 8px;
-  background: var(--group-bg);
+/* A progress track's inner inset (XP draws its blocks 1 px inside the frame). */
+.ant-progress-outer .ant-progress-inner {
+  padding: var(--progress-inset);
 }
-.dg-bucket-group[data-collapsed='true'] {
-  background: transparent;
+
+/* The inspector's header. A style may paint a title bar behind its first line. */
+.dg-inspector-header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--insp-head-gap);
+  padding: var(--insp-head-pad);
+  border-bottom: 1px solid var(--dg-border);
+}
+.dg-inspector-icon {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: var(--insp-icon-box);
+  height: var(--insp-icon-box);
+  margin-top: var(--insp-icon-offset);
+  border: var(--insp-icon-border);
+  border-radius: var(--card-radius);
+  background: var(--insp-icon-bg);
+  color: var(--insp-icon-text);
+  font-size: var(--insp-icon-size);
+}
+.dg-inspector-names {
+  flex: 1;
+  min-width: 0;
+}
+.dg-inspector-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--insp-title-lines);
+  overflow: hidden;
+  margin: 0;
+  color: var(--insp-title-text);
+  font-family: var(--font-ui);
+  font-size: var(--insp-title-size);
+  font-weight: 600;
+  line-height: var(--insp-title-lh);
+  overflow-wrap: break-word;
+}
+.dg-inspector-key {
+  margin-top: 2px;
+  color: var(--dg-text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.dg-inspector-header .dg-inspector-close.ant-btn {
+  flex-shrink: 0;
+  width: var(--insp-close-size);
+  min-width: var(--insp-close-size);
+  height: var(--insp-close-size);
+  margin-top: var(--insp-close-offset);
+  color: var(--dg-text-muted);
+}
+
+/* The browser sidebar: the bucket pane (title row, filter, scrolling list) over the footer. */
+.dg-sidebar-body {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--sider-bg);
+}
+.dg-bucket-pane {
+  flex: var(--pane-flex);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin: var(--pane-margin);
+  overflow: hidden;
+}
+.dg-bucket-pane-head {
+  flex-shrink: 0;
+  margin-bottom: var(--pane-head-gap);
+  padding: var(--pane-head-pad);
+  background: var(--pane-head-bg);
+}
+.dg-bucket-pane-head .dg-eyebrow {
+  color: var(--pane-head-text);
+}
+/* The footer: the wordmark (opens the browser) and the version. */
+.dg-sidebar-footer {
+  display: flex;
+  align-items: var(--taskbar-align);
+  justify-content: var(--taskbar-justify);
+  gap: var(--taskbar-gap);
+  height: var(--taskbar-height);
+  box-sizing: border-box;
+  padding: var(--taskbar-pad);
+  overflow: hidden;
+  border-top: 1px solid var(--taskbar-border);
+  background: var(--taskbar-bg);
+  color: var(--dg-text-muted);
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+.dg-sidebar-footer .dg-wordmark {
+  gap: 6px;
+  padding: var(--start-pad);
+  color: var(--start-text);
+  font-size: var(--start-size);
+}
+.dg-sidebar-footer .dg-wordmark:is(:hover, :focus-visible) {
+  color: var(--start-text-hover);
+  filter: var(--start-hover-filter);
+}
+.dg-sidebar-footer .dg-wordmark::before {
+  content: var(--start-flag);
+  width: 16px;
+  height: 16px;
+  background: var(--start-flag-image);
+  transform: skewY(-8deg);
+}
+.dg-sidebar-version {
+  display: flex;
+  align-items: center;
+  padding: var(--tray-pad);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A section per backend: a quiet label (type, name, count) over its buckets, in the eyebrow type
+   of the list title. The label sticks while its buckets scroll under it, so it is opaque. The rows
+   line up with an ungrouped list: the backend shows without boxes, rails or extra lines. */
+.dg-bucket-group + .dg-bucket-group {
+  margin-top: 8px;
 }
 .dg-bucket-group-header {
   position: sticky;
   top: 0;
   z-index: 1;
   width: 100%;
-  gap: 8px;
-  height: 32px;
-  padding: 0 8px 0 8px;
-  border-radius: 7px 7px 0 0;
+  gap: 6px;
+  height: 28px;
+  padding: 0 8px;
   background: var(--group-header-bg);
   color: var(--dg-group-color);
-  transition: color 0.15s, filter 0.15s;
-}
-.dg-bucket-group[data-collapsed='true'] .dg-bucket-group-header {
-  border-radius: 7px;
+  transition: color 0.15s;
 }
 .dg-bucket-group-header:hover {
   color: var(--dg-group-hover-color);
-  filter: brightness(1.06);
 }
-[data-theme='light'] .dg-bucket-group-header:hover {
-  filter: brightness(0.97);
+/* A backend name is an identifier: the eyebrow type, but never re-cased. */
+.dg-bucket-group-header .dg-eyebrow {
+  text-transform: none;
+  letter-spacing: 0.02em;
 }
 .dg-bucket-group-chevron {
   font-size: 11px;
@@ -524,7 +733,7 @@ code, kbd, pre, samp, .ant-typography code,
   transform: rotate(90deg);
 }
 .dg-bucket-group-type {
-  font-size: 13px;
+  font-size: 12px;
   opacity: 0.8;
 }
 /* The open bucket is inside a collapsed group: a dot in the accent colour. */
@@ -537,12 +746,8 @@ code, kbd, pre, samp, .ant-typography code,
 }
 .dg-bucket-group-rows {
   list-style: none;
-  margin: 0 0 0 16px;
-  padding: 4px 4px 4px 0;
-  border-left: 2px solid var(--group-rail);
-}
-.dg-bucket-group-rows > li {
-  padding-left: 4px;
+  margin: 0;
+  padding: 0 0 4px;
 }
 
 /* ───── Animations ───── */
@@ -642,9 +847,9 @@ code, kbd, pre, samp, .ant-typography code,
   border-radius: inherit;
   border-end-start-radius: 0;
   border-end-end-radius: 0;
-  background: var(--menu-identity-bg);
-  color: var(--menu-identity-text);
-  text-shadow: var(--menu-identity-shadow);
+  background: var(--window-title-bg);
+  color: var(--window-title-text);
+  text-shadow: var(--window-title-shadow);
 }
 .account-menu-identity-name {
   font-size: 13px;
@@ -870,7 +1075,7 @@ code, kbd, pre, samp, .ant-typography code,
    sections, table headers) and for the brand wordmark (`.dg-wordmark`). One size, one weight, one
    spacing. */
 .dg-eyebrow {
-  font-size: 11px;
+  font-size: var(--eyebrow-size);
   font-weight: 600;
   line-height: 1.3;
   letter-spacing: 0.06em;
@@ -908,8 +1113,6 @@ code, kbd, pre, samp, .ant-typography code,
   --glass-border: transparent;
   --overlay-bg: color-mix(in srgb, var(--dg-bg-base) 92%, transparent);
   --group-header-bg: var(--dg-bg-sidebar);
-  --group-bg: transparent;
-  --group-border: var(--dg-border);
   --docs-code-bg: var(--dg-bg-sidebar);
   --login-shell-bg: var(--dg-bg-base);
   --login-panel-bg: var(--dg-bg-card);
@@ -917,6 +1120,8 @@ code, kbd, pre, samp, .ant-typography code,
   --login-shadow: var(--dg-float-shadow);
   --login-hero-text: var(--dg-text-primary);
   --login-submit-blend: var(--dg-accent-blue);
+  /* The primary action: flat coral, no glow. */
+  --login-submit-shadow: none;
   --menu-panel-bg: var(--dg-bg-card);
   --menu-border: var(--dg-border);
   --menu-shadow: var(--dg-float-shadow);
@@ -960,13 +1165,9 @@ code, kbd, pre, samp, .ant-typography code,
 [data-theme-style="editorial"] .dg-login-shell::before {
   display: none;
 }
-/* The primary action: flat coral, no glow. */
-[data-theme-style="editorial"] .dg-login-submit {
-  box-shadow: none !important;
-}
 /* "Processing" tags: ink on the info paper, not the default style's blue. */
 [data-theme-style="editorial"] .ant-tag:not(.ant-tag-solid).ant-tag-processing {
-  color: var(--dg-text-primary) !important;
+  color: var(--dg-text-primary);
 }
 /* Paper cards: the drop, not a ring. */
 [data-theme-style="editorial"] .ant-card:not(.ant-card-bordered) {
@@ -1093,6 +1294,7 @@ code, kbd, pre, samp, .ant-typography code,
   box-sizing: border-box;
   width: min(100%, 480px);
   padding: clamp(30px, 4.2vw, 42px);
+  padding-top: calc(var(--window-title-height) + clamp(30px, 4.2vw, 42px));
   border: 1px solid color-mix(in srgb, var(--login-card-border) 84%, transparent);
   border-radius: 24px;
   background: var(--login-panel-bg);
@@ -1101,19 +1303,45 @@ code, kbd, pre, samp, .ant-typography code,
   -webkit-backdrop-filter: var(--surface-blur-strong);
 }
 
+/* The title bar of a style that draws one (--login-title, --window-title-height). */
+.dg-login-card::before {
+  content: var(--login-title);
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: var(--window-title-height);
+  box-sizing: border-box;
+  padding: 0 40px 0 10px;
+  display: flex;
+  align-items: center;
+  border-radius: inherit;
+  border-end-start-radius: 0;
+  border-end-end-radius: 0;
+  background: var(--window-title-bg);
+  color: var(--window-title-text);
+  font: 700 14px/1 var(--font-display);
+  text-shadow: var(--window-title-shadow);
+}
+
+/* AntD's button styles load after this sheet, hence !important; the values are roles. */
 .dg-login-theme-toggle {
   position: absolute !important;
-  top: 18px;
-  right: 18px;
-  color: var(--dg-text-muted) !important;
-  border: 1px solid color-mix(in srgb, var(--login-card-border) 78%, transparent) !important;
-  background: color-mix(in srgb, var(--glass-bg) 48%, transparent) !important;
+  inset: var(--login-toggle-inset);
+  inset-inline-start: auto;
+  inset-block-end: auto;
+  width: var(--login-toggle-size) !important;
+  height: var(--login-toggle-size) !important;
+  min-width: var(--login-toggle-size) !important;
+  border-radius: var(--login-toggle-radius) !important;
+  color: var(--login-toggle-text) !important;
+  border: 1px solid var(--login-toggle-border) !important;
+  background: var(--login-toggle-bg) !important;
 }
 
 .dg-login-theme-toggle:hover {
-  color: var(--dg-accent-blue) !important;
-  border-color: color-mix(in srgb, var(--dg-accent-blue) 38%, var(--login-card-border)) !important;
-  background: color-mix(in srgb, var(--glass-bg) 68%, var(--dg-accent-blue) 8%) !important;
+  color: var(--login-toggle-text-hover) !important;
+  border-color: var(--login-toggle-border-hover) !important;
+  background: var(--login-toggle-bg-hover) !important;
+  box-shadow: var(--login-toggle-ring);
 }
 
 /* ───── The DeltaGlider wordmark (brand identity) ─────
@@ -1246,23 +1474,25 @@ code, kbd, pre, samp, .ant-typography code,
 }
 
 .dg-login-submit {
-  height: 54px !important;
+  height: var(--login-submit-height) !important;
   margin-top: 8px;
-  border: 0 !important;
-  border-radius: 16px !important;
-  background: linear-gradient(135deg, var(--dg-accent-blue), color-mix(in srgb, var(--dg-accent-blue) 72%, var(--login-submit-blend))) !important;
-  color: var(--dg-on-accent) !important;
-  font: 800 16px/1 var(--font-ui) !important;
+  border: var(--login-submit-border) !important;
+  border-radius: var(--login-submit-radius) !important;
+  background: var(--login-submit-bg) !important;
+  color: var(--login-submit-text) !important;
+  font: var(--login-submit-font) !important;
   letter-spacing: 0.01em !important;
-  box-shadow:
-    0 18px 38px color-mix(in srgb, var(--dg-accent-blue) 22%, transparent),
-    inset 0 1px 0 color-mix(in srgb, var(--dg-on-accent) 30%, transparent) !important;
+  box-shadow: var(--login-submit-shadow) !important;
+}
+
+.dg-login-submit:not(:disabled):hover {
+  box-shadow: var(--login-submit-shadow-hover) !important;
 }
 
 .dg-login-submit:disabled {
-  border: 1px solid color-mix(in srgb, var(--dg-accent-blue) 22%, var(--login-card-border)) !important;
-  background: color-mix(in srgb, var(--glass-bg) 70%, transparent) !important;
-  color: color-mix(in srgb, var(--login-hero-text) 34%, transparent) !important;
+  border: var(--login-submit-disabled-border) !important;
+  background: var(--login-submit-disabled-bg) !important;
+  color: var(--login-submit-disabled-text) !important;
   box-shadow: none !important;
 }
 
@@ -1468,10 +1698,7 @@ code, kbd, pre, samp, .ant-typography code,
   --glass-bg: var(--dg-bg-card);
   --glass-border: var(--dg-border);
   --overlay-bg: color-mix(in srgb, var(--dg-bg-base) 90%, transparent);
-  --group-header-bg: var(--xp-pane-head-bg);
-  --group-bg: var(--dg-bg-card);
-  --group-border: var(--dg-border);
-  --group-rail: var(--dg-border);
+  --group-header-bg: var(--dg-bg-card);
   --docs-code-bg: var(--dg-bg-sidebar);
   --login-panel-bg: var(--dg-bg-base);
   --login-card-border: var(--xp-window-border);
@@ -1497,9 +1724,91 @@ code, kbd, pre, samp, .ant-typography code,
   --xp-seg-mask: repeating-linear-gradient(90deg, #000 0 7px, transparent 7px 9px);
   --sidebar-name-font: var(--font-ui);
   --bucket-row-pad-y: 4px;
-  --menu-identity-bg: var(--xp-title-bg);
-  --menu-identity-text: var(--xp-title-text);
-  --menu-identity-shadow: var(--xp-title-shadow);
+  --window-title-height: 28px;
+  --window-title-bg: var(--xp-title-bg);
+  --window-title-text: var(--xp-title-text);
+  --window-title-shadow: var(--xp-title-shadow);
+  --login-title: 'Log On to DeltaGlider';
+  --login-toggle-inset: 3px 5px auto auto;
+  --login-toggle-size: 22px;
+  --login-toggle-radius: 3px;
+  --login-toggle-bg: var(--xp-min-bg);
+  --login-toggle-bg-hover: var(--xp-min-bg);
+  --login-toggle-border: var(--dg-bg-card);
+  --login-toggle-border-hover: var(--dg-bg-card);
+  --login-toggle-text: var(--xp-title-text);
+  --login-toggle-text-hover: var(--xp-title-text);
+  --login-toggle-ring: inset 0 0 0 2px var(--xp-hot);
+  --login-submit-height: 34px;
+  --login-submit-radius: 3px;
+  --login-submit-border: 1px solid var(--xp-btn-border);
+  --login-submit-bg: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--xp-primary-fill);
+  --login-submit-text: var(--xp-primary-text);
+  --login-submit-font: 700 14px/1 var(--font-ui);
+  --login-submit-shadow: none;
+  --login-submit-shadow-hover: inset 0 0 0 2px var(--xp-hot);
+  --login-submit-disabled-bg: var(--dg-bg-base);
+  --login-submit-disabled-border: 1px solid var(--dg-border);
+  --login-submit-disabled-text: var(--dg-text-faint);
+  --eyebrow-size: 12px;
+  --sider-bg: var(--xp-sider-bg);
+  --dot-color: transparent;
+  --pane-flex: 0 1 auto;
+  --pane-margin: 12px 10px 0;
+  --pane-head-pad: 6px 10px;
+  --pane-head-gap: 8px;
+  --pane-head-bg: var(--xp-pane-head-bg);
+  --pane-head-text: var(--dg-accent-blue-light);
+  --taskbar-height: 32px;
+  --taskbar-pad: 0;
+  --taskbar-gap: 0;
+  --taskbar-align: stretch;
+  --taskbar-justify: space-between;
+  --taskbar-bg: var(--xp-taskbar-bg);
+  --taskbar-border: var(--xp-window-border);
+  --start-pad: 0 18px 0 10px;
+  --start-size: 16px;
+  --start-text: var(--xp-title-text);
+  --start-text-hover: var(--xp-title-text);
+  --start-hover-filter: brightness(1.1);
+  --start-flag: '';
+  --start-flag-image: var(--xp-flag);
+  --tray-pad: 0 12px;
+  --toolbar-bg: var(--xp-toolbar-bg);
+  --chrome-bg: var(--xp-title-bg);
+  --chrome-border: var(--xp-window-border);
+  --chrome-text: var(--xp-title-text);
+  --chrome-muted: var(--xp-title-text);
+  --chrome-accent: var(--xp-title-text);
+  --insp-head-gap: 6px;
+  --insp-head-pad: 0 4px 6px 8px;
+  --insp-icon-box: 16px;
+  --insp-icon-offset: 6px;
+  --insp-icon-size: 14px;
+  --insp-icon-bg: none;
+  --insp-icon-border: 0;
+  --insp-icon-text: var(--xp-title-text);
+  /* One line: Chromium still breaks a nowrap line at <wbr>, so the clamp cuts the rest; the key shows it in full. */
+  --insp-title-lines: 1;
+  --insp-title-size: 13px;
+  --insp-title-lh: 28px;
+  --insp-title-text: var(--xp-title-text);
+  --insp-close-size: 21px;
+  --insp-close-offset: 4px;
+  --floating-bar-border: var(--xp-menu-border);
+  --floating-bar-radius: 0;
+  --floating-bar-bg: var(--xp-toolbar-bg);
+  --floating-bar-shadow: var(--dg-elev-shadow);
+  --th-size: 12px;
+  --th-weight: 400;
+  --th-tracking: 0;
+  --th-case: none;
+  --table-row-selected-text: var(--xp-select-text);
+  --focus-ring-style: dotted;
+  --button-focus-offset: -4px;
+  --scrollbar-size: 17px;
+  --scrollbar-buttons: block;
+  --progress-inset: 1px;
   --menu-radius: 0;
   --menu-item-radius: 0;
   --menu-item-hover-text: var(--xp-select-text);
@@ -1598,22 +1907,11 @@ code, kbd, pre, samp, .ant-typography code,
   background: var(--xp-select-bg);
   color: var(--xp-select-text);
 }
-/* Focus is the XP dotted rectangle. */
-[data-theme-style="xp"] :focus-visible:not(input, textarea, select, [tabindex='-1']) {
-  outline-style: dotted !important;
-}
+/* Focus is the XP dotted rectangle (--focus-ring-style). */
 /* AntD 6 hides the checkbox/radio input: the ring goes on the drawn box. */
 [data-theme-style="xp"] :is(.ant-checkbox, .ant-radio):has(> input:focus-visible) {
-  outline: var(--focus-ring-width) solid var(--focus-ring);
-  outline-style: dotted;
+  outline: var(--focus-ring-width) var(--focus-ring-style) var(--focus-ring);
   outline-offset: var(--focus-ring-offset);
-}
-
-/* Text fields: the same dotted rectangle, drawn outside the dark frame. */
-[data-theme-style="xp"] .ant-input:not(.ant-input-affix-wrapper .ant-input, .ant-input-number .ant-input):focus,
-[data-theme-style="xp"] :is(.ant-input-affix-wrapper-focused, .ant-input-number-focused, .ant-select-focused:not(.ant-select-disabled), .ant-picker-focused),
-[data-theme-style="xp"] :is(input, textarea, select):focus-visible:not([class*="ant-"], [type='checkbox'], [type='radio'], [tabindex='-1']) {
-  outline-style: dotted !important;
 }
 
 /* ── Buttons: glossy, steel-blue frame, orange hot-track, no motion ── */
@@ -1708,10 +2006,6 @@ code, kbd, pre, samp, .ant-typography code,
   border-bottom: 1px solid var(--dg-border);
   border-inline-end: 1px solid var(--dg-border);
   color: var(--dg-text-primary);
-  letter-spacing: 0 !important;
-  text-transform: none !important;
-  font-size: 12px !important;
-  font-weight: 400 !important;
 }
 [data-theme-style="xp"] .ant-table-wrapper .ant-table-thead > tr > th::before {
   display: none;
@@ -1720,7 +2014,7 @@ code, kbd, pre, samp, .ant-typography code,
   background: var(--xp-toolbar-hover);
   box-shadow: inset 0 -2px 0 var(--xp-hot);
 }
-[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell),
+/* White ink on the Luna selection: cell content carries inline colours, hence !important (an exception in styleLayers.test.ts). */
 [data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']) > :is(td, .ant-table-cell) :not(.ant-tag, .ant-tag *, .ant-btn, .ant-btn *, .ant-checkbox, .ant-checkbox *) {
   color: var(--xp-select-text) !important;
 }
@@ -1745,7 +2039,6 @@ code, kbd, pre, samp, .ant-typography code,
   background: var(--xp-pane-head-bg);
   border-bottom: 0;
   border-radius: 6px 6px 0 0;
-  min-height: 0;
 }
 [data-theme-style="xp"] .ant-card-head-title {
   color: var(--dg-accent-blue-light);
@@ -1755,41 +2048,25 @@ code, kbd, pre, samp, .ant-typography code,
 }
 
 /* ── Windows: dialogs and drawers get the Luna title bar ──
-   The modal's geometry and title-bar fill are AntD tokens (theme.ts, xpTheme); here only paint. */
+   Geometry is AntD's: Modal and Drawer tokens and the drawer's end-placed close (theme.ts). */
 [data-theme-style="xp"] .ant-modal-container {
   border: 1px solid var(--xp-window-border);
   border-radius: 8px 8px 0 0;
   box-shadow: var(--dg-float-shadow);
 }
 [data-theme-style="xp"] .ant-drawer-header {
-  margin: 0;
-  padding: 6px 36px 6px 10px;
   background: var(--xp-title-bg);
   border: 0;
-  min-height: 30px;
-  display: flex;
-  align-items: center;
 }
 [data-theme-style="xp"] :is(.ant-modal-title, .ant-drawer-title) {
   color: var(--xp-title-text);
   text-shadow: var(--xp-title-shadow);
-}
-[data-theme-style="xp"] .ant-drawer-title {
-  font-size: 14px;
 }
 [data-theme-style="xp"] :is(.ant-modal-close, .ant-drawer-close) {
   background: var(--xp-close-bg);
   border: 1px solid var(--dg-bg-card);
   border-radius: 3px;
   color: var(--xp-title-text);
-}
-[data-theme-style="xp"] .ant-drawer-close {
-  position: absolute;
-  top: 4px;
-  inset-inline: auto 5px;
-  width: 22px;
-  height: 22px;
-  margin: 0;
 }
 [data-theme-style="xp"] :is(.ant-modal-close, .ant-drawer-close):hover {
   background: var(--xp-close-bg);
@@ -1818,7 +2095,6 @@ code, kbd, pre, samp, .ant-typography code,
 /* ── Tabs: the orange hot-track on the active tab ── */
 [data-theme-style="xp"] .ant-tabs-ink-bar {
   background: var(--xp-hot);
-  height: 3px;
 }
 
 /* ── Progress: the green XP blocks ── */
@@ -1826,7 +2102,6 @@ code, kbd, pre, samp, .ant-typography code,
   border: 1px solid var(--xp-btn-border);
   border-radius: 3px;
   background: var(--dg-bar-track);
-  padding: 1px;
 }
 [data-theme-style="xp"] .ant-progress-bg {
   background: var(--dg-bar-saved);
@@ -1835,124 +2110,40 @@ code, kbd, pre, samp, .ant-typography code,
 }
 
 /* ── Shell: toolbar, Explorer pane, the taskbar with its Start button ── */
-[data-theme-style="xp"] .ant-layout-header {
-  background: var(--xp-toolbar-bg) !important;
-  border-bottom: 1px solid var(--dg-border) !important;
-}
-[data-theme-style="xp"] .ant-layout-sider {
-  background: var(--xp-sider-bg) !important;
-  border-right: 1px solid var(--dg-border) !important;
-}
 [data-theme-style="xp"] .dg-fullscreen-header {
-  background: var(--xp-title-bg) !important;
-  border-bottom: 1px solid var(--xp-window-border) !important;
-}
-[data-theme-style="xp"] .dg-fullscreen-header :is(.dg-wordmark, .dg-wordmark-product, .ant-btn, .anticon) {
-  color: var(--xp-title-text) !important;
   text-shadow: var(--xp-title-shadow);
 }
 [data-theme-style="xp"] .dg-fullscreen-header .ant-btn.ant-btn-variant-text:not(:disabled):hover {
   background: var(--xp-min-bg);
   box-shadow: inset 0 0 0 1px var(--xp-title-text);
 }
-[data-theme-style="xp"] .dg-sidebar-footer {
-  padding: 0 !important;
-  height: 32px;
-  box-sizing: border-box;
-  gap: 0 !important;
-  align-items: stretch !important;
-  justify-content: space-between;
-  background: var(--xp-taskbar-bg);
-  border-top: 1px solid var(--xp-window-border) !important;
-  overflow: hidden;
-}
 [data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 18px 0 10px;
   background: var(--xp-start-bg);
   border: 1px solid var(--xp-start-border);
   border-radius: 0 12px 12px 0;
   box-shadow: 1px 0 2px var(--xp-start-border);
-  color: var(--xp-title-text) !important;
   font-family: var(--font-display);
-  font-size: 16px !important;
   font-style: italic;
   font-weight: 700;
   letter-spacing: 0;
   text-transform: none;
   text-shadow: 1px 1px 2px var(--xp-start-border);
 }
-[data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark:hover {
-  filter: brightness(1.1);
-}
-[data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark::before {
-  content: '';
-  width: 16px;
-  height: 16px;
-  background: var(--xp-flag);
-  transform: skewY(-8deg);
-}
-[data-theme-style="xp"] .dg-sidebar-footer .dg-wordmark ~ span {
-  display: flex;
-  align-items: center;
-  padding: 0 12px;
+[data-theme-style="xp"] .dg-sidebar-version {
   background: var(--xp-tray-bg);
   border-left: 1px solid var(--xp-window-border);
   color: var(--xp-title-text);
-  font-size: 12px;
 }
 
-/* ── Bucket groups: the task-pane box ── */
-[data-theme-style="xp"] .dg-bucket-group {
-  border-radius: 6px 6px 0 0;
-  overflow: hidden;
-}
-[data-theme-style="xp"] .dg-bucket-group-header {
-  border-radius: 0;
-}
 
-/* ── Login: the Welcome screen, with the form as a Log On window ── */
+/* ── Login: the Welcome screen, with the form as a Log On window (the title bar is --login-title) ── */
 [data-theme-style="xp"] .dg-login-shell::before,
 [data-theme-style="xp"] :is(.dg-login-orb, .dg-login-grid) {
   display: none;
 }
 [data-theme-style="xp"] .dg-login-card {
-  padding-top: calc(28px + clamp(24px, 3vw, 32px));
   border: 1px solid var(--xp-window-border);
   border-radius: 8px 8px 0 0;
-  overflow: hidden;
-}
-[data-theme-style="xp"] .dg-login-card::before {
-  content: 'Log On to DeltaGlider';
-  position: absolute;
-  inset: 0 0 auto 0;
-  height: 28px;
-  box-sizing: border-box;
-  padding: 0 40px 0 10px;
-  display: flex;
-  align-items: center;
-  background: var(--xp-title-bg);
-  color: var(--xp-title-text);
-  font: 700 14px/1 var(--font-display);
-  text-shadow: var(--xp-title-shadow);
-}
-[data-theme-style="xp"] .dg-login-theme-toggle {
-  top: 3px;
-  right: 5px;
-  width: 22px !important;
-  height: 22px !important;
-  min-width: 22px !important;
-  background: var(--xp-min-bg) !important;
-  border: 1px solid var(--dg-bg-card) !important;
-  border-radius: 3px !important;
-  color: var(--xp-title-text) !important;
-}
-[data-theme-style="xp"] .dg-login-theme-toggle:hover {
-  background: var(--xp-min-bg) !important;
-  border-color: var(--dg-bg-card) !important;
-  box-shadow: inset 0 0 0 2px var(--xp-hot);
 }
 [data-theme-style="xp"] :is(.dg-login-brand, .dg-login-product) {
   font-family: var(--font-display);
@@ -1961,10 +2152,9 @@ code, kbd, pre, samp, .ant-typography code,
   text-shadow: none;
 }
 [data-theme-style="xp"] .dg-login-card :is(.ant-input, .ant-input-affix-wrapper) {
-  height: 34px !important;
-  border-radius: 2px !important;
-  border-color: var(--xp-field-border) !important;
-  background: var(--dg-bg-card) !important;
+  border-radius: 2px;
+  border-color: var(--xp-field-border);
+  background: var(--dg-bg-card);
 }
 [data-theme-style="xp"] .dg-login-sso-button {
   border: 1px solid var(--xp-btn-border);
@@ -1979,30 +2169,8 @@ code, kbd, pre, samp, .ant-typography code,
   box-shadow: inset 0 0 0 2px var(--xp-hot);
   transform: none;
 }
-[data-theme-style="xp"] .dg-login-submit {
-  height: 34px !important;
-  border: 1px solid var(--xp-btn-border) !important;
-  border-radius: 3px !important;
-  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--xp-primary-fill) !important;
-  color: var(--xp-primary-text) !important;
-  box-shadow: none !important;
-  font: 700 14px/1 var(--font-ui) !important;
-}
-[data-theme-style="xp"] .dg-login-submit:not(:disabled):hover {
-  box-shadow: inset 0 0 0 2px var(--xp-hot) !important;
-}
-[data-theme-style="xp"] .dg-login-submit:disabled {
-  background: var(--dg-bg-base) !important;
-  border: 1px solid var(--dg-border) !important;
-  color: var(--dg-text-faint) !important;
-  box-shadow: none !important;
-}
 
-/* ── Luna scrollbars: 17 px, a blue thumb, arrow buttons ── */
-[data-theme-style="xp"] ::-webkit-scrollbar {
-  width: 17px;
-  height: 17px;
-}
+/* ── Luna scrollbars: 17 px with arrow buttons (--scrollbar-size, --scrollbar-buttons), a blue thumb ── */
 [data-theme-style="xp"] ::-webkit-scrollbar-track {
   background: var(--xp-scroll-track);
 }
@@ -2021,9 +2189,6 @@ code, kbd, pre, samp, .ant-typography code,
   border-color: var(--xp-hot);
 }
 [data-theme-style="xp"] ::-webkit-scrollbar-button:single-button {
-  display: block;
-  width: 17px;
-  height: 17px;
   border: 1px solid var(--xp-scroll-border);
   border-radius: 3px;
   background-color: transparent;
@@ -2059,10 +2224,7 @@ code, kbd, pre, samp, .ant-typography code,
   border-radius: 3px;
 }
 
-/* ── Square corners on controls that carry an inline radius, error frames, switch, alerts ── */
-[data-theme-style="xp"] :is(.ant-btn, .ant-input, .ant-input-affix-wrapper, .ant-input-number, .ant-select-selector, .ant-picker, .ant-segmented, .ant-segmented-item, .ant-segmented-thumb, .ant-alert) {
-  border-radius: 3px !important;
-}
+/* ── Error frames, switch ── */
 [data-theme-style="xp"] :is(.ant-input, .ant-input-affix-wrapper, .ant-input-number, .ant-picker):is(.ant-input-status-error, .ant-input-affix-wrapper-status-error, .ant-input-number-status-error, .ant-picker-status-error),
 [data-theme-style="xp"] .ant-select-status-error .ant-select-selector {
   border-color: var(--dg-accent-red);
@@ -2075,122 +2237,40 @@ code, kbd, pre, samp, .ant-typography code,
   border-radius: 2px;
   background: var(--xp-btn-bg);
 }
-[data-theme-style="xp"] .ant-btn:focus-visible {
-  outline-offset: -4px !important;
-}
-/* The sign-in field sits in a 34 px wrapper: its input must not add its own height. */
-[data-theme-style="xp"] .dg-login-card .ant-input-affix-wrapper > .ant-input {
-  height: auto !important;
-}
 /* Task-pane group labels: bold sentence case, not tracked capitals. */
 [data-theme-style="xp"] .dg-eyebrow {
   text-transform: none;
   letter-spacing: 0;
-  font-size: 12px;
   font-weight: 700;
-}
-/* The bulk-action bar: a docked toolbar, not a floating pill. */
-[data-theme-style="xp"] [role='toolbar'][aria-label='Selection actions'] {
-  border-radius: 0 !important;
-  background: var(--xp-toolbar-bg) !important;
-  border: 1px solid var(--xp-menu-border) !important;
-  box-shadow: var(--dg-elev-shadow) !important;
 }
 
 /* ── Explorer task pane: a blue pane with the bucket list in a cream box ── */
-[data-theme-style="xp"] .ant-layout-sider .dot-grid-bg {
-  background: transparent !important;
-  background-image: none;
-}
-[data-theme-style="xp"] .ant-layout-sider nav[aria-label='Bucket list'] {
-  flex: 0 1 auto !important;
-  margin: 12px 10px 0;
+[data-theme-style="xp"] .dg-bucket-pane {
   background: var(--dg-bg-card);
   border: 1px solid var(--xp-window-border);
   border-radius: 6px 6px 0 0;
-  overflow: hidden;
-}
-[data-theme-style="xp"] .ant-layout-sider nav[aria-label='Bucket list'] > :first-child {
-  margin: 0 0 8px !important;
-  padding: 6px 10px !important;
-  background: var(--xp-pane-head-bg);
-}
-[data-theme-style="xp"] .ant-layout-sider nav[aria-label='Bucket list'] > :first-child * {
-  color: var(--dg-accent-blue-light) !important;
 }
 
-/* ── Inspector drawer: Luna title bar, XP split Share button, XP Delete button ── */
-/* The inspector header keeps its layout (icon, name over key, close); the skin paints a 28 px
-   Luna title bar behind the first line and sets the name on one line. */
+/* ── Inspector: a Luna title bar behind the header's first line (its geometry is --insp-*) ── */
 [data-theme-style="xp"] .dg-inspector-header {
-  gap: 6px !important;
-  padding: 0 4px 6px 8px !important;
   background: var(--xp-title-bg) top / 100% 28px no-repeat, var(--xp-toolbar-bg);
-  border-bottom: 1px solid var(--dg-border) !important;
 }
-[data-theme-style="xp"] .dg-inspector-header > div:first-child {
-  width: 16px !important;
-  height: 16px !important;
-  margin-top: 6px;
-  background: none !important;
-  border: 0 !important;
-}
-[data-theme-style="xp"] .dg-inspector-header > div:first-child .anticon {
-  font-size: 14px !important;
-  color: var(--xp-title-text) !important;
+[data-theme-style="xp"] .dg-inspector-icon {
   filter: drop-shadow(var(--xp-title-shadow));
 }
-/* One line: Chromium still breaks a nowrap line at <wbr>, so the clamp cuts the rest; the key below shows it in full. */
-[data-theme-style="xp"] .dg-inspector-header h2 {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 1;
-  overflow: hidden;
-  line-height: 28px;
-  color: var(--xp-title-text) !important;
-  font-family: var(--font-display) !important;
-  font-size: 13px !important;
-  font-weight: 700 !important;
+[data-theme-style="xp"] .dg-inspector-title {
+  font-family: var(--font-display);
+  font-weight: 700;
   text-shadow: var(--xp-title-shadow);
 }
-[data-theme-style="xp"] .dg-inspector-header .ant-btn {
-  width: 21px;
-  min-width: 21px;
-  height: 21px;
-  margin-top: 4px;
-  padding: 0;
-  background: var(--xp-close-bg) !important;
-  border: 1px solid var(--dg-bg-card) !important;
+[data-theme-style="xp"] .dg-inspector-header .dg-inspector-close.ant-btn,
+[data-theme-style="xp"] .dg-inspector-header .dg-inspector-close.ant-btn:not(:disabled):hover {
+  background: var(--xp-close-bg);
+  border: 1px solid var(--dg-bg-card);
   border-radius: 3px;
-  color: var(--xp-title-text) !important;
+  color: var(--xp-title-text);
 }
-[data-theme-style="xp"] .dg-share-split > button {
-  height: 34px !important;
-  background: linear-gradient(180deg, var(--xp-gloss) 0%, transparent 55%), var(--xp-primary-fill) !important;
-  border: 1px solid var(--xp-btn-border) !important;
-  color: var(--xp-primary-text) !important;
-}
-[data-theme-style="xp"] .dg-share-split > button:first-child {
-  border-radius: 3px 0 0 3px !important;
-}
-[data-theme-style="xp"] .dg-share-split > button:last-of-type {
-  border-radius: 0 3px 3px 0 !important;
-}
-[data-theme-style="xp"] .dg-share-split > button:hover {
+[data-theme-style="xp"] .dg-inspector-header .dg-inspector-close.ant-btn:not(:disabled):hover {
   box-shadow: inset 0 0 0 2px var(--xp-hot);
 }
-[data-theme-style="xp"] .dg-danger-action {
-  background: var(--xp-btn-bg) !important;
-  border-color: var(--xp-btn-border) !important;
-}
-[data-theme-style="xp"] .dg-danger-action:not(:disabled):hover {
-  box-shadow: inset 0 0 0 2px var(--xp-hot);
-}
-/* A selected row stays Luna blue under the pointer (the hover fill outranks the selected one). */
-[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']):hover > :is(td, .ant-table-cell) {
-  background: var(--xp-select-bg) !important;
-}
-/* The row open in the inspector (selected + keyboard cursor) keeps the Luna blue: the cursor fill would outrank it. */
-[data-theme-style="xp"] .ant-table-wrapper :is(.ant-table-tbody > tr, .ant-table-tbody-virtual .ant-table-row):is(.ant-table-row-selected, [aria-selected='true']).dg-row-cursor > :is(td, .ant-table-cell) {
-  background: var(--xp-select-bg) !important;
-}
+

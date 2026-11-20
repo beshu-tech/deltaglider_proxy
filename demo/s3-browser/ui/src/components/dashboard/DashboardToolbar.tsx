@@ -110,7 +110,6 @@ export default function DashboardToolbar({
             size="small"
             icon={<ReloadOutlined spin={loading} />}
             onClick={onManualRefresh}
-            style={{ borderRadius: 8 }}
             title="Refresh now"
             aria-label="Refresh now"
           />

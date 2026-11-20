@@ -16,7 +16,6 @@ import type { ConflictResolver } from '../bulkConflicts';
 import { pluralize } from '../utils';
 import type { RowKey } from '../rowKey';
 import { useIsNarrow } from '../useIsNarrow';
-import { cssVar } from '../themeVars';
 import { Z } from '../theme';
 
 /** Below this width the action buttons show their icon only (with a title):
@@ -132,9 +131,9 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
           zIndex: Z.floating, maxWidth: 'calc(100% - 32px)',
           display: 'flex', alignItems: 'center', gap: SPACE.xs,
           padding: iconOnly ? `${SPACE.xs}px ${SPACE.sm}px` : `${SPACE.xs}px ${SPACE.sm}px ${SPACE.xs}px ${SPACE.md}px`,
-          border: `1px solid ${colors.BORDER}`, borderRadius: 10,
-          background: colors.BG_ELEVATED,
-          boxShadow: cssVar('FLOAT_SHADOW'),
+          border: '1px solid var(--floating-bar-border)', borderRadius: 'var(--floating-bar-radius)',
+          background: 'var(--floating-bar-bg)',
+          boxShadow: 'var(--floating-bar-shadow)',
         }}
       >
         {shown ? (

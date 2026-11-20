@@ -70,7 +70,7 @@ export default function BucketPrefixInput({
   }, [value.bucket, value.prefix]);
 
   return (
-    <div style={{ ...style }}>
+    <div style={style}>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
       <div>
         <Text id={`${uid}-bucket`} type="secondary" style={{ display: 'block', fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
@@ -140,7 +140,6 @@ export default function BucketPrefixInput({
                   height: 24,
                   padding: '0 8px',
                   border: `1px solid ${colors.BORDER}`,
-                  borderRadius: 5,
                   background: 'var(--input-bg)',
                   color: colors.ACCENT_BLUE,
                   fontFamily: 'var(--font-mono)',

@@ -294,7 +294,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
         onMouseDown={(e) => e.preventDefault()}
         onClick={addRow}
         block
-        style={{ marginTop: 8, borderRadius: 8 }}
+        style={{ marginTop: 8 }}
       >
         Add resource
       </Button>

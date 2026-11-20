@@ -56,7 +56,7 @@ test('theme.css has one focus ring style', () => {
   const rings = rules.filter(([, , body]) => /(^|[;\s])outline\s*:/.test(body));
   expect(rings.length).toBeGreaterThan(0);
   for (const [, selector, body] of rings) {
-    expect(body, selector.trim()).toMatch(/outline:\s*var\(--focus-ring-width\) solid var\(--focus-ring[,)]/);
+    expect(body, selector.trim()).toMatch(/outline:\s*var\(--focus-ring-width\) var\(--focus-ring-style\) var\(--focus-ring[,)]/);
   }
 });
 

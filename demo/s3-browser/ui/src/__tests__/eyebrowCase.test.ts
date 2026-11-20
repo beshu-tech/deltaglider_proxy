@@ -73,7 +73,8 @@ test('every brand lockup uses the wordmark style', () => {
   expect(missing).toEqual([]);
   const css = readFileSync(join(SRC, 'theme.css'), 'utf8');
   for (const sel of ['.dg-wordmark', '.dg-login-brand', '.dg-login-product']) {
-    const rule = css.slice(css.indexOf(`${sel} {`));
+    // The base rule: the selector at the start of a line, not as a descendant in another rule.
+    const rule = css.slice(css.search(new RegExp(`^\\${sel} \\{`, 'm')));
     expect(rule.slice(0, rule.indexOf('}')), sel).toMatch(/text-transform:\s*uppercase/);
   }
 });

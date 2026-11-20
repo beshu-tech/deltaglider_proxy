@@ -432,7 +432,7 @@ export default function BucketEncryptionGroup({
             <Alert
               type="warning"
               showIcon
-              style={{ borderRadius: 6, fontSize: 12 }}
+              style={{ fontSize: 12 }}
               title="New writes to this bucket will be plaintext"
               description="Objects that are already encrypted stay readable. Run the re-encrypt job afterwards to decrypt them."
             />

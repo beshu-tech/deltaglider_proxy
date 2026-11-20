@@ -1072,7 +1072,7 @@ function RulesPanel<C extends RulesConfig<R>, R extends { name: string; enabled:
             type="warning"
             showIcon
             data-testid="rules-scheduler-off"
-            style={{ marginTop: 8, borderRadius: 8 }}
+            style={{ marginTop: 8 }}
             title={schedulerOffNote}
           />
         )}

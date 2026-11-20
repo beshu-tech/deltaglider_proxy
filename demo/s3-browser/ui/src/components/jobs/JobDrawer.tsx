@@ -282,7 +282,7 @@ export default function JobDrawer({
       return (
         <div>
           {serverRow.last_error && (
-            <Alert type="error" showIcon title={serverRow.last_error} style={{ marginBottom: 12, borderRadius: 8 }} />
+            <Alert type="error" showIcon title={serverRow.last_error} style={{ marginBottom: 12 }} />
           )}
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
             <div style={{ flex: 1, minWidth: 0 }}>

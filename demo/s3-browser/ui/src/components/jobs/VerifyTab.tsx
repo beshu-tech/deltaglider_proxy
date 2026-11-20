@@ -226,7 +226,7 @@ export default function VerifyTab({ ruleName }: Props) {
           type="info"
           showIcon
           title="Run started — verification re-runs when it finishes."
-          style={{ borderRadius: 8, marginBottom: 12 }}
+          style={{ marginBottom: 12 }}
         />
       )}
     </>
@@ -265,7 +265,7 @@ export default function VerifyTab({ ruleName }: Props) {
             showIcon
             title="Verification cancelled"
             description="The parity audit was cancelled before it finished."
-            style={{ borderRadius: 8, marginBottom: 16 }}
+            style={{ marginBottom: 16 }}
           />
           <Button
             type="primary"
@@ -291,7 +291,7 @@ export default function VerifyTab({ ruleName }: Props) {
             showIcon
             title="Verification failed"
             description={s.error || 'The parity audit could not complete.'}
-            style={{ borderRadius: 8, marginBottom: 16 }}
+            style={{ marginBottom: 16 }}
           />
           <Button
             icon={<ReloadOutlined />}
@@ -638,7 +638,7 @@ export function ParityResult({
         <Alert
           type={lastAttempt.kind === 'failed' ? 'error' : 'info'}
           showIcon
-          style={{ borderRadius: 8, marginBottom: 12 }}
+          style={{ marginBottom: 12 }}
           title={
             lastAttempt.kind === 'failed'
               ? 'The last audit failed'
@@ -816,7 +816,7 @@ export function ParityResult({
           <Alert
             type="warning"
             showIcon
-            style={{ borderRadius: 8, marginTop: 12 }}
+            style={{ marginTop: 12 }}
             title={
               outcome.cap_hit
                 ? 'Only part of the mirror was checked'
@@ -863,7 +863,7 @@ export function ParityResult({
             <Alert
               type="info"
               showIcon
-              style={{ borderRadius: 8, marginTop: 12 }}
+              style={{ marginTop: 12 }}
               title={`${outcome.unverifiable.toLocaleString()} ${noun(outcome.unverifiable, 'object matches', 'objects match')} on size, not checksum`}
               description="Their sizes match on both sides, but there was no comparable checksum to prove the bytes are identical — usually because they were written to the backend directly (not through the proxy), or the two sides store them differently. This is not a mismatch; re-write them through the proxy if you want full checksum parity."
             />
