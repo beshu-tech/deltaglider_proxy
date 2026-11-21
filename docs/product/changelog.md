@@ -8,7 +8,55 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-11-19_
+_Last updated: 2026-11-21_
+
+## v2.3.0 — 2026-11-21
+
+### Upgrade steps for the next release
+
+- **SigV2 requests are refused.** A request with `AWSAccessKeyId` and `Signature` query parameters, or with an `Authorization: AWS …` header, gets `400 InvalidArgument`. Sign with SigV4.
+- **A request must sign every `x-amz-*` header that it sends.** A presigned request or a header-signed request with an `x-amz-*` header outside its signed-header list gets `403 AccessDenied`, as on AWS. The header `x-amz-cf-id` is exempt.
+- **An anonymous request runs only `GetObject`, `HeadObject`, `ListObjects` and `ListObjectsV2`.** Every other operation on a public prefix, for example `HeadBucket` or a list of multipart uploads, gets `403`.
+- **A write is refused when a path segment of its key is a reserved name.** The reserved names are `reference.bin`, a name that ends in `.delta`, `.dg`, `.dg-folder-marker` and a name that starts with `.dg-tmp.`, in any letter case. The answer is `400 InvalidArgument`. A read, a listing and a delete of an existing key keep working. Before you upgrade, give such keys another name if you write to them. On a filesystem destination, a replication or migration records a key whose folder has such a name as failed, and a migration stops before its switch and names the keys.
+- **A key of more than 1024 bytes in the URL path is refused for every method**, and so is a `prefix`, `start-after`, `marker`, `key-marker` or `delimiter` of more than 1024 bytes. A user who is not an administrator can no longer read an existing object with a longer key. An administrator takes it away with `DeleteObjects` or the admin bulk delete.
+- **Admission rules decide per object.** A `deny` or `reject` rule with a `bucket`, a `path_glob` or a `method` now also applies to the source of a copy, to each key of `DeleteObjects`, to the key of a browser form upload, to the entries of the admin bulk and ZIP endpoints, and to the keys in a listing. A `path_glob` is matched against object keys, never against the text of a request. For these objects `method` names the effect: a read is `GET` or `HEAD`, a delete is `DELETE`, a write is `PUT`. A rule with a `bucket` or a `path_glob` that names `GET` now also refuses `HEAD`, and the reverse. Only a `deny` rule hides a key from a listing. Check your rules with the trace endpoint.
+- **An `allow-anonymous` rule with a `path_glob` lists only the keys that the glob matches.**
+- **An `email_regex` mapping rule matches the whole address.** A rule that relied on a match inside the address must add `.*`. At start, the proxy logs one warning for each stored rule that is not anchored at both ends.
+- **A field of the config file that holds a `${env:NAME}` reference cannot be changed through the admin API or the GUI.** The same holds for the address fields next to a credential that the proxy sends in clear: the webhook URLs next to a header from the environment, and the issuer, type and network policy of an OIDC provider whose client secret comes from the environment. Change these in the config file and restart. To store the text `${env:NAME}` itself, write `$${env:NAME}`. Before you upgrade, search the stored config file for `${env:` at fields that you did not write: release 2.2.5 stored such admin-typed text unescaped, and the new release reads it as a reference.
+- **`DGP_CONFIG_ENV_ALLOWLIST` names are accepted only as an S3 backend secret or an encryption key.**
+- **A change of the issuer, the type or the network policy of an OIDC provider clears its stored client secret** unless the same request carries the secret. Type the secret again when you move a provider.
+- **A full backup restore replaces the bootstrap password only from a session that logged in with the bootstrap password.** Another admin session keeps the running password, and the answer says so.
+- **A delete job that runs during the upgrade fails.** Start the delete again. A delete job now stops when the admin who started it is disabled or demoted.
+- **`max_object_size: auto` is lower.** It is the lower of the per-upload limit and what one principal can hold of the multipart total: 37.5 % of the spool budget with the defaults, where it was 50 %. Set `max_object_size` if you need more.
+- **Shared budgets have a share for each principal** (an access key; all anonymous requests count as one principal). One principal can hold at most 75 % of the open multipart uploads and of the multipart part bytes while others are idle, and every other principal always reaches 25 %. All downloads of large delta objects together hold at most 75 % of the spool, so uploads keep 25 %. A request above a limit gets `503 SlowDown` at once. An upload that needs more than the 25 % can get `503 SlowDown` while downloads hold their part. See [Rate limits](reference/rate-limits.md).
+- **A download of a large delta object must keep a minimum speed.** The client must take 64 KiB in each 60 s, and more for a large response, so that the response ends within about 6 h. A slower download is cut, and the client resumes it with a range request.
+- **One client address can hold at most a quarter of the connections.** Behind a reverse proxy, set `DGP_TRUSTED_PROXY_CIDRS` to the address of the reverse proxy, or raise `DGP_MAX_CONNECTIONS_PER_IP`. Otherwise connections above the limit are closed and the reverse proxy answers `502`.
+- **Operator:** the router drops the `X-Forwarded-For`, `Forwarded` and `X-Real-IP` headers that a client sends. A deployment with a trusted layer-7 proxy in front of the router sets `spec.router.trustClientForwardedFor: true`. Apply `deploy/crd.yaml` again.
+- **A restart no longer starts the encryption of a bucket from a sample of 100 objects.** It scans the whole bucket first, with one `HEAD` request for each object, and reads of the objects that are not yet encrypted fail until the scan ends. For a large bucket, start the conversion with a config apply or with `POST /_/api/admin/jobs/reencrypt`. A bucket that the proxy already encrypted gets no conversion at a restart.
+
+### Added
+
+- `DGP_MAX_CONNECTIONS_PER_IP`, `DGP_H2_IDLE_TIMEOUT_SECS`, `DGP_RESPONSE_STALL_SECS`, `DGP_RESPONSE_MAX_HOLD_SECS`, `DGP_SPOOL_READ_MAX_PERCENT`, `DGP_SPOOL_READ_SHARE_PERCENT` and `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT`. See [Configuration](reference/configuration.md).
+- `POST /_/api/admin/config/sync-floor/reset` forgets the config-sync generation floor of this node after you move or restore the sync bucket.
+- The operator setting `spec.router.trustClientForwardedFor`.
+
+### Fixed
+
+- An HTTP/2 connection that sends no request is closed after the header timeout, and one that is idle after `DGP_H2_IDLE_TIMEOUT_SECS` (120 s). Before, such connections stayed open and could take every connection of the listener.
+- A presigned upload link can no longer copy another object: an unsigned `x-amz-copy-source` header is refused.
+- An unknown or disabled access key gets the same answer as a wrong secret, also for a path that does not decode. The proxy shows `AccessDenied` only after it verified the signature.
+- A failed signature waits outside the request slots, also during a lockout. A request whose signature verifies is never refused or delayed by the limiter, so a lockout for an access key no longer blocks its owner.
+- The stored content type of a browser form upload comes only from the `Content-Type` form field, never from the file part. A refused form upload now gets its answer after the proxy read the rest of the request, where before the browser could see a reset connection.
+- A long `prefix` no longer costs seconds of CPU: policy patterns are matched in one linear pass.
+- A client that does not read its downloads no longer holds the spool space of other users, and one user can no longer take all multipart uploads.
+- A storage writer can no longer make a restart serve and encrypt an object that it replaced with plaintext, by adding objects that hide the encrypted ones from the start-up check.
+- A config-sync node with no merge base refuses a synced copy that is older than its last confirmed copy.
+- A copy to a key with a reserved folder name no longer creates a folder that stops later delta uploads, and a key such as `REFERENCE.BIN` can no longer replace the baseline of a folder on a case-insensitive disk.
+- A bucket migration, an added backend and a key rotation keep the `${env:NAME}` reference of a field that they copy, so the config file and the backups never hold that value in clear. A failed backup restore puts the previous config back.
+
+### Changed
+
+- The released binary and the Docker image are smaller: the binary goes from 110.7 MB to 53.3 MB, and the compressed image from 80.5 MB to 66.0 MB. The shipped builds use a new `dist` build profile (fat LTO, one codegen unit, stripped symbols, size-optimised code with the hash, cipher, checksum and compression code kept at full speed). Benchmarks of the codec and of a 64 MiB upload and download show no measurable slowdown.
 
 ## v2.2.5 — 2026-11-19
 

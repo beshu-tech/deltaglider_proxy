@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.3.0 — 2026-11-21
+
 ### Upgrade steps for the next release
 
 - **SigV2 requests are refused.** A request with `AWSAccessKeyId` and `Signature` query parameters, or with an `Authorization: AWS …` header, gets `400 InvalidArgument`. Sign with SigV4.
