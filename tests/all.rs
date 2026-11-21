@@ -20,6 +20,8 @@ mod common;
 mod admin_bulk_objects_test;
 #[path = "admin_config_test.rs"]
 mod admin_config_test;
+#[path = "admin_env_ref_test.rs"]
+mod admin_env_ref_test;
 #[path = "admin_handlers_test.rs"]
 mod admin_handlers_test;
 #[path = "admin_login_as_test.rs"]
@@ -158,6 +160,8 @@ mod oidc_login_test;
 mod optimization_test;
 #[path = "parity_test.rs"]
 mod parity_test;
+#[path = "principal_shares_test.rs"]
+mod principal_shares_test;
 #[path = "prod_shape_matrix_test.rs"]
 mod prod_shape_matrix_test;
 #[path = "public_prefix_list_test.rs"]

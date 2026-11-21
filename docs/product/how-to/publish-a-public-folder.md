@@ -51,7 +51,7 @@ After you edit the file, restart the proxy, or apply the file to the running pro
 
 ## What anonymous requests get
 
-Anonymous requests can GET, HEAD and LIST under the prefix, and a LIST result stays inside the prefix. These requests run as the built-in `$anonymous` user, and they can never write. The full rules are in the [authentication reference](../reference/authentication.md#public-prefixes).
+Anonymous requests can GET and HEAD an object and LIST under the prefix (`GetObject`, `HeadObject`, `ListObjects` and `ListObjectsV2`), and a LIST result stays inside the prefix. The proxy refuses every other S3 operation from an anonymous request with `403 AccessDenied`, for example listing multipart uploads or parts, reading ACLs, tags or object attributes, and `HeadBucket`. These requests run as the built-in `$anonymous` user, and they can never write. The full rules are in the [authentication reference](../reference/authentication.md#public-prefixes).
 
 A response to an anonymous request carries no `x-amz-meta-dg-tool` header, because that metadata names the version of the proxy. The lockout after failed sign-ins does not block public reads: a client address that the proxy locked out still gets the objects under a public prefix.
 

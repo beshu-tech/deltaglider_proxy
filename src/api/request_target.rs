@@ -64,6 +64,15 @@ impl RequestTarget {
         (bucket, key.trim_start_matches('/'))
     }
 
+    /// The key as s3s hands it to a handler: everything after the slash that
+    /// ends the bucket segment, leading slashes kept (`/b//k` is key `/k`).
+    /// The length limit counts these bytes, not the trimmed key of
+    /// [`Self::bucket_and_key`].
+    pub fn key_as_s3s_sees_it(&self) -> &str {
+        let path = self.path.strip_prefix('/').unwrap_or(&self.path);
+        path.split_once('/').map_or("", |(_, key)| key)
+    }
+
     /// The bucket, when s3s parses the path as bucket-level (`/b` or `/b/`,
     /// decoded). `/b//` is an object request for s3s (key `/`), so `None`.
     pub fn bucket_only(&self) -> Option<&str> {

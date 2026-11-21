@@ -32,7 +32,9 @@ pub struct RateLimiter {
     /// per-IP policy. The S3 API locks out a key at an address, never the
     /// address: behind a reverse proxy every client has the proxy's
     /// address, and one client with a wrong secret locked out all of them.
-    key_entries: Arc<DashMap<(IpAddr, String), RateLimitEntry>>,
+    key_entries: Arc<DashMap<KeyEntryId, RateLimitEntry>>,
+    /// Hard cap of `key_entries` (`MAX_KEY_ENTRIES`; a test sets less).
+    max_key_entries: usize,
     /// Per-account/subject bucket. Keys are caller-supplied strings:
     /// the bootstrap password endpoint uses `"bootstrap"`; `login_as`
     /// uses the access-key-id. Empty string means "no account
@@ -43,6 +45,9 @@ pub struct RateLimiter {
     /// locked account still admits these IPs, so a botnet that burns the
     /// account budget cannot lock the real operator out (S22).
     account_known_good: Arc<DashMap<(String, IpAddr), Instant>>,
+    /// Wait places taken per peer bucket ([`UnprovenTicket`]); an entry
+    /// exists only while a place is taken.
+    unproven: Arc<DashMap<IpAddr, usize>>,
     /// Maximum failed attempts before lockout (per-IP).
     max_attempts: u32,
     /// Rolling window for counting attempts (per-IP).
@@ -115,13 +120,55 @@ fn progressive_delay_for(count: u32) -> Duration {
     }
     let excess = count - 10;
     let delay_ms = 100u64.saturating_mul(1u64 << excess.min(6));
-    Duration::from_millis(delay_ms.min(5000))
+    Duration::from_millis(delay_ms).min(MAX_PROGRESSIVE_DELAY)
+}
+
+/// The longest progressive delay. A failed signature during a lockout waits
+/// this long: the lockout must never make a guess cheaper than before it.
+pub const MAX_PROGRESSIVE_DELAY: Duration = Duration::from_secs(5);
+
+/// The most wait places of one peer bucket: a signed request holds one until
+/// its signature verifies, and a failed one holds it through its delay. A
+/// request with no place free is still checked and served; if its signature
+/// fails, it is answered at once with no wait.
+pub const MAX_UNPROVEN_PER_PEER: usize = 32;
+
+/// One wait place of a peer bucket; the count falls when it drops ([`RateLimiter::try_open_unproven`]).
+pub struct UnprovenTicket {
+    open: Arc<DashMap<IpAddr, usize>>,
+    peer: IpAddr,
+}
+
+impl Drop for UnprovenTicket {
+    fn drop(&mut self) {
+        if let Some(mut n) = self.open.get_mut(&self.peer) {
+            *n = n.saturating_sub(1);
+        }
+        self.open.remove_if(&self.peer, |_, n| *n == 0);
+    }
 }
 
 /// The key the browser form-POST upload counts its failed signatures
 /// under. Its access key is in the form body, which the SigV4 middleware
 /// does not read, so every form POST from one address counts as one key.
 pub const FORM_POST_KEY: &str = "form-post";
+
+/// The most (address, access key id) entries the limiter keeps. Key ids
+/// are client text, so the map is bounded: at the cap, the oldest entries
+/// that are not locked out are forgotten (`evict_key_entries`).
+const MAX_KEY_ENTRIES: usize = 65_536;
+
+/// The map index of one (address, access key id as sent) pair: a fixed-size
+/// digest, so an attacker-chosen id costs no more memory than a short one.
+type KeyEntryId = (IpAddr, [u8; 16]);
+
+fn key_entry_id(ip: &IpAddr, access_key: &str) -> KeyEntryId {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(access_key.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    (crate::security::peer_bucket(*ip), id)
+}
 
 impl RateLimiter {
     /// Create a new rate limiter.
@@ -139,6 +186,8 @@ impl RateLimiter {
         Self {
             entries: Arc::new(DashMap::new()),
             key_entries: Arc::new(DashMap::new()),
+            max_key_entries: MAX_KEY_ENTRIES,
+            unproven: Arc::new(DashMap::new()),
             account_entries: Arc::new(DashMap::new()),
             account_known_good: Arc::new(DashMap::new()),
             max_attempts,
@@ -218,7 +267,7 @@ impl RateLimiter {
     /// How long the IP stays locked out; `None` when it is not locked out.
     /// An expired lockout is cleaned up or reset on the next failure.
     pub fn lockout_remaining(&self, ip: &IpAddr) -> Option<Duration> {
-        let entry = self.entries.get(ip)?;
+        let entry = self.entries.get(&crate::security::peer_bucket(*ip))?;
         remaining(entry.lockout_start?, self.lockout, Instant::now())
     }
 
@@ -243,14 +292,19 @@ impl RateLimiter {
 
     /// Get the current failure count for an IP (for logging).
     pub fn failure_count(&self, ip: &IpAddr) -> u32 {
-        self.entries.get(ip).map(|e| e.count).unwrap_or(0)
+        self.entries
+            .get(&crate::security::peer_bucket(*ip))
+            .map_or(0, |e| e.count)
     }
 
     /// Record a failed authentication attempt for an IP.
     /// Returns `true` if the IP is now rate-limited (should block further attempts).
     pub fn record_failure(&self, ip: &IpAddr) -> bool {
         let now = Instant::now();
-        let mut entry = self.entries.entry(*ip).or_insert(RateLimitEntry::new(now));
+        let mut entry = self
+            .entries
+            .entry(crate::security::peer_bucket(*ip))
+            .or_insert(RateLimitEntry::new(now));
         entry.count_failure(now, self.max_attempts, self.window, self.lockout)
     }
 
@@ -259,29 +313,80 @@ impl RateLimiter {
     /// now. Another key at the same address is not affected.
     pub fn record_key_failure(&self, ip: &IpAddr, access_key: &str) -> bool {
         let now = Instant::now();
+        let id = key_entry_id(ip, access_key);
+        if self.key_entries.len() >= self.max_key_entries && !self.key_entries.contains_key(&id) {
+            self.evict_key_entries(now);
+        }
         let mut entry = self
             .key_entries
-            .entry((*ip, access_key.to_string()))
+            .entry(id)
             .or_insert(RateLimitEntry::new(now));
         entry.count_failure(now, self.max_attempts, self.window, self.lockout)
     }
 
+    /// Make room in a full `key_entries`: drop what expired, then, down to
+    /// three quarters of the cap, the entries that are not locked out and
+    /// have the oldest window (a locked-out entry goes last). This forgets
+    /// failure counts; it never refuses a request.
+    fn evict_key_entries(&self, now: Instant) {
+        self.key_entries
+            .retain(|_, e| should_keep_entry(e, now, self.lockout, self.window));
+        let target = self.max_key_entries / 4 * 3;
+        let len = self.key_entries.len();
+        if len <= target {
+            return;
+        }
+        let mut order: Vec<(bool, Instant, KeyEntryId)> = self
+            .key_entries
+            .iter()
+            .map(|e| (e.lockout_start.is_some(), e.window_start, *e.key()))
+            .collect();
+        order.sort_unstable_by_key(|(locked, start, _)| (*locked, *start));
+        for (_, _, id) in order.into_iter().take(len - target) {
+            self.key_entries.remove(&id);
+        }
+    }
+
     /// How long `access_key` stays locked out at `ip`; `None` when it is not.
     pub fn key_lockout_remaining(&self, ip: &IpAddr, access_key: &str) -> Option<Duration> {
-        let entry = self.key_entries.get(&(*ip, access_key.to_string()))?;
+        let entry = self.key_entries.get(&key_entry_id(ip, access_key))?;
         remaining(entry.lockout_start?, self.lockout, Instant::now())
     }
 
     /// Failed signatures of `access_key` from `ip` in the current window.
     pub fn key_failure_count(&self, ip: &IpAddr, access_key: &str) -> u32 {
         self.key_entries
-            .get(&(*ip, access_key.to_string()))
+            .get(&key_entry_id(ip, access_key))
             .map_or(0, |e| e.count)
     }
 
     /// [`Self::progressive_delay`] for the pair.
     pub fn key_progressive_delay(&self, ip: &IpAddr, access_key: &str) -> Duration {
         progressive_delay_for(self.key_failure_count(ip, access_key))
+    }
+
+    /// Take one wait place of `ip`'s peer bucket; `None` when it holds
+    /// [`MAX_UNPROVEN_PER_PEER`] already. The caller refuses nothing then: the
+    /// request runs with no place, and only its failure answers at once.
+    pub fn try_open_unproven(&self, ip: &IpAddr) -> Option<UnprovenTicket> {
+        let peer = crate::security::peer_bucket(*ip);
+        let mut n = self.unproven.entry(peer).or_insert(0);
+        if *n >= MAX_UNPROVEN_PER_PEER {
+            return None;
+        }
+        *n += 1;
+        drop(n);
+        Some(UnprovenTicket {
+            open: self.unproven.clone(),
+            peer,
+        })
+    }
+
+    /// How many wait places of `ip`'s peer bucket are taken.
+    #[cfg(test)]
+    pub fn unproven_open(&self, ip: &IpAddr) -> usize {
+        let peer = crate::security::peer_bucket(*ip);
+        self.unproven.get(&peer).map_or(0, |n| *n)
     }
 
     /// Per-account variant: is this subject (bootstrap / AKID /
@@ -955,6 +1060,52 @@ fn sanitize_for_log(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_peer_bucket_has_a_fixed_number_of_wait_places() {
+        let rl = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(60));
+        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        let held: Vec<_> = (0..MAX_UNPROVEN_PER_PEER)
+            .map(|_| rl.try_open_unproven(&ip).expect("below the cap"))
+            .collect();
+        assert!(rl.try_open_unproven(&ip).is_none(), "the cap");
+        // Another address, and an IPv6 neighbour of a full /64, are judged apart or together.
+        let other: IpAddr = "192.0.2.8".parse().unwrap();
+        assert!(rl.try_open_unproven(&other).is_some());
+        // A ticket that drops frees one place; the map forgets an empty peer.
+        let mut held = held;
+        drop(held.pop());
+        let again = rl.try_open_unproven(&ip).expect("one place is free");
+        assert!(rl.try_open_unproven(&ip).is_none());
+        drop(held);
+        drop(again);
+        assert!(rl.unproven.get(&ip).is_none(), "no entry for an idle peer");
+    }
+
+    #[test]
+    fn an_ipv6_peer_counts_by_its_64_bit_network() {
+        let rl = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(60));
+        let held: Vec<_> = (0..MAX_UNPROVEN_PER_PEER)
+            .map(|i| {
+                let ip: IpAddr = format!("2001:db8:1:2::{i:x}").parse().unwrap();
+                rl.try_open_unproven(&ip).unwrap()
+            })
+            .collect();
+        let same_net: IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
+        assert!(rl.try_open_unproven(&same_net).is_none());
+        let other_net: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(rl.try_open_unproven(&other_net).is_some());
+        drop(held);
+    }
+
+    #[test]
+    fn the_progressive_delay_never_passes_the_longest_delay() {
+        assert_eq!(progressive_delay_for(10), Duration::ZERO);
+        assert_eq!(progressive_delay_for(11), Duration::from_millis(200));
+        for count in 17..1000 {
+            assert_eq!(progressive_delay_for(count), MAX_PROGRESSIVE_DELAY);
+        }
+    }
+
+    #[test]
     fn lockout_message_rounds_up_and_names_the_wait() {
         assert_eq!(lockout_message(Duration::from_secs(600)).0, 600);
         assert!(lockout_message(Duration::from_secs(600))
@@ -1436,6 +1587,109 @@ mod tests {
         std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
         std::env::remove_var("DGP_TRUSTED_PROXY_CIDRS");
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    /// Access key ids are client text: the map of (address, key id) entries
+    /// stays under its cap, whatever ids an attacker sends.
+    #[test]
+    fn key_entries_stay_under_their_cap() {
+        let mut limiter = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(120));
+        limiter.max_key_entries = 100;
+        let ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+        for n in 0..1_000 {
+            limiter.record_key_failure(&ip, &format!("AKGUESS{n}"));
+            assert!(limiter.key_entries.len() <= 100, "after {n} ids");
+        }
+        // A long id costs the same as a short one: the entry holds a digest.
+        let long = "A".repeat(1 << 16);
+        limiter.record_key_failure(&ip, &long);
+        assert_eq!(limiter.key_failure_count(&ip, &long), 1);
+    }
+
+    /// A full map forgets the oldest unlocked entries; it keeps a lockout
+    /// and never refuses a new failure.
+    #[test]
+    fn a_full_key_map_keeps_lockouts_and_still_counts_new_failures() {
+        let mut limiter = RateLimiter::new(3, Duration::from_secs(60), Duration::from_secs(120));
+        limiter.max_key_entries = 40;
+        let ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+        for _ in 0..3 {
+            limiter.record_key_failure(&ip, "AKLOCKED");
+        }
+        assert!(limiter.key_lockout_remaining(&ip, "AKLOCKED").is_some());
+        for n in 0..500 {
+            limiter.record_key_failure(&ip, &format!("AKGUESS{n}"));
+        }
+        assert!(
+            limiter.key_lockout_remaining(&ip, "AKLOCKED").is_some(),
+            "eviction dropped a live lockout"
+        );
+        assert_eq!(limiter.key_failure_count(&ip, "AKGUESS499"), 1);
+        assert!(limiter.key_entries.len() <= 40);
+    }
+
+    /// One IPv6 client owns a whole /64 and has a new address per
+    /// connection, so every counter of the limiter (per key id and per
+    /// address) counts the /64, like the listener's connection cap. An IPv4
+    /// address, also in its IPv4-mapped form, counts by itself.
+    #[test]
+    fn the_limiter_counts_an_ipv6_client_by_its_64() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let limiter = RateLimiter::new(3, Duration::from_secs(60), Duration::from_secs(120));
+        for n in 0..3 {
+            limiter.record_key_failure(&ip(&format!("2001:db8:1:2::{n:x}")), "AKONE");
+            limiter.record_failure(&ip(&format!("2001:db8:1:2::{n:x}")));
+        }
+        let same_net = ip("2001:db8:1:2:ffff:eeee:dddd:cccc");
+        assert!(limiter.key_lockout_remaining(&same_net, "AKONE").is_some());
+        assert_eq!(limiter.key_failure_count(&same_net, "AKONE"), 3);
+        assert!(limiter.is_limited(&same_net));
+        assert_eq!(limiter.failure_count(&same_net), 3);
+        let other_net = ip("2001:db8:1:3::1");
+        assert!(limiter.key_lockout_remaining(&other_net, "AKONE").is_none());
+        assert!(!limiter.is_limited(&other_net));
+        // IPv4 and its mapped form are one address; two IPv4 addresses are two.
+        limiter.record_key_failure(&ip("192.0.2.7"), "AKTWO");
+        assert_eq!(
+            limiter.key_failure_count(&ip("::ffff:192.0.2.7"), "AKTWO"),
+            1
+        );
+        assert_eq!(limiter.key_failure_count(&ip("192.0.2.8"), "AKTWO"), 0);
+    }
+
+    /// Source guard: every per-peer count takes its bucket from
+    /// `security::peer_bucket`, and nothing masks an IPv6 address on its own.
+    #[test]
+    fn every_per_peer_count_uses_the_one_bucket_rule() {
+        for (name, text) in [
+            ("serve.rs", include_str!("serve.rs")),
+            ("rate_limiter.rs", include_str!("rate_limiter.rs")),
+        ] {
+            let prod = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+            assert!(prod.contains("security::peer_bucket("), "{name}");
+            assert!(
+                !prod.contains("u64::MAX"),
+                "{name} builds its own IPv6 mask"
+            );
+        }
+    }
+
+    /// An existing and a missing key id count the same way: the state after
+    /// a request sequence depends on the id as sent, never on whether the id
+    /// exists (the limiter does not know).
+    #[test]
+    fn every_key_id_has_its_own_count_per_address() {
+        let limiter = RateLimiter::new(5, Duration::from_secs(60), Duration::from_secs(120));
+        let a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+        for _ in 0..4 {
+            limiter.record_key_failure(&a, "AKONE");
+        }
+        assert_eq!(limiter.key_failure_count(&a, "AKONE"), 4);
+        assert_eq!(limiter.key_failure_count(&a, "AKTWO"), 0);
+        assert_eq!(limiter.key_failure_count(&b, "AKONE"), 0);
+        assert!(limiter.record_key_failure(&a, "AKONE"));
+        assert!(limiter.key_lockout_remaining(&a, "AKTWO").is_none());
     }
 
     /// Per-account bucket: same shape as per-IP but keyed on subject.

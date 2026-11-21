@@ -338,7 +338,9 @@ impl super::worker::ObjectVisitor for Backfill<'_> {
         // The object's write lock, as every write of an object takes it:
         // the read, the hash and the metadata rewrite are one step for
         // this key on this process.
-        let _lock = engine.lock_object_write(self.bucket, key).await;
+        let _lock = engine
+            .lock_object_write(self.bucket, key, crate::types::WriteOrigin::Job)
+            .await;
         let (meta, basis) = match self.read(engine, key, listed).await {
             Ok(read) => read,
             Err(visit) => return visit,

@@ -75,6 +75,17 @@ Two instances can also create a user with the same name at about the same time, 
 
 The first sync after an upgrade has no merge base yet. Without a merge base, the merge cannot tell a delete from a row that the other side never had, so it keeps every row of both sides (a union). A change or a create that was not synced yet survives, and a delete that was not synced yet comes back. The merge base is stored next to the database as `deltaglider_config.db.sync-base`.
 
+An instance that has no merge base still refuses a downloaded copy whose sync generation is below its generation floor. The floor is the generation of the last copy that the instance confirmed, which means the last copy that it uploaded successfully or accepted from the bucket. The instance keeps one floor for each sync target (the endpoint, the bucket and the object name) in `deltaglider_jobs.db`. A failed upload does not raise the floor, so an instance whose uploads fail does not start to refuse the newer copies of its peers. The floor lives in the data directory of the node, next to the merge base, so a node with a wiped data directory has neither. Such a node cannot tell an old copy from a current one: it trusts the bucket at its first sync. At each start, the instance raises its floor to the generation of its merge base, when it can read the base, so an instance that you upgrade to this release has a floor before its first sync. Protect the sync bucket so that only the instances can write to it.
+
+If you point `config_sync_bucket` at another bucket, the instances start with no floor for the new target. If you restore the sync bucket from a backup, or rebuild the sync group, every instance that is ahead of the restored copy refuses it as a rollback, and it keeps refusing it until you reset the floor on purpose. For each such instance, send this request to the admin API, and then force a pull:
+
+```bash
+curl -b cookies -X POST https://dgp-reader-1:9000/_/api/admin/config/sync-floor/reset
+curl -b cookies -X POST https://dgp-reader-1:9000/_/api/admin/config/sync-now
+```
+
+The first request forgets the floor of the instance for its current sync target and deletes its merge base. It answers with the floor that it dropped, and the audit log has the entry `config_sync_floor_reset`. The instance never does this by itself. After the reset, the instance accepts any copy that the bucket holds, so run it only when you trust the content of the bucket.
+
 The synced database holds IAM only. The job state of each instance (replication and lifecycle cursors, run history, failure rows, maintenance jobs, the parity cache and the event outbox) is in a separate file, `deltaglider_jobs.db`, which the sync never uploads. An IAM change therefore uploads a file of a few hundred kilobytes, not the job history of the instance. During a rolling upgrade from a release that kept the job state in the config database, the instances keep merging IAM in both directions: a new instance ignores the job rows in a copy that an older instance uploads, and an older instance reads only the IAM tables of a copy that a new instance uploads.
 
 If you want no writer at all, switch to `iam_mode: declarative` and manage IAM through YAML and GitOps. See [How to manage IAM as code](manage-iam-as-code.md).
@@ -158,8 +169,8 @@ and the client has to restart it from the beginning.
 
 ## 7. Know what stays per-instance
 
-Two more pieces of state live inside each instance and are not shared. Neither breaks
-correctness, but both change behaviour compared to a single instance:
+Three more pieces of state live inside each instance and are not shared. None breaks
+correctness, but all three change behaviour compared to a single instance:
 
 - **The metadata cache.** Each instance caches object metadata (existence, size, ETag)
   for up to ten minutes and only invalidates its own cache on writes. If
@@ -180,6 +191,13 @@ correctness, but both change behaviour compared to a single instance:
   effective limit is up to N times the configured value. Size the configured limit
   accordingly, and remember that the admin GUI's source-IP stickiness concentrates
   everyone behind one NAT gateway onto a single instance's budget.
+- **The record of the buckets that this instance encrypted.** Each instance keeps its own
+  record, in its own `deltaglider_jobs.db`, and the sync never copies it. A new instance, or
+  a pod with an empty data volume, has no record, so at its first start it decides whether to
+  convert a bucket from the scan of the whole bucket alone
+  ([A conversion that a restart starts](../reference/encryption.md#a-conversion-that-a-restart-starts)).
+  Start the conversion of a bucket on a running instance with an apply, and not with a restart
+  of a new instance.
 
 ## 8. Keep the encryption of each bucket the same on every instance
 

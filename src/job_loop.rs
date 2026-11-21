@@ -65,11 +65,49 @@ impl ListFailure {
         }
         match e {
             E::InvalidArgument(_)
+            | E::KeyRefused(_)
             | E::NotFound(_)
             | E::Storage(S::NotFound(_))
             | E::Storage(S::InvalidKey(_)) => ListFailure::Token,
             _ => ListFailure::Fatal,
         }
+    }
+}
+
+impl ListFailure {
+    /// [`Self::of`] for a storage error: a read of one object.
+    pub fn of_storage(e: &crate::storage::StorageError) -> Self {
+        if crate::transfer::CopyClass::of_storage(e).retryable() {
+            ListFailure::Transient
+        } else {
+            ListFailure::Fatal
+        }
+    }
+}
+
+/// Run `op` again after a pause while it fails transiently, up to
+/// [`LIST_ATTEMPTS`] times: the bounded retry of every job read.
+pub async fn retry_transient<T, E, Fut>(
+    what: &str,
+    mut op: impl FnMut() -> Fut,
+    failure_of: impl Fn(&E) -> ListFailure,
+) -> Result<T, E>
+where
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut attempt = 0u32;
+    loop {
+        let e = match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        attempt += 1;
+        let Some(pause) = list_retry_delay(failure_of(&e), attempt) else {
+            return Err(e);
+        };
+        tracing::warn!("{what} failed ({e}); trying again ({attempt}/{LIST_ATTEMPTS})");
+        tokio::time::sleep(pause).await;
     }
 }
 

@@ -83,6 +83,10 @@ pub(super) async fn list_objects(
     req: s3s::S3Request<s3s::dto::ListObjectsInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListObjectsOutput>> {
     let list_scope = req.extensions.get::<ListScope>().cloned();
+    let rules = req
+        .extensions
+        .get::<crate::admission::ResourceRules>()
+        .cloned();
     let input = req.input;
     let max_keys = client_max_keys(input.max_keys)?;
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
@@ -101,6 +105,7 @@ pub(super) async fn list_objects(
         list_cursor(marker.as_deref(), None),
         false,
         list_scope.as_ref(),
+        rules.as_ref(),
         svc.list_budget().await,
         proof,
     )
@@ -153,6 +158,10 @@ pub(super) async fn list_objects_v2(
     req: s3s::S3Request<s3s::dto::ListObjectsV2Input>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListObjectsV2Output>> {
     let list_scope = req.extensions.get::<ListScope>().cloned();
+    let rules = req
+        .extensions
+        .get::<crate::admission::ResourceRules>()
+        .cloned();
     let reader = Reader::of(&req.extensions);
     let principal = crate::iam::request_principal(&req.extensions).cloned();
     let include_metadata = query_flag(&req.uri, "metadata", "true");
@@ -174,6 +183,7 @@ pub(super) async fn list_objects_v2(
         list_cursor(token_cursor.as_deref(), input.start_after.as_deref()),
         include_metadata,
         list_scope.as_ref(),
+        rules.as_ref(),
         svc.list_budget().await,
         proof,
     )
@@ -188,9 +198,9 @@ pub(super) async fn list_objects_v2(
             page.objects
                 .iter()
                 .map(|(key, meta)| {
-                    let entry_reader = *folders
-                        .entry(folder_of(key))
-                        .or_insert_with(|| reader.narrow(principal.as_deref(), &input.bucket, key));
+                    let entry_reader = *folders.entry(folder_of(key)).or_insert_with(|| {
+                        reader.narrow(principal.as_deref(), rules.as_ref(), &input.bucket, key)
+                    });
                     // Matched against the rendered <Key>, so encode alike.
                     (
                         enc.apply(key.clone()),
@@ -418,6 +428,7 @@ pub(super) async fn client_list_page(
     cursor: Option<&str>,
     metadata: bool,
     scope: Option<&ListScope>,
+    rules: Option<&crate::admission::ResourceRules>,
     budget: usize,
     proof: Option<crate::iam::listing::ProofResume>,
 ) -> s3s::S3Result<crate::iam::listing::CallerPage> {
@@ -436,7 +447,8 @@ pub(super) async fn client_list_page(
         });
     }
     let listed = crate::iam::listing::list_page_for_caller(
-        &**engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope, budget, proof,
+        &**engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope, rules, budget,
+        proof,
     )
     .await?;
     if listed.page.objects.is_empty() && listed.page.common_prefixes.is_empty() {

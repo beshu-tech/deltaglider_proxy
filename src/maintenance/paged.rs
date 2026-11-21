@@ -362,9 +362,10 @@ pub(crate) async fn paged_phase<S: PageStep>(
 }
 
 /// Test seam (`DGP_TEST_MAINTENANCE_OBJECT_STALL_MS`, debug builds only):
-/// hold each object of every paged phase, so a test can send requests while
-/// the job is still running. Off in production.
-async fn object_stall() {
+/// hold each object of every paged phase (and each page of a delete job),
+/// so a test can send requests while the job is still running. Off in
+/// production.
+pub(crate) async fn object_stall() {
     let ms = crate::config::test_seams::test_seams().maintenance_object_stall_ms;
     if ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;

@@ -298,7 +298,7 @@ pub async fn run_now(
     let engine = state.s3_state.engine.load().clone();
     let gate = state.s3_state.maintenance_gate.clone();
     let rule_owned = rule.clone();
-    tokio::spawn(async move {
+    tokio::spawn(crate::deltaglider::spool::as_background(async move {
         let _guard = guard;
         let result = lifecycle::run_begun_rule(
             Some(db_arc.clone()),
@@ -325,7 +325,7 @@ pub async fn run_now(
                 rule_owned.name, e
             );
         }
-    });
+    }));
 
     Ok((
         StatusCode::ACCEPTED,

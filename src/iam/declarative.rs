@@ -1250,8 +1250,16 @@ fn desired_existing_provider(
     {
         return yaml.clone();
     }
+    // A stored secret never follows a new destination (THE rule, `Destination`).
+    use crate::config_db::auth_providers::Destination;
+    let same_destination = Destination::of(db)
+        == Destination::new(
+            &yaml.provider_type,
+            yaml.issuer_url.as_deref(),
+            yaml.extra_config.as_ref(),
+        );
     DeclarativeAuthProvider {
-        client_secret: db.client_secret.clone(),
+        client_secret: db.client_secret.clone().filter(|_| same_destination),
         ..yaml.clone()
     }
 }
@@ -1983,6 +1991,59 @@ mod tests {
         assert!(
             diff.providers_to_update.is_empty(),
             "redacted provider secret must not trigger an update that wipes it: {diff:?}"
+        );
+    }
+
+    /// A stored secret does not follow a change of its destination: when the
+    /// YAML names no secret and moves the issuer (or the type, or the extra
+    /// config), the stored secret is cleared, never sent to the new issuer.
+    #[test]
+    fn a_stored_provider_secret_does_not_follow_a_new_destination() {
+        let provider = |issuer: &str| DeclarativeAuthProvider {
+            name: "goog".into(),
+            provider_type: "oidc".into(),
+            enabled: true,
+            priority: 0,
+            display_name: None,
+            client_id: Some("client-123".into()),
+            client_secret: None,
+            issuer_url: Some(issuer.into()),
+            scopes: default_scopes(),
+            extra_config: None,
+        };
+        let stored = AuthProviderConfig {
+            id: 1,
+            name: "goog".into(),
+            provider_type: "oidc".into(),
+            enabled: true,
+            priority: 0,
+            display_name: None,
+            client_id: Some("client-123".into()),
+            client_secret: Some("real-oidc-secret".into()),
+            issuer_url: Some("https://accounts.google.com".into()),
+            scopes: default_scopes(),
+            extra_config: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let same = desired_existing_provider(&stored, &provider("https://accounts.google.com"));
+        assert_eq!(same.client_secret.as_deref(), Some("real-oidc-secret"));
+        let moved = desired_existing_provider(&stored, &provider("https://evil.example.com"));
+        assert_eq!(moved.client_secret, None, "the secret followed the issuer");
+        let mut typed = provider("https://accounts.google.com");
+        typed.provider_type = "google".into();
+        assert_eq!(
+            desired_existing_provider(&stored, &typed).client_secret,
+            None
+        );
+        // A secret that the YAML names is the admin's own: it passes through.
+        let mut own = provider("https://evil.example.com");
+        own.client_secret = Some("typed".into());
+        assert_eq!(
+            desired_existing_provider(&stored, &own)
+                .client_secret
+                .as_deref(),
+            Some("typed")
         );
     }
 

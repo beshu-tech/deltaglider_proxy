@@ -49,11 +49,7 @@ storage:
 "#;
 
 fn load(text: &str) -> Config {
-    let (expanded, refs) = expand_env_with_recording(text, lookup).unwrap();
-    let mut cfg = Config::from_yaml_str(&expanded)
-        .unwrap_or_else(|e| panic!("{e}\n--- expanded:\n{expanded}"));
-    cfg.env_refs = refs;
-    cfg
+    Config::from_template_with(text, &lookup).unwrap_or_else(|e| panic!("{e}\n--- {text}"))
 }
 
 fn check(cfg: &Config) {

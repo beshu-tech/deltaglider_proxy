@@ -652,10 +652,16 @@ test('6. config: export YAML, edit + Review & apply, persisted; env refs in YAML
   await expect(dlg.getByRole('button', { name: 'Apply and Persist' })).toBeDisabled();
   await dlg.getByRole('button', { name: 'Close', exact: true }).last().click();
 
-  // With a `:-default` the same ref resolves to the default and applies.
-  // (Not the RUST_LOG value of the local run: a value equal to the env value
-  // is an echo and never reaches the file.)
+  // A `:-default` changes nothing: a request holds a reference only where
+  // the config file has the same one.
+  watch.expectFailure(400, /\/_\/api\/admin\/config\/validate$/, 'POST');
   dlg = await importYaml(withLevel('${env:QA_UNSET_LEVEL:-deltaglider_proxy=warn}'));
+  await expect(dlg.getByRole('alert').filter({ hasText: 'Validation error' })).toBeVisible({ timeout: 30_000 });
+  await expect(dlg.getByRole('button', { name: 'Apply and Persist' })).toBeDisabled();
+  await dlg.getByRole('button', { name: 'Close', exact: true }).last().click();
+
+  // The literal value applies.
+  dlg = await importYaml(withLevel('deltaglider_proxy=warn'));
   await expect(dlg.getByRole('alert').filter({ hasText: 'YAML is valid' })).toBeVisible({ timeout: 30_000 });
   // A successful apply reloads the admin page so every panel re-fetches.
   await Promise.all([

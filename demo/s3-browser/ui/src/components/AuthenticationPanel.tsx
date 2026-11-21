@@ -22,6 +22,7 @@ import FormField from './FormField';
 import IamSourceBanner from './IamSourceBanner';
 import MappingRuleRow from './MappingRuleRow';
 import MaskedSecretInput from './MaskedSecretInput';
+import { savingClearsTheSecret, withNetworkPolicy } from '../providerSecret';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { ApiError } from '../errorHandling';
@@ -591,6 +592,14 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
   const clientIdValidator = v.required('the client ID');
   const clientIdField = form.text('clientId', formClientId, setFormClientId, clientIdValidator);
 
+  // The server clears a stored secret when the destination moves and no new one comes with it.
+  const secretWillClear = isEdit && provider !== null && savingClearsTheSecret(
+    provider,
+    { issuerUrl: formIssuerUrl, allowLocal: formAllowLocal, caCertPath: formCaCertPath },
+    formClientSecret,
+  );
+  const secretClearNote = 'Saving this change clears the stored client secret. Type the client secret again to keep the sign-in working.';
+
   const handleSave = async () => {
     if (!form.submit()) return;
     setSaving(true);
@@ -665,7 +674,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         <Input {...nameField.inputProps} placeholder="google-corp" disabled={readOnly} />
       </FormField>
 
-      <FormField label="Issuer URL" error={issuerField.error} style={{ marginBottom: 16 }}>
+      <FormField label="Issuer URL" error={issuerField.error} helpText={secretWillClear ? secretClearNote : undefined} style={{ marginBottom: 16 }}>
         <Input {...issuerField.inputProps} placeholder="https://accounts.google.com" disabled={readOnly} />
       </FormField>
 
@@ -676,7 +685,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       {!readOnly && (
         <FormField
           label="Client secret"
-          helpText={isEdit ? 'Leave empty to keep the current secret.' : undefined}
+          helpText={isEdit ? (secretWillClear ? secretClearNote : 'Leave empty to keep the current secret.') : undefined}
           style={{ marginBottom: 16 }}
         >
           <MaskedSecretInput
@@ -817,22 +826,4 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       </div>
     </div>
   );
-}
-
-/**
- * `extra_config` with the form's network policy on top of the stored keys.
- * An off switch and an empty path remove their key, so the stored config
- * stays minimal (and matches a YAML declaration that omits them).
- */
-function withNetworkPolicy(
-  base: Record<string, unknown> | undefined,
-  allowLocal: boolean,
-  caCertPath: string,
-): Record<string, unknown> {
-  const next: Record<string, unknown> = { ...(base ?? {}) };
-  delete next.allow_local;
-  delete next.ca_cert_path;
-  if (allowLocal) next.allow_local = true;
-  if (caCertPath.trim()) next.ca_cert_path = caCertPath.trim();
-  return next;
 }

@@ -119,6 +119,8 @@ pub struct ObjectWriteGuard {
     lock: Arc<ObjectWriteLock>,
     /// The object this guard locks, as the engine parses its key.
     object: ObjectKey,
+    /// Who writes under this guard: it picks the write gate of the key.
+    origin: crate::types::WriteOrigin,
     /// The object as the precondition check read it under this lock
     /// (`Some(None)`: absent). `None`: no precondition, nothing read.
     checked: Option<Option<(FileMetadata, super::metadata::StoredForms)>>,
@@ -128,7 +130,48 @@ pub struct ObjectWriteGuard {
     committed: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Proof that the key under an [`ObjectWriteGuard`] passed the write gate of
+/// the guard's origin. Only `ObjectWriteGuard::gate` makes one, so a writer
+/// that asks for it cannot store bytes under a refused key.
+pub struct WriteGate<'g> {
+    lock: &'g ObjectWriteGuard,
+}
+
+impl<'g> WriteGate<'g> {
+    /// The write lock of the gated key.
+    pub fn lock(&self) -> &'g ObjectWriteGuard {
+        self.lock
+    }
+
+    /// The bucket of the gated key.
+    pub fn bucket(&self) -> &'g str {
+        &self.lock.object.bucket
+    }
+
+    /// The deltaspace (folder) of the gated key.
+    pub fn deltaspace_id(&self) -> &'g str {
+        &self.lock.object.prefix
+    }
+
+    /// The file name of the gated key.
+    pub fn filename(&self) -> &'g str {
+        &self.lock.object.filename
+    }
+}
+
 impl ObjectWriteGuard {
+    /// THE write gate of the key under this guard: the rule of its origin
+    /// (`validate_ingest`; a data write also refuses a folder-marker key).
+    pub(super) fn gate(&self, data: bool) -> Result<WriteGate<'_>, EngineError> {
+        let checked = if data {
+            self.object.validate_data_ingest(self.origin)
+        } else {
+            self.object.validate_ingest(self.origin)
+        };
+        checked.map_err(|e| EngineError::KeyRefused(e.to_string()))?;
+        Ok(WriteGate { lock: self })
+    }
+
     /// A handle on the commit flag: true once a write under this guard
     /// committed.
     pub(crate) fn commit_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
@@ -243,7 +286,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// per-deltaspace prefix lock (the store takes that one). Idle entries
     /// are pruned like the prefix locks. Not re-entrant: a task that holds
     /// the guard of a key and asks for it again waits forever.
-    pub async fn lock_object_write(&self, bucket: &str, key: &str) -> ObjectWriteGuard {
+    pub async fn lock_object_write(
+        &self,
+        bucket: &str,
+        key: &str,
+        origin: crate::types::WriteOrigin,
+    ) -> ObjectWriteGuard {
         const CLEANUP_THRESHOLD: usize = 1024;
         let locks = shared_object_write_locks();
         if locks.len() > CLEANUP_THRESHOLD {
@@ -271,6 +319,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             _window: self.open_write_window(bucket),
             lock: mutex,
             object,
+            origin,
             checked: None,
             committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -350,8 +399,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
         precondition: &Precondition,
+        origin: crate::types::WriteOrigin,
     ) -> Result<ObjectWriteGuard, ConditionalError> {
-        let mut guard = self.lock_object_write(bucket, key).await;
+        let mut guard = self.lock_object_write(bucket, key, origin).await;
         if !precondition.is_empty() {
             // Fail closed (review C4): only NotFound means "absent". Any
             // other HEAD error used to read as absent, so `If-None-Match: *`
@@ -383,7 +433,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         precondition: &Precondition,
     ) -> Result<StoreResult, ConditionalError> {
-        let guard = self.lock_and_check(bucket, key, precondition).await?;
+        let guard = self
+            .lock_and_check(bucket, key, precondition, crate::types::WriteOrigin::Client)
+            .await?;
         Ok(self
             .store_ingested(
                 ticket,
@@ -513,7 +565,9 @@ mod tests {
     #[tokio::test]
     async fn a_guard_covers_its_own_key_only() {
         let (engine, _fake, _usage) = counted_s3_engine().await;
-        let guard = engine.lock_object_write("b", "//d/a.txt").await;
+        let guard = engine
+            .lock_object_write("b", "//d/a.txt", crate::types::WriteOrigin::Client)
+            .await;
         assert!(guard.covers("b", "d", "a.txt").is_ok());
         assert!(guard.covers("b", "d", "b.txt").is_err());
         assert!(guard.covers("b", "", "a.txt").is_err());
@@ -720,7 +774,12 @@ mod tests {
             "async fn put_delta<",
             "async fn delete_passthrough_idempotent(",
         ];
-        let proofs = ["ObjectWriteGuard", "PutObject", "PassthroughWrite"];
+        let proofs = [
+            "ObjectWriteGuard",
+            "WriteGate",
+            "PutObject",
+            "PassthroughWrite",
+        ];
         let mut offenders = Vec::new();
         for (file, line, sig, body) in prod_fns("src/deltaglider/engine") {
             if FORWARDERS.iter().any(|f| sig.contains(f)) {
@@ -737,6 +796,61 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "an engine write of an object form without the object's write lock: {offenders:?}"
+        );
+    }
+
+    /// Every engine function that stores bytes under a key asks for the
+    /// write gate of the key's origin: it takes the [`WriteGate`] proof or
+    /// calls a gate itself. A writer that checks only `lock.covers()` (the
+    /// copy fast path did) stores under a key that a client write refuses.
+    #[test]
+    fn every_engine_write_of_a_key_passes_the_write_gate() {
+        const STORES: &[&str] = &[
+            ".put_passthrough(",
+            ".put_passthrough_file(",
+            ".put_passthrough_chunked(",
+            ".put_passthrough_parts(",
+            ".put_delta(",
+            ".put_reference(",
+            ".put_reference_from_file(",
+            ".put_object(",
+            ".put_directory_marker(",
+            ".copy_within(",
+            ".create_multipart_upload(",
+        ];
+        const GATES: &[&str] = &[
+            "WriteGate",
+            "gate_write(",
+            "gate_marker(",
+            "gate_rewrite(",
+            "validated_key_ingest(",
+            // Built by a store after `validated_key_ingest`.
+            "PutObject<",
+            "PassthroughWrite<",
+        ];
+        // The reference-write module forwards a write that its caller made
+        // under both locks; the two others rewrite a baseline
+        // that exists (no key is created).
+        const EXEMPT: &[&str] = &[
+            "async fn put_delta<",
+            "async fn put_reference<",
+            "async fn put_reference_from_file<",
+            "async fn rewrite_reference_if_unchanged(",
+            "async fn restamp_reference(",
+        ];
+        let mut offenders = Vec::new();
+        for (file, line, sig, body) in prod_fns("src/deltaglider/engine") {
+            if EXEMPT.iter().any(|e| sig.contains(e)) {
+                continue;
+            }
+            let stores = STORES.iter().any(|w| body.contains(w));
+            if stores && !GATES.iter().any(|g| body.contains(g) || sig.contains(g)) {
+                offenders.push(format!("{file}:{line}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "an engine write of a key that skips the write gate: {offenders:?}"
         );
     }
 
@@ -798,7 +912,9 @@ mod tests {
             .store("b", "d/other.jpg", b"x", None, HashMap::new())
             .await
             .unwrap();
-        let held = engine.lock_object_write("b", "d/k.jpg").await;
+        let held = engine
+            .lock_object_write("b", "d/k.jpg", crate::types::WriteOrigin::Client)
+            .await;
         // Writers of the held key wait: a store, a delete, a copy into it.
         let waiting = {
             let e = engine.clone();
@@ -832,7 +948,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let lock = engine.lock_object_write("b", "d/c.zip").await;
+            let lock = engine
+                .lock_object_write("b", "d/c.zip", crate::types::WriteOrigin::Client)
+                .await;
             engine
                 .store_known_prior(
                     &crate::transfer::CommitTicket::for_test(),

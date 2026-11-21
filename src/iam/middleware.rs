@@ -5,12 +5,11 @@
 use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use iam_rs::Context;
 use tracing::debug;
 
 use super::types::{ListScope, S3Action};
-use crate::metrics::{record_http_request_total, Metrics};
 
 /// Map an HTTP method + DECODED path to an S3 action. Bucket-level vs
 /// object-level comes from `RequestTarget::bucket_and_key`, the same split
@@ -53,6 +52,17 @@ fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
     }
 }
 
+/// Request-extension record: the authorization middleware denied this
+/// request. The s3s access hook answers it once s3s has verified the
+/// signature; no layer before that shows the verdict.
+#[derive(Debug, Clone)]
+pub struct AuthzDenied {
+    pub user: String,
+    pub action: S3Action,
+    pub bucket: String,
+    pub key: String,
+}
+
 /// The action and resource the authorization middleware checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthzTarget<'a> {
@@ -91,41 +101,41 @@ pub fn authz_target<'a>(
 ///
 /// If an `AuthenticatedUser` is present in request extensions (inserted by
 /// the SigV4 middleware in IAM mode), evaluates their permissions against
-/// the requested action and resource. Denies with 403 if not permitted.
+/// the requested action and resource. A denial is recorded as `AuthzDenied`
+/// and answered by the s3s access hook after the signature is verified.
+///
+/// It runs before s3s verifies the signature, so it NEVER answers a request
+/// itself (guard `the_middleware_never_answers_a_request_itself`).
 ///
 /// In legacy mode or open access, no `AuthenticatedUser` is present and
 /// the request passes through unchecked.
-// `Err` is the early-response short-circuit axum middleware idiom; boxing an
-// `http::Response` on the per-request hot path to please `result_large_err`
-// (clippy ≥ 1.98) buys nothing.
-#[allow(clippy::result_large_err)]
-pub async fn authorization_middleware(
-    mut request: Request<Body>,
-    next: Next,
-) -> Result<Response, Response> {
+pub async fn authorization_middleware(mut request: Request<Body>, next: Next) -> Response {
     // OPTIONS (CORS preflight) always passes through without auth
     if request.method() == axum::http::Method::OPTIONS {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     // Only enforce if an AuthenticatedUser was inserted by SigV4 middleware
     let user = match super::request_principal(request.extensions()) {
         // An `Arc` clone: the principal is shared, never copied.
         Some(u) => u.clone(),
-        None => return Ok(next.run(request).await),
+        None => return next.run(request).await,
     };
 
     let method = request.method().clone();
-    // Authorize the resource s3s will SERVE: its decoded path and query, not
-    // the raw text (`/bucket%2Fkey` is an object read, `%70refix=` is
-    // `prefix=`). A path that does not decode is refused here; s3s would
-    // refuse it too.
+    // Authorize the resource s3s will SERVE (decoded path and query). An
+    // undecodable path is recorded as a denial: s3s refuses it too.
     let target = match crate::api::request_target::RequestTarget::from_uri(request.uri()) {
         Ok(target) => target,
         Err(_) => {
-            return Err(
-                crate::api::S3Error::InvalidArgument("Invalid URI encoding".into()).into_response(),
-            )
+            let action = classify_action(&method, request.uri().path());
+            request.extensions_mut().insert(AuthzDenied {
+                user: user.name.clone(),
+                action,
+                bucket: String::new(),
+                key: String::new(),
+            });
+            return next.run(request).await;
         }
     };
     let path = target.path.as_str();
@@ -141,7 +151,7 @@ pub async fn authorization_middleware(
     // the real service root: `//x` has an empty bucket too, but it is not
     // ListBuckets and must not skip IAM.
     if path == "/" && action == S3Action::List {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     // Build IAM evaluation context from request. `base_context` holds the
@@ -271,49 +281,19 @@ pub async fn authorization_middleware(
     };
 
     if !allowed {
-        // Not a credential failure: s3s never checks this signature.
-        if let Some(outcome) = request.extensions().get::<crate::api::auth::AuthOutcome>() {
-            outcome.mark_authz_denied();
-        }
+        // Not answered here: an unverified caller must not learn a verdict.
+        // The s3s access hook refuses once s3s verified the signature.
         debug!(
             "IAM denied: user='{}' action={:?} bucket='{}' key='{}'",
             user.name, action, bucket, key
         );
-        if let Some(metrics) = request.extensions().get::<std::sync::Arc<Metrics>>() {
-            record_http_request_total(
-                metrics,
-                method.as_str(),
-                path,
-                axum::http::StatusCode::FORBIDDEN,
-            );
-        }
-        // Audit-log every IAM denial.
-        //
-        // Previously this was `debug!`-only, which made runtime
-        // debugging of 403s a black box — operators had to flip the
-        // tracing filter to debug and replay the request. With the
-        // in-memory audit ring (Wave 11), denials now show up
-        // immediately in `/_/admin/diagnostics/audit` with the
-        // exact resolved (action, bucket, key) the check evaluated.
-        //
-        // `target` carries the S3 action + bucket/key so the admin
-        // GUI's filter box can find specific denials fast.
-        crate::audit::audit_log(
-            "access_denied",
-            &user.name,
-            &format!("{:?}", action),
-            request.headers(),
-            bucket,
-            key,
-        );
-        // Drain up to 64KB of the request body before returning 403 so the client
-        // receives a clean error response instead of "connection reset". Without this,
-        // axum drops the unread body and closes the connection mid-upload, breaking
-        // AWS CLI and other S3 clients that expect a proper HTTP error response.
-        // 64KB is enough for S3 SDKs to read the error; larger bodies get a
-        // connection reset (acceptable, and limits DoS surface).
-        let _ = axum::body::to_bytes(request.into_body(), 64 * 1024).await;
-        return Err(crate::api::S3Error::AccessDenied.into_response());
+        request.extensions_mut().insert(AuthzDenied {
+            user: user.name.clone(),
+            action,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        });
+        return next.run(request).await;
     }
 
     debug!(
@@ -328,12 +308,99 @@ pub async fn authorization_middleware(
         request.extensions_mut().insert(scope);
     }
 
-    Ok(next.run(request).await)
+    next.run(request).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The places where `authorization_middleware` returns something other
+    /// than `next.run(..).await`: a `return`, the last expression, or a `?`.
+    fn own_answers(file: &str) -> Vec<String> {
+        use syn::spanned::Spanned;
+        use syn::visit::Visit;
+
+        fn passes_on(e: &syn::Expr) -> bool {
+            let syn::Expr::Await(a) = e else { return false };
+            let syn::Expr::MethodCall(m) = &*a.base else {
+                return false;
+            };
+            m.method == "run"
+                && matches!(&*m.receiver, syn::Expr::Path(p) if p.path.is_ident("next"))
+        }
+
+        struct Scan(Vec<String>);
+        impl<'ast> Visit<'ast> for Scan {
+            fn visit_expr_return(&mut self, r: &'ast syn::ExprReturn) {
+                if !r.expr.as_deref().is_some_and(passes_on) {
+                    self.0
+                        .push(format!("line {}: return", r.span().start().line));
+                }
+                syn::visit::visit_expr_return(self, r);
+            }
+            fn visit_expr_try(&mut self, t: &'ast syn::ExprTry) {
+                self.0.push(format!("line {}: ?", t.span().start().line));
+            }
+        }
+
+        let parsed = syn::parse_file(file).expect("the file parses");
+        let func = parsed
+            .items
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Fn(f) if f.sig.ident == "authorization_middleware" => Some(f),
+                _ => None,
+            })
+            .expect("the middleware is in the file");
+        let mut scan = Scan(Vec::new());
+        scan.visit_block(&func.block);
+        match func.block.stmts.last() {
+            Some(syn::Stmt::Expr(e, None)) if passes_on(e) => {}
+            other => scan.0.push(format!(
+                "line {}: the last expression",
+                other.map_or(0, |s| s.span().start().line)
+            )),
+        }
+        scan.0
+    }
+
+    /// Source guard: this middleware never answers a request itself. It
+    /// runs before s3s verifies the signature, and any answer of its own
+    /// (a verdict, a decode error) differs for a key id that exists and one
+    /// that does not. It records a denial (`AuthzDenied`) and passes on; the
+    /// s3s access hook answers after the signature is verified. There is no
+    /// exception: OPTIONS, ListBuckets and a request with no principal also
+    /// pass on.
+    #[test]
+    fn the_middleware_never_answers_a_request_itself() {
+        let offenders = own_answers(include_str!("middleware.rs"));
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
+    /// The guard sees an own answer in every shape.
+    #[test]
+    fn the_answer_guard_catches_each_shape() {
+        let wrap = |body: &str| {
+            format!("async fn authorization_middleware(request: R, next: Next) -> Response {{ {body} }}")
+        };
+        assert!(own_answers(&wrap("next.run(request).await")).is_empty());
+        assert!(own_answers(
+            &wrap("if a {{ return next.run(request).await; }} next.run(request).await")
+                .replace("{{", "{")
+                .replace("}}", "}")
+        )
+        .is_empty());
+        for bad in [
+            "return E.into_response(); next.run(request).await",
+            "if a { return Err(E); } next.run(request).await",
+            "let x = f()?; next.run(request).await",
+            "E.into_response()",
+            "next.run(request).await; E.into_response()",
+        ] {
+            assert!(!own_answers(&wrap(bad)).is_empty(), "{bad}");
+        }
+    }
 
     /// s3s routes `?delete` to DeleteObjects only on a BUCKET path. On an
     /// object path it ignores the parameter: `POST /b/k?uploadId=u&delete`

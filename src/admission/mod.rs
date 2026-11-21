@@ -47,13 +47,16 @@ use crate::bucket_policy::PublicPrefixSnapshot;
 use serde::{Deserialize, Serialize};
 
 pub mod evaluator;
+pub mod glob_reach;
 pub mod grant;
 pub mod middleware;
+pub mod resource;
 pub mod spec;
 
 pub use evaluator::{evaluate, RequestInfo};
 pub use grant::{anonymous_grant, AnonymousGrant};
 pub use middleware::{admission_middleware, AdmissionAllowAnonymous};
+pub use resource::{BucketRules, Effect, PrefixVerdict, Refusal, ResourceRules};
 pub use spec::{AdmissionBlockSpec, AdmissionSpec, MatchSpec};
 
 /// Name prefix of the blocks synthesised from bucket `public_prefixes`
@@ -74,6 +77,8 @@ pub struct AdmissionChain {
     /// one place — useful for unit tests that want to construct a chain
     /// without going through live config.
     public_prefixes: std::sync::Arc<PublicPrefixSnapshot>,
+    /// Some block decides per resource (see [`Self::has_resource_rules`]).
+    resource_rules: bool,
 }
 
 /// One admission rule. Stable shape across phases.
@@ -87,6 +92,23 @@ pub struct AdmissionBlock {
     pub match_: Match,
     /// What to do when the predicate fires.
     pub action: Action,
+}
+
+impl AdmissionBlock {
+    fn decides_per_resource(&self) -> bool {
+        let Match::Predicates(p) = &self.match_ else {
+            return false;
+        };
+        match self.action {
+            // A `method` counts: `deny {method: [PUT, DELETE]}` alone must cover
+            // each DeleteObjects key and the form POST key.
+            Action::Deny | Action::Reject { .. } => {
+                p.bucket.is_some() || p.path_glob.is_some() || p.methods.is_some()
+            }
+            Action::AllowAnonymous => p.path_glob.is_some(),
+            Action::Continue => false,
+        }
+    }
 }
 
 /// Predicate side of an admission block. Two variants today:
@@ -127,9 +149,9 @@ pub struct Predicates {
     pub source_networks: Option<Vec<ipnet::IpNet>>,
     /// Bucket the request targets (lowercased). `None` = any bucket.
     pub bucket: Option<String>,
-    /// Glob-style pattern matched against the full object key.
-    /// Pre-compiled at chain-build time.
-    pub path_glob: Option<globset::GlobMatcher>,
+    /// Glob-style pattern matched against the full object key, never
+    /// against request text. Pre-compiled at chain-build time.
+    pub path_glob: Option<PathGlob>,
     /// Fire only on authenticated / unauthenticated requests. `None`
     /// = either.
     pub authenticated: Option<bool>,
@@ -139,6 +161,44 @@ pub struct Predicates {
     /// rate-limit work). A `tracing::warn!` fires per block at
     /// build time so operators see the gap.
     pub config_flag: Option<String>,
+}
+
+/// A compiled `path_glob`: the matcher for one key, and what the glob says
+/// about the keys below a prefix (for a LIST, which names no key).
+#[derive(Debug, Clone)]
+pub struct PathGlob {
+    matcher: globset::GlobMatcher,
+    reach: std::sync::Arc<glob_reach::GlobReach>,
+}
+
+impl PathGlob {
+    pub fn new(pattern: &str) -> Result<Self, globset::Error> {
+        let glob = globset::Glob::new(pattern)?;
+        Ok(Self {
+            matcher: glob.compile_matcher(),
+            reach: std::sync::Arc::new(glob_reach::GlobReach::new(&glob)),
+        })
+    }
+
+    /// Does the glob match this key?
+    pub fn matches_key(&self, key: &str) -> bool {
+        self.matcher.is_match(key)
+    }
+
+    /// Can some key that starts with `prefix` match?
+    pub fn can_match_below(&self, prefix: &str) -> bool {
+        self.reach.can_match_below(prefix)
+    }
+
+    /// Can a key directly in `folder` (no further `/`) match?
+    pub fn can_match_in_folder(&self, folder: &str) -> bool {
+        self.reach.can_match_in_folder(folder)
+    }
+
+    /// Does every key that starts with `prefix` match?
+    pub fn matches_all_below(&self, prefix: &str) -> bool {
+        self.reach.matches_all_below(prefix)
+    }
 }
 
 /// Decision side of an admission block.
@@ -288,10 +348,22 @@ impl AdmissionChain {
         synthesised.sort_by(|a, b| a.name.cmp(&b.name));
         blocks.extend(synthesised);
 
+        let resource_rules = blocks.iter().any(AdmissionBlock::decides_per_resource);
         Self {
             blocks,
             public_prefixes: std::sync::Arc::new(snapshot),
+            resource_rules,
         }
+    }
+
+    /// `true` when a block decides per RESOURCE, not per request: a `deny` /
+    /// `reject` that names a `bucket`, a `path_glob` or a `method` (a copy source, a
+    /// batch-delete key or a listed key can lie where the request line does
+    /// not), or an `allow-anonymous` with a `path_glob` (an anonymous LIST
+    /// shows only the keys that glob matches). Only then does a request
+    /// carry [`resource::ResourceRules`].
+    pub fn has_resource_rules(&self) -> bool {
+        self.resource_rules
     }
 
     /// Access the block list (read-only). Exposed for the trace endpoint
@@ -364,9 +436,8 @@ fn compile_block(spec: &crate::admission::AdmissionBlockSpec) -> Result<Admissio
         bucket: spec.match_.bucket.as_ref().map(|b| b.to_ascii_lowercase()),
         path_glob: match &spec.match_.path_glob {
             Some(glob_str) => Some(
-                globset::Glob::new(glob_str)
-                    .map_err(|e| format!("invalid path_glob `{}`: {}", glob_str, e))?
-                    .compile_matcher(),
+                PathGlob::new(glob_str)
+                    .map_err(|e| format!("invalid path_glob `{}`: {}", glob_str, e))?,
             ),
             None => None,
         },

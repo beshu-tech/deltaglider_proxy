@@ -214,12 +214,8 @@ const SPOOL_SITES: &[(&str, &str, Spool)] = &[
     ("src/cli/transfer_io.rs", "upload_file", Spool::NoMonitor),
 ];
 
-/// CLASS GUARD: every acquisition of spool space in `src/` is classified in
-/// [`SPOOL_SITES`], and the table has no row that no code matches. (The
-/// gate itself is a type: the reserving wrappers take a `HeldSpool` or a
-/// `SpoolWriteAdmission`.)
-#[test]
-fn every_spool_acquisition_is_classified() {
+/// The functions of `src/` that acquire spool space: `(file, function)`.
+fn spool_acquiring_functions() -> Vec<(String, String)> {
     const ACQUIRING: &[&str] = &[
         "spool_acquire",
         "spool_acquire_group",
@@ -265,6 +261,16 @@ fn every_spool_acquisition_is_classified() {
             }
         }
     }
+    found
+}
+
+/// CLASS GUARD: every acquisition of spool space in `src/` is classified in
+/// [`SPOOL_SITES`], and the table has no row that no code matches. (The
+/// gate itself is a type: the reserving wrappers take a `HeldSpool` or a
+/// `SpoolWriteAdmission`.)
+#[test]
+fn every_spool_acquisition_is_classified() {
+    let found = spool_acquiring_functions();
     let mut problems = Vec::new();
     for (file, name) in &found {
         if !SPOOL_SITES.iter().any(|(f, n, _)| f == file && n == name) {
@@ -341,6 +347,33 @@ fn the_gated_acquire_wrappers_take_the_admission() {
 /// Files whose spool acquisitions are all reads (a GET and a range read):
 /// reads and deletes work at level critical, so they never ask the gate.
 const READ_FILES: &[&str] = &["src/deltaglider/engine/retrieve.rs"];
+
+/// CLASS GUARD: the response stream of a spool file is made in ONE function
+/// of `retrieve.rs` (`stream_spool`), which charges the principal of the
+/// request for the live stream. A second place that opens a spool file for a
+/// response would let one principal hold the whole budget again. Reads and
+/// the router scope stay as the share needs them.
+#[test]
+fn spool_response_streams_are_made_in_one_charging_function() {
+    let text = crate::source_scan::read("src/deltaglider/engine/retrieve.rs");
+    let code = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+    assert_eq!(
+        code.matches("ReaderStream::new").count(),
+        1,
+        "a spool file is streamed by stream_spool only"
+    );
+    let body =
+        crate::source_scan::prod_fn_text("src/deltaglider/engine/retrieve.rs", "stream_spool");
+    assert!(
+        body.contains("charge_stream") && body.contains("ReaderStream::new"),
+        "stream_spool charges the stream it makes"
+    );
+    let router = crate::source_scan::read("src/api/s3_router.rs");
+    assert!(
+        router.contains("principal_spool_scope"),
+        "the S3 router runs every request in its principal's spool scope"
+    );
+}
 
 /// CLASS GUARD: every client verb that STORES bytes asks the store gate (it
 /// adds the critical-disk refusal of a filesystem backend to the write
@@ -446,7 +479,9 @@ async fn relayed_delta_parts_refused_by_the_disk_gate_store_whole() {
     for level in [Level::High, Level::Critical] {
         set_level(&engine, level);
         let key = format!("empty-{}.zip", level.name());
-        let lock = engine.lock_object_write("b", &key).await;
+        let lock = engine
+            .lock_object_write("b", &key, crate::types::WriteOrigin::Client)
+            .await;
         let stored = engine
             .store_relayed_parts_delta_with_multipart_etag(
                 &lock,
@@ -467,7 +502,9 @@ async fn relayed_delta_parts_refused_by_the_disk_gate_store_whole() {
         std::fs::write(&part, b"some bytes").unwrap();
         let parts = [RelayPart::of_file(&part)];
         let key = format!("full-{}.zip", level.name());
-        let lock = engine.lock_object_write("b", &key).await;
+        let lock = engine
+            .lock_object_write("b", &key, crate::types::WriteOrigin::Client)
+            .await;
         engine
             .store_relayed_parts_delta_with_multipart_etag(
                 &lock,
@@ -482,4 +519,48 @@ async fn relayed_delta_parts_refused_by_the_disk_gate_store_whole() {
             .await
             .unwrap_or_else(|e| panic!("{level:?} non-empty: {e}"));
     }
+}
+
+/// One principal's live downloads cannot take the budget of the other
+/// principals: past its share (and the rest) a stream is refused at once with
+/// a retryable `Overloaded` that names the variable, and a write of another
+/// principal still gets its space.
+#[tokio::test]
+async fn a_download_over_the_principal_share_is_refused_at_once_and_a_write_is_not() {
+    use crate::deltaglider::spool::{as_principal, SpoolDir};
+    let (raw, _fake) = s3_engine().await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = raw.with_spool_dir(
+        SpoolDir::new(dir.path().join("spool"), 128 * MIB)
+            .unwrap()
+            .with_read_share(25),
+    );
+    // Reads in total are capped at 96 MiB (75 %), a share is 24 and the rest 72.
+    // Each file is 30 MiB, above the share: two pass while all streams stay
+    // within 72 MiB, the third would make 90.
+    let a = engine.spool_acquire_ungated(30 * MIB).await.unwrap();
+    let b = engine.spool_acquire_ungated(30 * MIB).await.unwrap();
+    let c = engine.spool_acquire_ungated(30 * MIB).await.unwrap();
+    let _held = as_principal("mallory", async { engine.spool.charge_stream(&a) })
+        .await
+        .unwrap();
+    let _second = as_principal("mallory", async { engine.spool.charge_stream(&b) })
+        .await
+        .unwrap();
+    let refused = as_principal("mallory", async { engine.spool.charge_stream(&c) }).await;
+    let err = refused.err().expect("the third file is over the reach");
+    assert_eq!(err.kind(), crate::deltaglider::spool::CONTENDED);
+    assert!(
+        err.to_string().contains("DGP_SPOOL_READ_SHARE_PERCENT"),
+        "{err}"
+    );
+    // The refusal reaches the client as a retryable Overloaded.
+    assert!(matches!(
+        super::resources::spool_error(err),
+        crate::deltaglider::EngineError::Overloaded(m) if m.contains("DGP_SPOOL_READ_SHARE_PERCENT")
+    ));
+    // A write is no stream: it takes the free space.
+    let _write = as_principal("dana", engine.spool_acquire_ungated(8 * MIB))
+        .await
+        .unwrap();
 }

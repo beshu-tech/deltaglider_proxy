@@ -19,9 +19,9 @@ import { normalizeUiError } from '../errorHandling';
 
 /**
  * Pure: the paragraphs of the "Backup restored" dialog. Users that the
- * restore renamed (their name was taken) and policy rules it kept
- * contained (a condition the proxy cannot evaluate) are named, because the
- * operator must check them.
+ * restore renamed (their name was taken), policy rules it kept
+ * contained (a condition the proxy cannot evaluate) and a kept bootstrap
+ * password are named, because the operator must check them.
  */
 export function restoreSummaryLines(result: ImportBackupResult): string[] {
   const ext = result.external_identities_created ?? 0;
@@ -39,6 +39,9 @@ export function restoreSummaryLines(result: ImportBackupResult): string[] {
     lines.push(
       `${contained.length} policy rule${contained.length === 1 ? ' has' : 's have'} a condition that the proxy cannot evaluate. The rule is kept, but an Allow grants nothing and a Deny applies without its condition: ${contained.join('; ')}.`,
     );
+  }
+  if (result.bootstrap_password) {
+    lines.push(result.bootstrap_password);
   }
   lines.push('The page reloads to show the restored state.');
   return lines;

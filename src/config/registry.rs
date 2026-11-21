@@ -81,7 +81,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MAX_OBJECT_SIZE",
-        description: "Max object size in bytes, or `auto` (default): the effective per-upload limit of the spool (half of the effective spool budget)",
+        description: "Max object size in bytes, or `auto` (default): the lower of the per-upload limit and what one principal can hold of the total multipart limit (37.5 % of the effective spool budget with the defaults)",
         example: "auto",
         category: "Delta Engine",
     },
@@ -423,6 +423,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT",
+        description: "A principal's share of the open multipart uploads (DGP_MAX_MULTIPART_UPLOADS) and of the multipart part bytes (DGP_MAX_TOTAL_MULTIPART_BYTES), 1-100, default: 25. A principal alone may use the larger of its share and the rest (75 % by default); with others active it is always admitted up to its share. A request past that gets 503 SlowDown that names the caller's own limit; 100 turns the shares off",
+        example: "25",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_MULTIPART_SWEEP_INTERVAL_SECS",
         description: "Multipart sweeper interval in seconds (default: 300)",
         example: "300",
@@ -483,15 +489,51 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_H2_IDLE_TIMEOUT_SECS",
+        description: "Seconds an HTTP/2 connection that already got a response with a status below 400 stays open with no request in flight (default: 120, at least 1). A connection that got none (no request, or only refused ones) is closed after DGP_HEADER_READ_TIMEOUT_SECS. Keep it longer than the idle time of the connections that a reverse proxy keeps to the proxy. The listener reads it at startup",
+        example: "120",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_MAX_CONNECTIONS",
         description: "The most client connections open at once (default: 4 x DGP_MAX_CONCURRENT_REQUESTS, at least 4096). A connection above the cap is closed before the TLS handshake and counted in deltaglider_connections_refused_total. The listener reads it at startup",
         example: "4096",
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_MAX_CONNECTIONS_PER_IP",
+        description: "The most client connections open at once from one TCP peer address (default: a quarter of DGP_MAX_CONNECTIONS, at least 1). A connection above the cap is closed before the TLS handshake and counted in deltaglider_connections_refused_total. Behind a reverse proxy every client has the proxy's address, so raise it there. The listener reads it at startup",
+        example: "1024",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_BACKEND_SHARE_PERCENT",
         description: "With more than one storage backend: the most of DGP_MAX_CONCURRENT_REQUESTS, and of DGP_SPOOL_MAX_BYTES, that the requests to one backend may hold (1-100, default: 75). A request to a backend whose share of request slots is full gets 503 SlowDown at once; one whose share of spool is full waits for that backend's own spool. A slow backend then cannot stall the others",
         example: "75",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_SPOOL_READ_SHARE_PERCENT",
+        description: "A principal's share of the READ spool space (an access key, or all anonymous requests), 1-100, default: 25. The shares work inside DGP_SPOOL_READ_MAX_PERCENT. A principal alone may use the larger of its share and the rest of the read cap (75 % of the cap by default); with other principals active it is always admitted up to its share. A read past that gets 503 SlowDown at once, and so does a download that would need new spool space for it: the share is asked before the download reserves or decodes anything. 100 turns the shares off (the read cap stays)",
+        example: "25",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_SPOOL_READ_MAX_PERCENT",
+        description: "The most of DGP_SPOOL_MAX_BYTES that all READ requests together may hold (response streams of spool files and the downloads that fill them), 1-100, default: 75. Writes always keep the rest (25 % by default). An upload that needs more than that part can get a retryable 503 SlowDown while reads hold their cap; lower this value, or set max_object_size to that part, so that every admitted object finds space. One read on an idle proxy may be larger than the cap. 100 turns the cap off",
+        example: "75",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_RESPONSE_STALL_SECS",
+        description: "The length in seconds of one window in which a response body that holds spool space (a large delta GET) must be read at its minimum rate, or it ends and releases the space (default: 60, at least 1). The minimum per window is 64 KiB, or more for a large file (see DGP_RESPONSE_MAX_HOLD_SECS). A client above the rate is never cut, however long the download takes",
+        example: "60",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_RESPONSE_MAX_HOLD_SECS",
+        description: "The time in seconds in which a response body that holds spool space is released whatever its client does (default: 21600, 6 hours, at least 1). Each stall window the client must take at least min(held bytes, bytes the response sends) times window / this value (64 KiB at the least): 48.5 KiB/s for a 1 GiB response, 1.2 MiB/s for 25 GiB; a range sends less than the file it holds",
+        example: "21600",
         category: "Server",
     },
     EnvVarEntry {

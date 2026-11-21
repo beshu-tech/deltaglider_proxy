@@ -8,7 +8,9 @@
 
 use crate::common;
 
-use common::TestServer;
+use common::{
+    admin_http_client, generate_binary, head_headers, mutate_binary, put_object, TestServer,
+};
 use std::path::Path;
 
 /// Write a file directly into the deltaspace directory.
@@ -578,4 +580,443 @@ async fn test_store_heals_stripped_reference_metadata_preserving_bytes() {
             "{key} roundtrip mismatch"
         );
     }
+}
+
+// ============================================================================
+// Reserved names in any path segment
+// ============================================================================
+
+/// A write whose key has a reserved name as ANY segment gets a 400 that names
+/// the segment, in any letter case; nothing is stored. A key that already has
+/// such a segment (written straight to the disk) stays readable and deletable.
+#[tokio::test]
+async fn a_write_with_a_reserved_segment_is_refused_and_existing_ones_stay_reachable() {
+    let server = TestServer::builder().build().await;
+    let data_dir = server.data_dir().expect("filesystem backend");
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket();
+    let put = |key: &'static str| {
+        let s3 = s3.clone();
+        async move {
+            s3.put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+                .send()
+                .await
+        }
+    };
+    for key in [
+        "atk/reference.bin/x.txt",
+        "atk/REFERENCE.BIN/x.txt",
+        "atk/REFERENCE.BIN",
+        "d/app-2.zip.delta/x.txt",
+        "d/App.ZIP.DELTA",
+        "q/.dg-folder-marker/x",
+        "q/.DG-TMP.a/x",
+    ] {
+        let err = put(key).await.expect_err(key);
+        let status = err.raw_response().map(|r| r.status().as_u16());
+        assert_eq!(status, Some(400), "{key}");
+    }
+    assert!(!data_dir
+        .join(bucket)
+        .join("deltaspaces")
+        .join("atk")
+        .exists());
+    // The message names the segment.
+    let http = server.http();
+    let resp = http
+        .put(format!(
+            "{}/{bucket}/atk/reference.bin/x.txt",
+            server.endpoint()
+        ))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("the path segment &apos;reference.bin&apos; is reserved"),
+        "{body}"
+    );
+
+    // An ordinary delta folder still works after the refusals.
+    put("atk/app-1.zip").await.unwrap();
+
+    // A key written by an earlier release (a directory named like a baseline).
+    write_file(data_dir, bucket, "old/reference.bin", "x.txt", b"legacy");
+    let got = s3
+        .get_object()
+        .bucket(bucket)
+        .key("old/reference.bin/x.txt")
+        .send()
+        .await;
+    assert!(got.is_ok(), "{:?}", got.err());
+    s3.delete_object()
+        .bucket(bucket)
+        .key("old/reference.bin/x.txt")
+        .send()
+        .await
+        .unwrap();
+    let gone = s3
+        .head_object()
+        .bucket(bucket)
+        .key("old/reference.bin/x.txt")
+        .send()
+        .await;
+    assert!(gone.is_err());
+}
+
+// ============================================================================
+// Case variants of reserved names that an earlier release stored
+// ============================================================================
+
+/// On a case-sensitive data directory a case variant of a reserved name is an
+/// ordinary object: one that an earlier release stored stays listed, readable
+/// and deletable, and the bucket can be deleted. A new write is refused.
+#[tokio::test]
+async fn legacy_case_variants_of_reserved_names_stay_reachable() {
+    let server = TestServer::builder().build().await;
+    let data_dir = server.data_dir().expect("filesystem backend");
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket();
+    // The data dir of this test must be case-sensitive (ext4/tmpfs).
+    let probe = data_dir.join(".case-probe");
+    std::fs::write(&probe, b"").unwrap();
+    let insensitive = data_dir.join(".CASE-PROBE").exists();
+    std::fs::remove_file(&probe).unwrap();
+    if insensitive {
+        eprintln!("skipping: the data directory is case-insensitive");
+        return;
+    }
+    let legacy = [
+        ("", "rates.DELTA", "k1"),
+        ("", "Reference.Bin", "k2"),
+        ("a/.Dg", "x", "k3"),
+    ];
+    for (prefix, name, _) in legacy {
+        write_file(data_dir, bucket, prefix, name, b"legacy");
+    }
+    let keys = ["rates.DELTA", "Reference.Bin", "a/.Dg/x"];
+
+    // LIST shows all three; a LIST of the odd-case folder works.
+    let listed = s3.list_objects_v2().bucket(bucket).send().await.unwrap();
+    let mut got: Vec<_> = listed
+        .contents()
+        .iter()
+        .map(|o| o.key().unwrap().to_string())
+        .collect();
+    got.sort();
+    assert_eq!(got, ["Reference.Bin", "a/.Dg/x", "rates.DELTA"]);
+    let sub = s3
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix("a/.Dg/")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sub.contents().len(), 1);
+
+    for key in keys {
+        let got = s3.get_object().bucket(bucket).key(key).send().await;
+        assert!(got.is_ok(), "GET {key}: {:?}", got.err());
+        let head = s3.head_object().bucket(bucket).key(key).send().await;
+        assert!(head.is_ok(), "HEAD {key}: {:?}", head.err());
+    }
+
+    // A new write of the same names is refused.
+    for key in keys {
+        let err = s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"new"))
+            .send()
+            .await
+            .expect_err(key);
+        let status = err.raw_response().map(|r| r.status().as_u16());
+        assert_eq!(status, Some(400), "PUT {key}");
+    }
+
+    // DeleteObject and DeleteObjects remove them.
+    s3.delete_object()
+        .bucket(bucket)
+        .key("rates.DELTA")
+        .send()
+        .await
+        .unwrap();
+    assert!(s3
+        .head_object()
+        .bucket(bucket)
+        .key("rates.DELTA")
+        .send()
+        .await
+        .is_err());
+    let del = s3
+        .delete_objects()
+        .bucket(bucket)
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("Reference.Bin")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(del.errors().is_empty(), "{:?}", del.errors());
+    assert!(!data_dir
+        .join(bucket)
+        .join("deltaspaces/Reference.Bin")
+        .exists());
+    assert!(data_dir.join(bucket).join("deltaspaces/a/.Dg/x").exists());
+
+    // DeleteBucket works once the last such object is deleted.
+    s3.delete_object()
+        .bucket(bucket)
+        .key("a/.Dg/x")
+        .send()
+        .await
+        .unwrap();
+    s3.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+// ============================================================================
+// A copy of a delta obeys the reserved-name rule of a client write
+// ============================================================================
+
+/// Seeds `src/base.zip` and `src/v1.zip`; the second is stored as a delta.
+async fn seed_delta_source(server: &TestServer) {
+    let http = server.http();
+    let base = generate_binary(100_000, 7);
+    let variant = mutate_binary(&base, 0.01);
+    for (name, body) in [("base.zip", base), ("v1.zip", variant)] {
+        put_object(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            &format!("src/{name}"),
+            body,
+            "application/zip",
+        )
+        .await;
+    }
+    let head = head_headers(&http, &server.endpoint(), server.bucket(), "src/v1.zip").await;
+    assert_eq!(
+        head["x-amz-storage-type"], "delta",
+        "fixture: a delta source"
+    );
+}
+
+/// Two delta PUTs into `folder`: the second one is stored as a delta.
+async fn folder_still_takes_deltas(server: &TestServer, folder: &str) {
+    let http = server.http();
+    let base = generate_binary(100_000, 9);
+    let variant = mutate_binary(&base, 0.01);
+    for (name, body) in [("app-1.zip", base), ("app-2.zip", variant)] {
+        put_object(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            &format!("{folder}/{name}"),
+            body,
+            "application/zip",
+        )
+        .await;
+    }
+    let head = head_headers(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        &format!("{folder}/app-2.zip"),
+    )
+    .await;
+    assert_eq!(head["x-amz-storage-type"], "delta", "{folder}");
+}
+
+/// The destinations that a client write refuses, with the folder whose later
+/// delta PUTs the refused copy would break.
+const REFUSED_COPY_DESTINATIONS: [(&str, &str); 2] = [
+    ("atk/reference.bin/x.zip", "atk"),
+    ("d/app-2.zip.delta/x.zip", "d"),
+];
+
+/// A CopyObject of a delta into a key with a reserved segment is a 400, and
+/// no directory appears where the baseline or a delta goes.
+#[tokio::test]
+async fn a_delta_copy_into_a_reserved_segment_is_refused() {
+    let server = TestServer::builder().build().await;
+    seed_delta_source(&server).await;
+    let data_dir = server.data_dir().expect("filesystem backend");
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket();
+    for (dest, folder) in REFUSED_COPY_DESTINATIONS {
+        let err = s3
+            .copy_object()
+            .bucket(bucket)
+            .key(dest)
+            .copy_source(format!("{bucket}/src/v1.zip"))
+            .send()
+            .await
+            .expect_err(dest);
+        let status = err.raw_response().map(|r| r.status().as_u16());
+        assert_eq!(status, Some(400), "{dest}");
+        let spaces = data_dir.join(bucket).join("deltaspaces");
+        assert!(
+            !spaces.join(folder).join("reference.bin").exists(),
+            "{dest}"
+        );
+        assert!(!spaces.join("atk").exists(), "{dest}");
+        assert!(!spaces.join("d/app-2.zip.delta").exists(), "{dest}");
+    }
+    folder_still_takes_deltas(&server, "atk").await;
+    folder_still_takes_deltas(&server, "d").await;
+}
+
+/// The admin bulk copy and move go through the same transfer: the item
+/// fails, the source stays, and the destination folder stays usable.
+#[tokio::test]
+async fn an_admin_copy_or_move_of_a_delta_into_a_reserved_segment_is_refused() {
+    let server = TestServer::builder().build().await;
+    seed_delta_source(&server).await;
+    let data_dir = server.data_dir().expect("filesystem backend");
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket();
+    for op in ["copy", "move"] {
+        for (dest, folder) in REFUSED_COPY_DESTINATIONS {
+            let (dest_prefix, relative) = dest.rsplit_once('/').unwrap();
+            let r: serde_json::Value = admin
+                .post(format!("{}/_/api/admin/objects/{op}", server.endpoint()))
+                .json(&serde_json::json!({
+                    "source_bucket": bucket,
+                    "dest_bucket": bucket,
+                    "dest_prefix": format!("{dest_prefix}/"),
+                    "items": [{ "source_key": "src/v1.zip", "relative": relative }]
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(r["failed"], 1, "{op} {dest}: {r}");
+            assert_eq!(r["succeeded"], 0, "{op} {dest}: {r}");
+            let spaces = data_dir.join(bucket).join("deltaspaces");
+            assert!(!spaces.join(folder).exists(), "{op} {dest}");
+        }
+    }
+    let head = head_headers(&server.http(), &server.endpoint(), bucket, "src/v1.zip").await;
+    assert_eq!(head["x-amz-storage-type"], "delta", "the source stays");
+    folder_still_takes_deltas(&server, "atk").await;
+    folder_still_takes_deltas(&server, "d").await;
+}
+
+/// A delta copy into an ordinary key still ships the stored delta.
+#[tokio::test]
+async fn a_delta_copy_into_an_ordinary_key_keeps_the_delta_form() {
+    let server = TestServer::builder().build().await;
+    seed_delta_source(&server).await;
+    let data_dir = server.data_dir().expect("filesystem backend");
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket();
+    s3.copy_object()
+        .bucket(bucket)
+        .key("src/v1-copy.zip")
+        .copy_source(format!("{bucket}/src/v1.zip"))
+        .send()
+        .await
+        .expect("CopyObject");
+    let spaces = data_dir.join(bucket).join("deltaspaces/src");
+    assert!(spaces.join("v1-copy.zip.delta").is_file());
+    assert!(!spaces.join("v1-copy.zip").exists());
+}
+
+// ============================================================================
+// A refused key is refused before the body is read
+// ============================================================================
+
+/// Send the head of a `method` request with a declared body of 50 MB and no
+/// body bytes; the status that comes back before any byte of the body.
+async fn status_before_the_body(
+    server: &TestServer,
+    method: &str,
+    path: &str,
+    content_type: &str,
+) -> Option<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host = server.endpoint().replace("http://", "");
+    let mut tcp = tokio::net::TcpStream::connect(&host).await.unwrap();
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 50000000\r\n\
+         Content-Type: {content_type}\r\n\r\n"
+    );
+    tcp.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 64];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(3), tcp.read(&mut buf)).await;
+    let n = read.ok()?.ok()?;
+    std::str::from_utf8(&buf[..n])
+        .ok()?
+        .split(' ')
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// A PutObject whose key a client write refuses gets its 400 before the proxy
+/// reads the body, as CreateMultipartUpload does.
+#[tokio::test]
+async fn a_put_with_a_refused_key_is_refused_before_its_body_is_read() {
+    let server = TestServer::builder().open_access().build().await;
+    let bucket = server.bucket();
+    for key in ["atk/reference.bin/x.zip", "d/app.zip.delta", "q/.dg/x"] {
+        let status = status_before_the_body(
+            &server,
+            "PUT",
+            &format!("/{bucket}/{key}"),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, Some(400), "{key}");
+    }
+}
+
+/// The same for a browser form upload: after its signature is verified and
+/// before its file is read. (Open access: the form is not signed.)
+#[tokio::test]
+async fn a_form_upload_with_a_refused_key_is_refused_before_its_file_is_read() {
+    let server = TestServer::builder().open_access().build().await;
+    let bucket = server.bucket();
+    let boundary = "xBOUNDARYx";
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host = server.endpoint().replace("http://", "");
+    let mut tcp = tokio::net::TcpStream::connect(&host).await.unwrap();
+    let fields = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\natk/reference.bin/x.zip\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.zip\"\r\n\
+         Content-Type: application/zip\r\n\r\n"
+    );
+    let head = format!(
+        "POST /{bucket} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 50000000\r\n\
+         Content-Type: multipart/form-data; boundary={boundary}\r\n\r\n{fields}"
+    );
+    tcp.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(3), tcp.read(&mut buf))
+        .await
+        .expect("an answer before the file")
+        .unwrap();
+    let status = std::str::from_utf8(&buf[..n])
+        .unwrap()
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .to_string();
+    assert_eq!(status, "400");
 }

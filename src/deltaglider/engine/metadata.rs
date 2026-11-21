@@ -172,13 +172,57 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
     ) -> Result<(ObjectKey, String), EngineError> {
+        let gate = self.gate_write(lock)?;
         let obj_key = ObjectKey::parse(bucket, key);
-        obj_key
-            .validate_data_ingest()
-            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
         let deltaspace_id = obj_key.deltaspace_id();
         lock.covers(bucket, &deltaspace_id, &obj_key.filename)?;
+        debug_assert_eq!(gate.filename(), obj_key.filename);
         Ok((obj_key, deltaspace_id))
+    }
+
+    /// THE gate of every write of a DATA object under `lock`: a store, a
+    /// raw delta or baseline write, a copy.
+    pub fn gate_write<'g>(
+        &self,
+        lock: &'g super::conditional::ObjectWriteGuard,
+    ) -> Result<super::conditional::WriteGate<'g>, EngineError> {
+        let gate = lock.gate(true)?;
+        self.backend_accepts_new_key(&gate)?;
+        Ok(gate)
+    }
+
+    /// A key that creates a folder which collides with a file of the
+    /// destination backend (a job copy of a key that key validation lets pass).
+    fn backend_accepts_new_key(
+        &self,
+        gate: &super::conditional::WriteGate<'_>,
+    ) -> Result<(), EngineError> {
+        match self
+            .storage
+            .new_key_refusal(gate.bucket(), gate.deltaspace_id(), gate.filename())
+        {
+            Some(why) => Err(EngineError::KeyRefused(why)),
+            None => Ok(()),
+        }
+    }
+
+    /// The gate of a folder-marker write (a key that ends in `/`).
+    pub(super) fn gate_marker<'g>(
+        &self,
+        lock: &'g super::conditional::ObjectWriteGuard,
+    ) -> Result<super::conditional::WriteGate<'g>, EngineError> {
+        let gate = lock.gate(false)?;
+        self.backend_accepts_new_key(&gate)?;
+        Ok(gate)
+    }
+
+    /// The gate of an in-place rewrite of an object that exists already
+    /// (re-encrypt): the rule of the guard's origin, on the same key.
+    pub(super) fn gate_rewrite<'g>(
+        &self,
+        lock: &'g super::conditional::ObjectWriteGuard,
+    ) -> Result<super::conditional::WriteGate<'g>, EngineError> {
+        lock.gate(true)
     }
 
     /// Look up object metadata by checking both delta and passthrough storage,

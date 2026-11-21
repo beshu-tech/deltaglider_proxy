@@ -537,7 +537,7 @@ pub async fn window_open(engine: &DynEngine, bucket: &str) -> bool {
 pub enum BootConversion {
     /// Its conversion window is open: nothing to do.
     WindowOpen,
-    /// The sample holds no object that a client cannot read.
+    /// The scan holds no object that a client cannot read.
     NoPlaintext,
     /// The boot opened the window and queued the job of its run.
     Started { run: RunId, job_id: i64 },
@@ -550,31 +550,59 @@ pub enum BootConversion {
     NoAtomicWrites { key: String, why: String },
 }
 
-/// The boot's conversion of a bucket that a restart made encrypt
-/// (operator, Helm, GitOps: no apply ran). When the sample of `sample`
-/// objects holds one that a client cannot read and none that is encrypted,
-/// the bucket has NO key claim (no proxy ever wrote encrypted data there,
-/// so its plaintext is history, not a plant) and NO marker, and no job is
-/// active on it: open
-/// the window in [`OpenMode::Refresh`] (a marker that another node wrote
-/// meanwhile and that opens here keeps its run, with a new cutoff) and
-/// queue the re-encrypt job of its run, by `boot`. Idempotent across
-/// restarts: the job's first write claims the bucket, and the marker
-/// stays until the job ends.
+/// The boot's conversion of a bucket that a restart made encrypt: it opens a window only when
+/// the node's record and a scan of the whole bucket find no proof that the proxy encrypted it.
 pub async fn start_at_boot(
     app: &crate::api::handlers::AppState,
     config: &crate::config::Config,
     bucket: &str,
-    sample: u32,
+    sample: u64,
 ) -> Result<BootConversion, String> {
+    use crate::deltaglider::ScanScope;
     let engine = app.engine.load_full();
     if window_open(&engine, bucket).await {
         return Ok(BootConversion::WindowOpen);
     }
+    let recorded = engine.encrypts_recorded(bucket).await;
+    let scope = match recorded {
+        Ok(false) => ScanScope::Whole,
+        _ => ScanScope::Sample(sample),
+    };
+    let began = std::time::Instant::now();
     let found = engine
-        .plaintext_sample(bucket, sample)
+        .plaintext_scan(bucket, scope)
         .await
         .map_err(|e| e.to_string())?;
+    tracing::info!(
+        "boot check of bucket '{bucket}': read {} object(s) ({scope:?}) in {:.1} s, {} name(s) \
+         refused as keys; sealed object found: {}",
+        found.listed,
+        began.elapsed().as_secs_f64(),
+        found.unreadable_names,
+        found.encrypted
+    );
+    if recorded == Ok(false) {
+        // Proof that this proxy encrypted the bucket: a record that only this node can lose.
+        let proof = if found.encrypted {
+            Some("the boot scan found a sealed object")
+        } else if matches!(engine.storage().read_key_claim(bucket).await, Ok(Some(_))) {
+            Some("the bucket holds a key claim")
+        } else if marker_exists(&engine, bucket).await == Ok(true) {
+            Some("the bucket holds a conversion marker")
+        } else {
+            None
+        };
+        if let Some(why) = proof {
+            engine.note_encrypts(bucket, why).await;
+        }
+    }
+    if recorded == Ok(true) && matches!(engine.storage().read_key_claim(bucket).await, Ok(None)) {
+        tracing::warn!(
+            "bucket '{bucket}' has no key claim, but this proxy recorded that it encrypted the \
+             bucket: someone with access to the storage may have deleted the claim. The boot \
+             opens no conversion window for it"
+        );
+    }
     let Some(key) = found.first_refused else {
         return Ok(BootConversion::NoPlaintext);
     };
@@ -584,12 +612,32 @@ pub async fn start_at_boot(
             why: why.to_string(),
         })
     };
+    match &recorded {
+        Ok(false) => {}
+        Ok(true) => {
+            return refused(
+                "this proxy recorded that it encrypted the bucket, so its plaintext objects may \
+                 be plants, and the boot never opens a window for such a bucket",
+            )
+        }
+        Err(e) => {
+            return refused(&format!(
+                "this proxy's own record of encrypted buckets could not be read: {e}"
+            ))
+        }
+    }
     if found.encrypted {
         // A key claim that a backend writer deleted must not turn plants
         // into history.
         return refused(
             "the bucket holds encrypted objects too, so its plaintext objects may not be \
              history",
+        );
+    }
+    if !found.complete {
+        return refused(
+            "the scan of the whole bucket did not finish, so it cannot prove that the bucket \
+             holds no encrypted object",
         );
     }
     match engine.storage().read_key_claim(bucket).await {
@@ -880,6 +928,33 @@ pub fn backfill_refusal(bucket: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The boot opens a window only after it read the node's own record and
+    /// scanned the whole bucket: the order of the checks in `start_at_boot`.
+    #[test]
+    fn the_boot_opens_a_window_only_after_the_record_and_a_whole_scan() {
+        let text = include_str!("conversion.rs");
+        let body = &text[text.find("pub async fn start_at_boot(").unwrap()..];
+        let body = &body[..body.find("\n/// One re-encrypt job to queue").unwrap()];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("start_at_boot lost `{needle}`"))
+        };
+        let open = at("open_window(");
+        for needle in [
+            "encrypts_recorded(",
+            "ScanScope::Whole",
+            "found.complete",
+            "found.encrypted",
+        ] {
+            assert!(
+                at(needle) < open,
+                "`{needle}` must come before the window opens"
+            );
+        }
+        let sample = ["plaintext", "_sample"].concat();
+        assert!(!text.contains(&sample), "the 100-key sample is gone");
+    }
 
     #[test]
     fn the_purge_runs_only_when_a_job_asked_for_it() {

@@ -99,3 +99,12 @@ test('the restore summary names renamed users and contained rules', () => {
   expect(lines.join('\n')).toContain('dana -> dana-2');
   expect(lines.join('\n')).toContain('user dana: rule 1');
 });
+
+test('the restore summary says when the bootstrap password was kept', () => {
+  const base = { users_created: 0, users_skipped: 0, groups_created: 0, groups_skipped: 0, memberships_created: 0 };
+  const note = 'The bootstrap password was kept: only a session that logged in with the bootstrap password may replace it.';
+  const lines = restoreSummaryLines({ ...base, bootstrap_password: note });
+  expect(lines).toContain(note);
+  expect(lines[lines.length - 1]).toBe('The page reloads to show the restored state.');
+  expect(restoreSummaryLines(base).join('\n')).not.toContain('bootstrap');
+});

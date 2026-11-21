@@ -1419,19 +1419,27 @@ fn dollar_literal_survives_persist_load_roundtrip() {
 }
 
 #[test]
-fn escape_dollar_leaves_whole_env_refs_intact() {
-    // A re-inserted whole ${env:NAME} ref must NOT be escaped (it must expand
-    // on load); a materialized literal with `$` must be.
-    assert!(is_whole_env_ref("${env:FOO}"));
-    assert!(is_whole_env_ref("${env:FOO:-default}"));
-    assert!(!is_whole_env_ref("pay $$10"));
-    assert!(!is_whole_env_ref("prefix ${env:FOO} suffix")); // not a WHOLE ref
-    let mut v = serde_yaml::Value::String("${env:FOO}".into());
-    escape_dollar_for_persist(&mut v);
-    assert_eq!(v.as_str(), Some("${env:FOO}"), "whole ref left intact");
-    let mut lit = serde_yaml::Value::String("pay $$10".into());
-    escape_dollar_for_persist(&mut lit);
-    assert_eq!(lit.as_str(), Some("pay $$$$10"), "literal $ escaped to $$");
+fn file_text_escapes_literals_and_keeps_templates() {
+    // A template at its own path stays a template (it must expand on load);
+    // every literal `$` is doubled, and a literal that looks like a reference
+    // is never one after the next load.
+    let env = |n: &str| (n == "FOO").then(|| "foo-value".to_string());
+    let mut cfg =
+        Config::from_template_with("advanced:\n  public_url: https://h/${env:FOO}\n", &env)
+            .unwrap();
+    cfg.config_sync_object_key = Some("pay $$10 ${env:FOO}".into());
+    let full = cfg.with_file_text(env_template::Escape::Full);
+    assert_eq!(full.public_url.as_deref(), Some("https://h/${env:FOO}"));
+    assert_eq!(
+        full.config_sync_object_key.as_deref(),
+        Some("pay $$$$10 $${env:FOO}")
+    );
+    let minimal = cfg.with_file_text(env_template::Escape::Minimal);
+    // Only a `$` that the expander would read as something else is doubled.
+    assert_eq!(
+        minimal.config_sync_object_key.as_deref(),
+        Some("pay $$$10 $${env:FOO}")
+    );
 }
 
 #[test]

@@ -1293,7 +1293,9 @@ fn validate_match_type(match_type: &str) -> Result<(), String> {
 /// so the two handlers can't drift.
 fn validate_mapping_rule(match_type: &str, match_value: &str) -> Result<(), String> {
     validate_match_type(match_type)?;
-    if match_type == "email_regex" && regex_lite::Regex::new(match_value).is_err() {
+    if match_type == "email_regex"
+        && crate::iam::external_auth::mapping::compile_email_regex(match_value).is_err()
+    {
         return Err(format!("invalid email_regex pattern: {match_value}"));
     }
     Ok(())
@@ -1537,9 +1539,12 @@ mod tests {
     #[test]
     fn validate_mapping_rule_regex_must_compile() {
         assert!(validate_mapping_rule("email_regex", r"^.+@example\.com$").is_ok());
+        assert!(validate_mapping_rule("email_regex", r".+@a\.com|.+@b\.com").is_ok());
         // Unbalanced group → compile failure → Err.
         assert!(validate_mapping_rule("email_regex", "(((").is_err());
         assert!(validate_mapping_rule("email_regex", "[a-").is_err());
+        // Compiles only once wrapped: it would match every address.
+        assert!(validate_mapping_rule("email_regex", "a)|(.*").is_err());
     }
 
     #[test]

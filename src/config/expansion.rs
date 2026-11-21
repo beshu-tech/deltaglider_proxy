@@ -49,9 +49,17 @@ pub fn expand_env_vars(input: &str) -> Result<String, ConfigError> {
 /// True if `s` is exactly one `${env:NAME}` / `${env:NAME:-default}`
 /// reference. Redactors keep such values: a reference is not a secret, and
 /// stripping it would break the IaC round-trip that
-/// [`Config::with_env_refs_reinserted`](super::Config::with_env_refs_reinserted) exists to enable.
+/// [`Config::with_file_text`](super::Config::with_file_text) exists to enable.
 pub fn is_env_ref(s: &str) -> bool {
     s.starts_with("${env:") && s.ends_with('}') && !s[2..s.len() - 1].contains('}')
+}
+
+/// True if `s` holds at least one unescaped `${env:NAME}` reference. After
+/// [`Config::with_file_text`](super::Config::with_file_text) that is exactly
+/// a string written as its template: redactors keep it (a reference is not a
+/// secret), and mask any other string.
+pub fn holds_env_ref(s: &str) -> bool {
+    s.contains("${env:") && super::env_template::Template::parse(s).is_ok_and(|t| t.has_refs())
 }
 
 /// [`expand_env_vars`] that additionally RECORDS which `${env:NAME}` refs
@@ -65,28 +73,72 @@ pub fn expand_env_vars_recording(input: &str) -> Result<(String, EnvRefs), Confi
     expand_env_with_recording(input, super::process_env)
 }
 
-/// Recorded `${env:…}` provenance: the value each ref resolved to (the map
-/// this derefs to, `name → value`), and the `:-default` each such ref was
-/// written with, so persist and export re-emit `${env:NAME:-default}` as
-/// written. One type, so every copy of the provenance carries both.
+/// Recorded `${env:…}` provenance of the config file: the value each reference
+/// resolved to (`name → value`) and the frozen set (`env_template::Frozen`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvRefs {
     values: std::collections::BTreeMap<String, String>,
-    /// `name → default` of the recorded refs written with `:-default`.
-    pub defaults: std::collections::BTreeMap<String, String>,
-    /// `name → path` in the config tree of a SHORT value (a region, a port):
-    /// such a value is re-emitted only there, and only while it is unchanged
-    /// (see [`super::Config::with_env_refs_reinserted`]).
-    pub paths: std::collections::BTreeMap<String, String>,
+    /// The paths that the config file gave to the environment, fixed for the
+    /// life of the process (but the routes of a migrate job, see
+    /// [`Self::drop_templates_under`]).
+    pub frozen: std::sync::Arc<super::env_template::Frozen>,
+    /// Templates that an admin request added through the allowlist, by path.
+    /// They are written back as references; they are not frozen.
+    pub templates: std::collections::BTreeMap<String, super::env_template::Template>,
+    /// The strings of the config that holds this are already file text (see
+    /// `Config::with_file_text`): a second pass leaves them as they are.
+    pub(crate) rendered: bool,
 }
 
 impl EnvRefs {
-    /// The ref as written: `${env:NAME}` or `${env:NAME:-default}`.
-    pub fn ref_text(&self, name: &str) -> String {
-        match self.defaults.get(name) {
-            Some(d) => format!("${{env:{name}:-{d}}}"),
-            None => format!("${{env:{name}}}"),
+    /// Add the values and the allowlist templates that `other` records; its
+    /// entries win. The frozen set of `self` stays: nothing adds to it.
+    pub fn merge(&mut self, other: EnvRefs) {
+        self.values.extend(other.values);
+        self.templates.extend(other.templates);
+    }
+
+    /// Declare a copy: every template at or under `from` is written again under `to`.
+    /// The copy is not frozen.
+    pub fn derive_templates(&mut self, from: &str, to: &str) {
+        let copies: Vec<(String, super::env_template::Template)> = self
+            .frozen
+            .templates
+            .iter()
+            .chain(self.templates.iter())
+            .filter_map(|(path, template)| {
+                let rest = path.strip_prefix(from)?;
+                (rest.is_empty() || rest.starts_with('/'))
+                    .then(|| (format!("{to}{rest}"), template.clone()))
+            })
+            .collect();
+        self.templates.extend(copies);
+    }
+
+    /// End every template at or under `prefix`, a frozen one too: the field
+    /// they stood for is gone (a `__dgmigrate_*` route that its job removed).
+    pub fn drop_templates_under(&mut self, prefix: &str) {
+        let under = |path: &str| {
+            path.strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        };
+        self.templates.retain(|path, _| !under(path));
+        if self.frozen.templates.keys().any(|p| under(p))
+            || self.frozen.destinations.iter().any(|p| under(p))
+        {
+            let frozen = std::sync::Arc::make_mut(&mut self.frozen);
+            frozen.templates.retain(|path, _| !under(path));
+            frozen.destinations.retain(|path| !under(path));
         }
+    }
+
+    /// The template that persist and export write at `path`: the frozen one,
+    /// else one that an admin request added.
+    pub fn template_at(&self, path: &str) -> Option<&super::env_template::Template> {
+        self.frozen
+            .templates
+            .get(path)
+            .or_else(|| self.templates.get(path))
     }
 }
 
@@ -134,95 +186,21 @@ impl Extend<(String, String)> for EnvRefs {
     }
 }
 
-/// Pure: `name → default` of the `${env:NAME:-default}` refs in `input`
-/// outside whole-line comments (`$$` is a literal `$`, not a ref). A name
-/// gets a default only when every ref to it carries that same default
-/// (review A3): one default per name went back at every site, so a secret
-/// written `${env:S}` next to `${env:S:-}` came back as `${env:S:-}` and
-/// loaded empty. With no default, every site stays fail-loud.
-fn ref_defaults(input: &str) -> std::collections::BTreeMap<String, String> {
-    let mut seen: std::collections::BTreeMap<String, Option<String>> =
-        std::collections::BTreeMap::new();
-    let mut conflict: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut line_start = 0;
-    for line in input.split_inclusive('\n') {
-        let this_start = line_start;
-        line_start += line.len();
-        if line.trim_start().starts_with('#') && !in_block_scalar(input, this_start) {
-            continue;
-        }
-        let mut rest = line;
-        while let Some(i) = rest.find('$') {
-            let after = &rest[i + 1..];
-            if let Some(a) = after.strip_prefix('$') {
-                rest = a;
-                continue;
-            }
-            let Some(spec) = after.strip_prefix("{env:") else {
-                rest = after;
-                continue;
-            };
-            let Some(close) = spec.find('}') else { break };
-            let (name, default) = match spec[..close].split_once(":-") {
-                Some((name, default)) => (name, Some(default.to_string())),
-                None => (&spec[..close], None),
-            };
-            match seen.get(name) {
-                Some(first) if *first != default => {
-                    conflict.insert(name.to_string());
-                }
-                Some(_) => {}
-                None => {
-                    seen.insert(name.to_string(), default);
-                }
-            }
-            rest = &spec[close + 1..];
-        }
-    }
-    seen.into_iter()
-        .filter(|(name, _)| !conflict.contains(name))
-        .filter_map(|(name, default)| Some((name, default?)))
-        .collect()
-}
-
-/// Expansion for documents that arrive over the ADMIN API (`/config/apply`,
-/// `/config/validate`, section PUTs). S7: such a document is attacker-shaped
-/// input from any admin session, so it must not read the server environment
-/// at large — `${env:AWS_SECRET_ACCESS_KEY}` in a field that echoes into an
-/// error or an export would hand the admin any env var of the process.
-///
-/// Rule: a ref resolves only from `known` — the `name → value` provenance
-/// the RUNNING config recorded when the file on disk was loaded. A name the
-/// file does not already use is treated as unset (its `:-default` applies,
-/// else a [`ConfigError::MissingEnvVar`]). To use a new env var, reference it
-/// in the file on disk (boot), or expand client-side (`config apply`).
-///
-/// Opt-in: `DGP_CONFIG_ENV_ALLOWLIST` names extra variables that admin input
-/// may resolve from the server env (see [`admin_env_lookup`]).
-pub fn expand_env_admin(
-    input: &str,
-    known: &std::collections::BTreeMap<String, String>,
-) -> Result<(String, EnvRefs), ConfigError> {
-    expand_env_with_recording(input, |name| admin_env_lookup(name, known))
-}
-
 /// The operator opt-in for extra env names that admin input may resolve.
 pub const CONFIG_ENV_ALLOWLIST_VAR: &str = "DGP_CONFIG_ENV_ALLOWLIST";
 
-/// THE env lookup for admin-sourced config (document apply/validate/import/
-/// restore and section PUTs): the running config's recorded provenance, else
-/// the server env for a name the operator allowlisted.
-pub fn admin_env_lookup(
-    name: &str,
-    known: &std::collections::BTreeMap<String, String>,
-) -> Option<String> {
-    if let Some(v) = known.get(name) {
-        return Some(v.clone());
-    }
-    let allowlist: String = super::env_parse(CONFIG_ENV_ALLOWLIST_VAR)?;
-    env_name_allowlisted(name, &allowlist)
-        .then(|| super::process_env(name))
-        .flatten()
+/// The server's value of an allowlisted name. The admin judge
+/// (`env_template::Admit`) calls it only for a name that
+/// [`admin_env_allowed`] admits, in a credential field.
+pub fn admin_env_lookup(name: &str) -> Option<String> {
+    super::process_env(name)
+}
+
+/// Is `name` on the operator's `DGP_CONFIG_ENV_ALLOWLIST`? The one place
+/// that reads the list; the request path passes the answer down.
+pub fn admin_env_allowed(name: &str) -> bool {
+    super::env_parse::<String>(CONFIG_ENV_ALLOWLIST_VAR)
+        .is_some_and(|list| env_name_allowlisted(name, &list))
 }
 
 /// Pure: does `allowlist` (comma-separated names; a trailing `*` matches a
@@ -276,7 +254,8 @@ pub fn escape_dollars(s: &str) -> String {
     s.replace('$', "$$")
 }
 
-/// Testable core of [`expand_env_vars_recording`].
+/// Testable core of [`expand_env_vars_recording`]: the values only; the
+/// templates come from [`super::env_template::record_templates`].
 pub(crate) fn expand_env_with_recording(
     input: &str,
     lookup: impl Fn(&str) -> Option<String>,
@@ -291,14 +270,11 @@ pub(crate) fn expand_env_with_recording(
         }
         v
     })?;
-    let mut defaults = ref_defaults(input);
-    defaults.retain(|name, _| used.contains_key(name));
     Ok((
         expanded,
         EnvRefs {
             values: used,
-            defaults,
-            paths: Default::default(),
+            ..Default::default()
         },
     ))
 }
@@ -307,9 +283,9 @@ pub(crate) fn expand_env_with_recording(
 /// value (`None` = unset).
 pub(crate) fn expand_env_with(
     input: &str,
-    lookup: impl FnMut(&str) -> Option<String>,
+    mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<String, ConfigError> {
-    expand_core(input, lookup, false)
+    expand_core(input, |name, _| lookup(name), false)
 }
 
 /// [`expand_env_with`] for a whole YAML DOCUMENT: a ref that is an entire
@@ -320,9 +296,57 @@ pub(crate) fn expand_env_with(
 /// typed load (`lenient::from_value`) gives the value the type of its field.
 pub(crate) fn expand_env_doc_with(
     input: &str,
-    lookup: impl FnMut(&str) -> Option<String>,
+    mut lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<String, ConfigError> {
-    expand_core(input, lookup, true)
+    expand_core(input, |name, _| lookup(name), true)
+}
+
+/// The start and end characters of a marked reference: two private-use
+/// characters that the text does not hold, chosen per text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Markers {
+    pub open: char,
+    pub close: char,
+}
+
+impl Markers {
+    /// The first two private-use characters that `text` does not hold.
+    pub(crate) fn choose(text: &str) -> Result<Self, ConfigError> {
+        let range = '\u{E000}'..='\u{F8FF}';
+        let used: std::collections::BTreeSet<char> =
+            text.chars().filter(|c| range.contains(c)).collect();
+        let mut free = range.filter(|c| !used.contains(c));
+        match (free.next(), free.next()) {
+            (Some(open), Some(close)) => Ok(Self { open, close }),
+            _ => Err(ConfigError::EnvRefRefused(
+                "the text uses every private-use character".to_string(),
+            )),
+        }
+    }
+}
+
+/// The `(name, default)` of one marked reference.
+pub(crate) type MarkedRef = (String, Option<String>);
+
+/// `input` with each reference replaced by a marker (`open`, its index, `close`),
+/// and the `(name, default)` of each; the marked text parses like the expanded one.
+pub(crate) fn mark_refs(input: &str) -> Result<(String, Vec<MarkedRef>, Markers), ConfigError> {
+    let markers = Markers::choose(input)?;
+    let mut refs: Vec<MarkedRef> = Vec::new();
+    let text = expand_core(
+        input,
+        |name, default| {
+            refs.push((name.to_string(), default.map(str::to_string)));
+            Some(format!(
+                "{}{}{}",
+                markers.open,
+                refs.len() - 1,
+                markers.close
+            ))
+        },
+        true,
+    )?;
+    Ok((text, refs, markers))
 }
 
 /// Pure: where a ref starting at byte `start` (its `$`) and ending at byte
@@ -514,7 +538,7 @@ fn yaml_double_quoted(value: &str) -> String {
 
 fn expand_core(
     input: &str,
-    mut lookup: impl FnMut(&str) -> Option<String>,
+    mut lookup: impl FnMut(&str, Option<&str>) -> Option<String>,
     doc: bool,
 ) -> Result<String, ConfigError> {
     let bytes = input.as_bytes();
@@ -591,7 +615,7 @@ fn expand_core(
                         }
                         // Resolve to the env value (non-empty), else the default,
                         // else error. set-but-empty falls through to the default.
-                        let resolved: String = match lookup(name) {
+                        let resolved: String = match lookup(name, default) {
                             Some(v) if !v.is_empty() => v,
                             _ => match default {
                                 Some(d) => d.to_string(),
@@ -640,7 +664,7 @@ fn expand_core(
     Ok(out)
 }
 
-fn is_valid_env_name(name: &str) -> bool {
+pub(super) fn is_valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -652,7 +676,7 @@ fn is_valid_env_name(name: &str) -> bool {
 /// True if `s` contains a character that, spliced as raw pre-parse text into a
 /// YAML scalar, could break or restructure the document: any control char
 /// EXCEPT tab (newlines, NUL, etc.). Tab is allowed (legitimate in some values).
-fn has_unsafe_control_char(s: &str) -> bool {
+pub(super) fn has_unsafe_control_char(s: &str) -> bool {
     s.chars().any(|c| c.is_control() && c != '\t')
 }
 
@@ -688,12 +712,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn admin_expansion_ignores_process_env() {
-        let known = std::collections::BTreeMap::new();
-        assert!(expand_env_admin("${env:HOME}", &known).is_err());
-        assert_eq!(expand_env_admin("${env:HOME:-d}", &known).unwrap().0, "d");
-    }
     use super::*;
 
     /// B035: only a ref that IS the whole node (block plain scalar, quoted

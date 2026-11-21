@@ -92,7 +92,7 @@ Before production, decide each of these from your workload, not the defaults:
 | Lever | Env var | Default | Size it from |
 |---|---|---|---|
 | Codec concurrency | `DGP_CODEC_CONCURRENCY` | num_cpus × 4 (min 16) | Peak concurrent delta ops |
-| Max object size | `DGP_MAX_OBJECT_SIZE` | `auto` (half of the spool budget) | Largest object that clients upload (bigger uploads are refused with `400 EntityTooLarge`) |
+| Max object size | `DGP_MAX_OBJECT_SIZE` | `auto` (37.5 % of the spool budget) | Largest object that clients upload (bigger uploads are refused with `400 EntityTooLarge`) |
 | Spool threshold | `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB | Upload bodies and delta objects above it use spool disk instead of RAM |
 | Upload memory budget | `DGP_INGEST_MEMORY_MAX_BYTES` | 1 GiB | RAM for upload bodies of at most the spool threshold; a body that does not fit goes to the spool |
 | Spool budget | `DGP_SPOOL_MAX_BYTES` | `auto` (50% of the free space of the spool directory at start; 25% on a device shared with backend data) | Concurrent uploads above the spool threshold, large delta operations and multipart uploads. A request that finds no free spool space gets `503 SlowDown` |

@@ -960,6 +960,15 @@ pub fn count_5xx(metrics_text: &str) -> u64 {
         .sum()
 }
 
+/// Pure: the 5xx request count of a scrape, `503 SlowDown` left out.
+pub fn count_5xx_except_503(metrics_text: &str) -> u64 {
+    fault_lines(metrics_text)
+        .filter(|l| !l.contains("status=\"503\""))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+        .map(|v| v as u64)
+        .sum()
+}
+
 /// The request-counter lines of 5xx faults. `501 NotImplemented` is the
 /// proxy's deliberate answer to an S3 feature it does not offer, not a fault.
 fn fault_lines(metrics_text: &str) -> impl Iterator<Item = &str> {
@@ -987,7 +996,8 @@ fn scrape_metrics(port: u16) -> Option<String> {
 
 /// Tests that declared deliberate 5xx answers, by test thread name (libtest
 /// names the thread after the test).
-static DECLARED_SERVER_ERRORS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static DECLARED_SERVER_ERRORS: std::sync::Mutex<Vec<(String, bool)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Declare that the CALLING TEST makes its servers answer 5xx on purpose (a
 /// failing backend, a closed write gate, a refused read). Call it first in the
@@ -999,7 +1009,19 @@ pub fn expect_server_errors(why: &str) {
         .name()
         .map(str::to_string)
         .expect("expect_server_errors runs on the test thread");
-    DECLARED_SERVER_ERRORS.lock().unwrap().push(name);
+    DECLARED_SERVER_ERRORS.lock().unwrap().push((name, false));
+}
+
+/// [`expect_server_errors`] for a test that provokes only `503 SlowDown` (a
+/// refused share, a closed gate): a 500, 502 or 504 still fails the test, so
+/// a crash in the refused path cannot hide behind the declaration.
+pub fn expect_throttling_only(why: &str) {
+    assert!(!why.trim().is_empty(), "say why the server may answer 503");
+    let name = std::thread::current()
+        .name()
+        .map(str::to_string)
+        .expect("expect_throttling_only runs on the test thread");
+    DECLARED_SERVER_ERRORS.lock().unwrap().push((name, true));
 }
 
 impl TestServer {
@@ -1007,18 +1029,25 @@ impl TestServer {
     /// declare it. Skipped for a TLS listener (the scrape is plain HTTP) and
     /// when the metrics endpoint is not reachable.
     fn assert_no_server_errors(&self) {
-        let declared = self.test_name.as_ref().is_some_and(|n| {
+        // `None`: nothing declared; `Some(false)`: any 5xx; `Some(true)`: 503 only.
+        let declared = self.test_name.as_ref().and_then(|n| {
             DECLARED_SERVER_ERRORS
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|d| d == n)
+                .filter(|(d, _)| d == n)
+                .map(|(_, throttle_only)| *throttle_only)
+                .reduce(|a, b| a && b)
         });
-        if self.tls || declared {
+        if self.tls || declared == Some(false) {
             return;
         }
         if let Some(text) = scrape_metrics(self.port) {
-            let n = count_5xx(&text);
+            let n = if declared == Some(true) {
+                count_5xx_except_503(&text)
+            } else {
+                count_5xx(&text)
+            };
             assert!(
                 n == 0,
                 "the proxy answered {n} request(s) with a 5xx during this test; fix the cause, \
@@ -1265,6 +1294,8 @@ mod flag_tests {
         // 501 NotImplemented is an answer, not a fault.
         assert_eq!(super::count_5xx(text), 3);
         assert_eq!(super::count_5xx(""), 0);
+        // A test that declared only throttling still fails on a 500.
+        assert_eq!(super::count_5xx_except_503(text), 1);
     }
 
     #[test]

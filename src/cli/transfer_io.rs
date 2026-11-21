@@ -121,7 +121,9 @@ async fn store_spooled(
     user_metadata: HashMap<String, String>,
     hashes: Option<crate::deltaglider::ingest::BodyHashes>,
 ) -> Result<StoreResult, TransferError> {
-    let lock = engine.lock_object_write(bucket, key).await;
+    let lock = engine
+        .lock_object_write(bucket, key, crate::types::WriteOrigin::Client)
+        .await;
     engine
         .store_spooled_delta(
             &lock,
@@ -256,7 +258,7 @@ pub(crate) async fn copy_object(
         .retrieve_stream(src_bucket, src_key)
         .await
         .map_err(TransferError::Source)?;
-    let (stream, metadata) = match resp {
+    let (stream, metadata, stream_held) = match resp {
         RetrieveResponse::Buffered { data, metadata, .. } => {
             let (ct, meta) = dest_attrs(&metadata);
             return dst
@@ -265,8 +267,11 @@ pub(crate) async fn copy_object(
                 .map_err(TransferError::Dest);
         }
         RetrieveResponse::Streamed {
-            stream, metadata, ..
-        } => (stream, metadata),
+            stream,
+            metadata,
+            held_spool,
+            ..
+        } => (stream, metadata, held_spool),
     };
     let size = metadata.file_size;
     let (ct, meta) = dest_attrs(&metadata);
@@ -278,7 +283,7 @@ pub(crate) async fn copy_object(
     // `sync`), the copy holds that budget and never waits for more.
     use crate::deltaglider::ingest::{self, IngestError};
     let held_spool = if std::ptr::eq(src, dst) {
-        src.stream_held_spool(&metadata)
+        stream_held
     } else {
         HeldSpool::NOTHING
     };
@@ -326,7 +331,9 @@ async fn store_ingested(
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
 ) -> Result<StoreResult, TransferError> {
-    let lock = engine.lock_object_write(bucket, key).await;
+    let lock = engine
+        .lock_object_write(bucket, key, crate::types::WriteOrigin::Client)
+        .await;
     crate::transfer::inline_commit(|ticket| async move {
         engine
             .store_ingested(

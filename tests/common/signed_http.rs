@@ -161,6 +161,33 @@ pub fn sign_raw(method: Method, url: &str, key: &str, secret: &str) -> Vec<(Stri
         .collect()
 }
 
+/// [`sign_raw`] for a request that also carries `extra` headers (they are
+/// signed, and returned with the signature headers), for a raw-socket test.
+pub fn sign_raw_with(
+    method: Method,
+    url: &str,
+    key: &str,
+    secret: &str,
+    extra: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let mut builder = reqwest::Client::new()
+        .request(method, url)
+        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+    for (k, v) in extra {
+        builder = builder.header(*k, *v);
+    }
+    let mut request = builder.build().expect("request");
+    sign_in_place(&mut request, key, secret);
+    ["authorization", "x-amz-date", "x-amz-content-sha256"]
+        .iter()
+        .map(|n| {
+            let v = request.headers().get(*n).expect("signed header");
+            (n.to_string(), v.to_str().unwrap().to_string())
+        })
+        .chain(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        .collect()
+}
+
 fn sign_in_place(request: &mut reqwest::Request, key: &str, secret: &str) {
     let presigned = request
         .url()

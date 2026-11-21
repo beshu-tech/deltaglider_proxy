@@ -153,51 +153,54 @@ fn chunked_headers(
 /// A small body is read into memory, within the threshold.
 #[tokio::test]
 async fn a_put_three_times_the_threshold_is_spooled_and_stored() {
-    let rig = Rig::new().await;
-    let data = body(3 * THRESHOLD);
-    let etag = rig
-        .put(put_req(
-            "a/photo.jpg",
+    crate::deltaglider::spool::as_background(async {
+        let rig = Rig::new().await;
+        let data = body(3 * THRESHOLD);
+        let etag = rig
+            .put(put_req(
+                "a/photo.jpg",
+                chunks(&data),
+                &len_header(data.len()),
+                Some(md5_b64(&data)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(etag, hex::encode(md5::Md5::digest(&data)));
+        assert_eq!(rig.bodies("spool", "over_threshold"), 1);
+        assert_eq!(rig.engine().memory_budget().peak_bytes(), 0);
+        rig.assert_restored("after a spooled passthrough");
+        // (A GET may keep a cached spool file of its own.)
+        assert_eq!(rig.stored("a/photo.jpg").await.unwrap(), data);
+
+        // A delta-eligible key takes the same spooled store (its body becomes
+        // the folder's cached reference file, so the spool is not checked).
+        rig.put(put_req(
+            "a/app.zip",
             chunks(&data),
             &len_header(data.len()),
-            Some(md5_b64(&data)),
+            None,
         ))
         .await
         .unwrap();
-    assert_eq!(etag, hex::encode(md5::Md5::digest(&data)));
-    assert_eq!(rig.bodies("spool", "over_threshold"), 1);
-    assert_eq!(rig.engine().memory_budget().peak_bytes(), 0);
-    rig.assert_restored("after a spooled passthrough");
-    // (A GET may keep a cached spool file of its own.)
-    assert_eq!(rig.stored("a/photo.jpg").await.unwrap(), data);
+        assert_eq!(rig.stored("a/app.zip").await.unwrap(), data);
+        assert_eq!(rig.bodies("spool", "over_threshold"), 2);
 
-    // A delta-eligible key takes the same spooled store (its body becomes
-    // the folder's cached reference file, so the spool is not checked).
-    rig.put(put_req(
-        "a/app.zip",
-        chunks(&data),
-        &len_header(data.len()),
-        None,
-    ))
+        let small = body(200 * KIB);
+        rig.put(put_req(
+            "a/small.jpg",
+            chunks(&small),
+            &len_header(small.len()),
+            None,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(rig.stored("a/small.jpg").await.unwrap(), small);
+        assert_eq!(rig.bodies("memory", "under_threshold"), 1);
+        let peak = rig.engine().memory_budget().peak_bytes();
+        assert!(peak > 0 && peak <= THRESHOLD as u64, "RAM peak {peak}");
+        assert_eq!(rig.engine().memory_budget().held_bytes(), 0);
+    })
     .await
-    .unwrap();
-    assert_eq!(rig.stored("a/app.zip").await.unwrap(), data);
-    assert_eq!(rig.bodies("spool", "over_threshold"), 2);
-
-    let small = body(200 * KIB);
-    rig.put(put_req(
-        "a/small.jpg",
-        chunks(&small),
-        &len_header(small.len()),
-        None,
-    ))
-    .await
-    .unwrap();
-    assert_eq!(rig.stored("a/small.jpg").await.unwrap(), small);
-    assert_eq!(rig.bodies("memory", "under_threshold"), 1);
-    let peak = rig.engine().memory_budget().peak_bytes();
-    assert!(peak > 0 && peak <= THRESHOLD as u64, "RAM peak {peak}");
-    assert_eq!(rig.engine().memory_budget().held_bytes(), 0);
 }
 
 /// A trailer checksum is checked as the framed body streams: announced
@@ -756,43 +759,113 @@ async fn an_upload_part_copy_of_a_large_source_becomes_a_relay_file() {
 /// other.
 #[tokio::test]
 async fn a_copy_source_that_holds_its_spool_never_waits_for_the_destination() {
-    use crate::storage::StorageBackendExt as _;
-    use sha2::Digest as _;
-    let rig = Rig::new().await;
-    // 9 MiB: the source spool and the destination do not fit 16 MiB.
-    let data = body(9 * MIB);
-    let meta = crate::types::FileMetadata::new_reference(
-        "a.zip".into(),
-        "a.zip".into(),
-        hex::encode(sha2::Sha256::digest(&data)),
-        hex::encode(md5::Md5::digest(&data)),
-        data.len() as u64,
-        None,
-    );
-    let engine = rig.engine();
-    let storage = engine.storage();
-    storage
-        .put_reference(
-            "b",
-            "rel",
-            Bytes::copy_from_slice(&data),
-            &meta,
-            crate::deltaglider::RefWriteProof::for_tests(),
+    crate::deltaglider::spool::as_background(async {
+        use crate::storage::StorageBackendExt as _;
+        use sha2::Digest as _;
+        let rig = Rig::new().await;
+        // 9 MiB: the source spool and the destination do not fit 16 MiB.
+        let data = body(9 * MIB);
+        let meta = crate::types::FileMetadata::new_reference(
+            "a.zip".into(),
+            "a.zip".into(),
+            hex::encode(sha2::Sha256::digest(&data)),
+            hex::encode(md5::Md5::digest(&data)),
+            data.len() as u64,
+            None,
+        );
+        let engine = rig.engine();
+        let storage = engine.storage();
+        storage
+            .put_reference(
+                "b",
+                "rel",
+                Bytes::copy_from_slice(&data),
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put_passthrough("b", "rel", "a.zip", Bytes::copy_from_slice(&data), &meta)
+            .await
+            .unwrap();
+        let err = copy::read_copy_source(&engine, "b", "rel/a.zip", "b", data.len() as u64)
+            .await
+            .expect_err("source and destination do not fit the spool");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge, "{err:?}");
+        assert!(
+            err.message()
+                .unwrap_or_default()
+                .contains("DGP_SPOOL_MAX_BYTES"),
+            "{err:?}"
+        );
+    })
+    .await
+}
+
+/// An UploadPartCopy range of a source that streams from a spool file (a
+/// reference object above the threshold) holds that file while the part is
+/// ingested, so the ingest never waits for more: a part that does not fit
+/// beside the source is EntityTooLarge at once. Before, the held budget was
+/// dropped and the part waited for the acquire timeout while it held the
+/// source file (hold-and-wait).
+#[tokio::test]
+async fn a_part_copy_that_holds_its_source_spool_never_waits_for_its_own() {
+    crate::deltaglider::spool::as_background(async {
+        use crate::storage::StorageBackendExt as _;
+        use sha2::Digest as _;
+        let rig = Rig::new().await;
+        let data = body(11 * MIB);
+        let meta = crate::types::FileMetadata::new_reference(
+            "a.zip".into(),
+            "a.zip".into(),
+            hex::encode(sha2::Sha256::digest(&data)),
+            hex::encode(md5::Md5::digest(&data)),
+            data.len() as u64,
+            None,
+        );
+        let engine = rig.engine();
+        let storage = engine.storage();
+        storage
+            .put_reference(
+                "b",
+                "rel",
+                Bytes::copy_from_slice(&data),
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+        storage
+            .put_passthrough("b", "rel", "a.zip", Bytes::copy_from_slice(&data), &meta)
+            .await
+            .unwrap();
+        let id = rig.create_upload("m/part.bin");
+        // 11 MiB of source file and a 6 MiB part do not fit 16 MiB.
+        let input = s3s::dto::UploadPartCopyInput::builder()
+            .bucket("b".into())
+            .key("m/part.bin".into())
+            .upload_id(id)
+            .part_number(1)
+            .copy_source(s3s::dto::CopySource::Bucket {
+                bucket: "b".into(),
+                key: "rel/a.zip".into(),
+                version_id: None,
+            })
+            .copy_source_range(Some(format!("bytes=0-{}", 6 * MIB - 1)))
+            .build()
+            .unwrap();
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            copy::upload_part_copy(
+                &rig.svc,
+                super::multipart::adapter_test_support::request(input),
+            ),
         )
         .await
-        .unwrap();
-    storage
-        .put_passthrough("b", "rel", "a.zip", Bytes::copy_from_slice(&data), &meta)
-        .await
-        .unwrap();
-    let err = copy::read_copy_source(&engine, "b", "rel/a.zip", "b", data.len() as u64)
-        .await
-        .expect_err("source and destination do not fit the spool");
-    assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge, "{err:?}");
-    assert!(
-        err.message()
-            .unwrap_or_default()
-            .contains("DGP_SPOOL_MAX_BYTES"),
-        "{err:?}"
-    );
+        .expect("the part waited for spool budget while it held its source file");
+        let err = answered.expect_err("source file and part do not fit the spool");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::EntityTooLarge, "{err:?}");
+    })
+    .await
 }

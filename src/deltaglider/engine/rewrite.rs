@@ -142,7 +142,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
         let name = obj_key.filename.clone();
         test_stall(RewriteStall::BeforeLock, key).await;
-        let lock = self.lock_object_write(bucket, key).await;
+        let lock = self
+            .lock_object_write(bucket, key, crate::types::WriteOrigin::Job)
+            .await;
         let out = match form {
             ObjectVariant::Passthrough => {
                 let at = (bucket, deltaspace_id.as_str(), name.as_str());
@@ -171,6 +173,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         version: &str,
         unconditional: Unconditional,
     ) -> Result<Rewritten, EngineError> {
+        self.gate_rewrite(lock)?;
         lock.covers(bucket, deltaspace_id, name)?;
         let size = read.file_size;
         // Large: the body goes through a spool file (bounded memory).
@@ -313,6 +316,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         version: &str,
         unconditional: Unconditional,
     ) -> Result<Rewritten, EngineError> {
+        self.gate_rewrite(lock)?;
         lock.covers(bucket, deltaspace_id, name)?;
         let held = self
             .held_reference_lock(bucket, deltaspace_id, "delta")

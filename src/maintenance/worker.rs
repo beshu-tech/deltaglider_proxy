@@ -261,7 +261,7 @@ async fn run_lane(
                             deletes.clone(),
                             instance_id.clone(),
                         );
-                        tokio::spawn(async move {
+                        tokio::spawn(crate::deltaglider::spool::as_background(async move {
                             let holder = Holder {
                                 id: &id,
                                 lease,
@@ -271,7 +271,7 @@ async fn run_lane(
                             };
                             run_job(&mutator, &config, &db, &state, holder, job).await;
                             drop(slot);
-                        });
+                        }));
                     }
                     Ok(None) => break (lease, next_due),
                     Err(e) => {

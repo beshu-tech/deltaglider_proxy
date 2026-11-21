@@ -13,7 +13,7 @@ fn review3_relay_parts_past_the_budget_are_not_written_for_free() {
     let dir = tempfile::tempdir().unwrap();
     // 16 MiB budget: one upload may hold 4 MiB of it.
     let spool = SpoolDir::new(dir.path().join("spool"), 16 << 20).unwrap();
-    let store = MultipartStore::new(64 << 20)
+    let store = super::tests::unshared(64 << 20)
         .with_spool(spool.clone())
         .with_relay_upload_max(Some(4 << 20));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
@@ -61,7 +61,7 @@ fn no_per_upload_cap_leaves_only_the_global_budget() {
     let store = MultipartStore {
         // Only the spool budget: no global part cap either.
         max_total_configured: Some(u64::MAX),
-        ..MultipartStore::new(64 << 20)
+        ..super::tests::unshared(64 << 20)
             .with_spool(spool.clone())
             .with_relay_upload_max(Some(0))
     };
@@ -82,7 +82,7 @@ fn no_per_upload_cap_leaves_only_the_global_budget() {
 fn a_live_processs_relay_root_is_never_swept() {
     let dir = tempfile::tempdir().unwrap();
     let spool = SpoolDir::new(dir.path().join("spool"), 8 << 20).unwrap();
-    let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+    let store = super::tests::unshared(64 << 20).with_spool(spool.clone());
     let parent = spool.dir().join(RELAY_ROOT_DIR);
     let mut live = std::process::Command::new("sleep")
         .arg("60")

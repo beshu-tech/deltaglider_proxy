@@ -41,6 +41,8 @@ export interface ImportBackupResult {
   /** Policy rules kept with a condition the proxy cannot evaluate (contained: an
    *  Allow grants nothing, a Deny applies without its condition). Absent when none. */
   contained_rules?: string[];
+  /** Set when the restore kept the running bootstrap password although the backup holds another one: the reason. */
+  bootstrap_password?: string;
 }
 
 export type ImportBackupMode = 'full' | 'preserve-bootstrap' | 'iam-only' | 'config-only';

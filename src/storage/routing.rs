@@ -1511,6 +1511,15 @@ impl StorageBackend for RoutingBackend {
             .unwrap_or(false)
     }
 
+    fn new_key_refusal(&self, bucket: &str, prefix: &str, filename: &str) -> Option<String> {
+        // An unknown home: the default backend's rule, as the multipart label does.
+        self.backend_hint(bucket, |b, real| b.new_key_refusal(real, prefix, filename))
+            .unwrap_or_else(|| {
+                self.default_backend()
+                    .new_key_refusal(bucket, prefix, filename)
+            })
+    }
+
     fn storage_identity(&self, bucket: &str) -> String {
         match self.routes.get(bucket) {
             Some(route) => route_identity(bucket, route),
@@ -1603,6 +1612,15 @@ impl StorageBackend for RoutingBackend {
         scope: &str,
     ) -> Result<Vec<String>, StorageError> {
         route_existing!(self, bucket, list_reference_prefixes, scope)
+    }
+
+    async fn list_reference_prefix_stream(
+        &self,
+        bucket: &str,
+        scope: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<String, StorageError>>, StorageError>
+    {
+        route_existing!(self, bucket, list_reference_prefix_stream, scope)
     }
 
     /// When bucket is None, sum total_size across all backends.

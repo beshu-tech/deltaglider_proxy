@@ -72,49 +72,31 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         Ok(self.storage.head_bucket(bucket).await?)
     }
 
-    /// Issue #120: a sample of `bucket` (the first `sample` objects that a
-    /// listing gives, one HEAD each): the first object that the read rule
-    /// refuses because it is not encrypted, and whether any sampled object
-    /// is encrypted. The boot starts the conversion of a bucket that a
-    /// restart made encrypt only when the sample holds plaintext and no
-    /// encrypted object (`maintenance::conversion::start_at_boot`).
-    pub async fn plaintext_sample(
-        &self,
-        bucket: &str,
-        sample: u32,
-    ) -> Result<PlaintextSample, EngineError> {
-        let page = self
-            .list_objects(bucket, "", None, sample, None, false)
-            .await?;
-        let mut out = PlaintextSample::default();
-        for (key, _) in page.objects {
-            if key.ends_with('/') || crate::coordination::cas_probe::is_probe_key(&key) {
-                continue;
-            }
-            match self.head(bucket, &key).await {
-                Ok(meta) => {
-                    out.encrypted |= meta
-                        .user_metadata
-                        .contains_key(crate::storage::encrypting::ENCRYPTION_MARKER_KEY);
-                }
-                Err(EngineError::Storage(e))
-                    if crate::storage::encrypting::seal::is_plaintext_refusal(&e) =>
-                {
-                    out.first_refused.get_or_insert(key);
-                }
-                Err(_) => {}
-            }
+    /// Write the node's record that this proxy encrypts `bucket`, after proof (`why`).
+    /// Never fails: a failed write is logged and the next proof retries it.
+    pub async fn note_encrypts(&self, bucket: &str, why: &'static str) {
+        use crate::storage::encrypting::conversion::ConversionOp;
+        if let Err(e) = self
+            .storage
+            .conversion(bucket, ConversionOp::NoteEncrypts { why })
+            .await
+        {
+            tracing::warn!("encryption: the record that '{bucket}' encrypts was not noted: {e}");
         }
-        Ok(out)
     }
-}
 
-/// What [`DeltaGliderEngine::plaintext_sample`](super::DeltaGliderEngine::plaintext_sample) found.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct PlaintextSample {
-    /// The first sampled object that a client cannot read because it is
-    /// not encrypted.
-    pub first_refused: Option<String>,
-    /// A sampled object is encrypted (presented with `dg-encrypted`).
-    pub encrypted: bool,
+    /// Does the node's own record (jobs DB, out of a storage writer's reach) say this
+    /// proxy encrypted `bucket`? `Err`: it could not answer; never read it as "no".
+    pub async fn encrypts_recorded(&self, bucket: &str) -> Result<bool, String> {
+        use crate::storage::encrypting::conversion::{ConversionOp, ConversionReply};
+        match self
+            .storage
+            .conversion(bucket, ConversionOp::Encrypts)
+            .await
+        {
+            Ok(ConversionReply::Encrypts(answer)) => answer,
+            Ok(other) => Err(format!("the backend answered {other:?}, not the record")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }

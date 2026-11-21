@@ -24,7 +24,6 @@ use futures::Stream;
 use futures::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
@@ -359,14 +358,28 @@ impl s3s::S3 for DeltaGliderS3Service {
     }
 }
 
+/// A response body: the engine's stream behind a `Sync` wrapper that also
+/// ends a body whose client stopped reading ([`crate::deltaglider::stall_guard`]).
 struct SyncStorageStream {
-    inner: Mutex<BoxStream<'static, Result<bytes::Bytes, StorageError>>>,
+    inner: crate::deltaglider::stall_guard::StallGuard,
 }
 
 impl SyncStorageStream {
-    fn new(inner: BoxStream<'static, Result<bytes::Bytes, StorageError>>) -> Self {
+    /// The body of a GET. A stream that holds spool space (`held_spool`, from
+    /// the response the engine returned) ends, and gives the space back,
+    /// when the client accepts under 64 KiB in `DGP_RESPONSE_STALL_SECS`.
+    fn for_response(
+        engine: &crate::deltaglider::DynEngine,
+        held_spool: crate::deltaglider::spool::HeldSpool,
+        stream: BoxStream<'static, Result<bytes::Bytes, StorageError>>,
+    ) -> Self {
+        let policy = crate::deltaglider::stall_guard::StallPolicy::for_body(
+            held_spool,
+            engine.tuning().response_stall_secs,
+            engine.tuning().response_max_hold_secs,
+        );
         Self {
-            inner: Mutex::new(inner),
+            inner: crate::deltaglider::stall_guard::StallGuard::new(stream, policy),
         }
     }
 }
@@ -375,8 +388,7 @@ impl Stream for SyncStorageStream {
     type Item = Result<bytes::Bytes, s3s::StdError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut guard = self.inner.lock().expect("stream mutex poisoned");
-        Pin::new(&mut *guard)
+        Pin::new(&mut self.get_mut().inner)
             .poll_next(cx)
             .map_err(|e| Box::new(e) as s3s::StdError)
     }
@@ -425,6 +437,27 @@ async fn no_such_key_or_bucket(
 /// so production code cannot call it.
 fn request_policy_context(ext: &axum::http::Extensions) -> iam_rs::Context {
     policy_context_for_ip(ext.get::<crate::api::auth::RequestClientIp>().map(|c| c.0))
+}
+
+/// The S3 error of a resource that an admission block refuses: the
+/// request-line answer (`deny` = 403, `reject` = the operator's status and
+/// message) for that resource.
+pub(crate) fn refusal_error(refusal: &crate::admission::Refusal) -> s3s::S3Error {
+    crate::api::S3Error::from(refusal).into()
+}
+
+/// Is `bucket/key`, a resource this request reads, writes or deletes beyond
+/// its request line, refused by an admission `deny` / `reject` block? THE
+/// check every such point asks (copy source, batch-delete key, form POST
+/// key). `effect` is what the request does to the resource.
+pub(crate) fn admission_refusal(
+    ext: &axum::http::Extensions,
+    effect: crate::admission::Effect,
+    bucket: &str,
+    key: &str,
+) -> Option<crate::admission::Refusal> {
+    ext.get::<crate::admission::ResourceRules>()?
+        .refusal(effect, bucket, key)
 }
 
 fn policy_context_for_ip(client_ip: Option<std::net::IpAddr>) -> iam_rs::Context {
@@ -564,6 +597,7 @@ impl Reader {
     pub(crate) fn for_object(ext: &axum::http::Extensions, bucket: &str, key: &str) -> Self {
         Self::of(ext).narrow(
             crate::iam::request_principal(ext).map(|u| u.as_ref()),
+            ext.get::<crate::admission::ResourceRules>(),
             bucket,
             key,
         )
@@ -572,23 +606,34 @@ impl Reader {
     /// [`Self::for_object`] for a form POST, which has no request extensions.
     pub(crate) fn for_form_writer(
         user: Option<&AuthenticatedUser>,
+        rules: Option<&crate::admission::ResourceRules>,
         bucket: &str,
         key: &str,
     ) -> Self {
-        Self::of_principal(user).narrow(user, bucket, key)
+        Self::of_principal(user).narrow(user, rules, bucket, key)
     }
 
     /// `self`, or [`Self::OutsideFolder`] when `user` may not read the whole
-    /// folder of `key`. Open access (no principal) keeps every fact.
-    pub(crate) fn narrow(self, user: Option<&AuthenticatedUser>, bucket: &str, key: &str) -> Self {
-        match user {
-            Some(u)
-                if self == Self::Authenticated
-                    && !u.can_read_whole_prefix(bucket, folder_of(key)) =>
-            {
-                Self::OutsideFolder
-            }
-            _ => self,
+    /// folder of `key`, or when an admission rule may refuse a key directly in
+    /// that folder: the facts of `key` would tell something about that key.
+    /// Open access (no principal) with no such rule keeps every fact.
+    pub(crate) fn narrow(
+        self,
+        user: Option<&AuthenticatedUser>,
+        rules: Option<&crate::admission::ResourceRules>,
+        bucket: &str,
+        key: &str,
+    ) -> Self {
+        if self != Self::Authenticated {
+            return self;
+        }
+        let folder = folder_of(key);
+        let by_policy = user.is_some_and(|u| !u.can_read_whole_prefix(bucket, folder));
+        let by_rules = rules.is_some_and(|r| r.in_bucket(bucket).may_refuse_in_folder(folder));
+        if by_policy || by_rules {
+            Self::OutsideFolder
+        } else {
+            self
         }
     }
 }

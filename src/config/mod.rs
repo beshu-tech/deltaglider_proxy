@@ -17,8 +17,10 @@ pub(crate) use keys::*;
 mod check;
 pub use check::{DocumentRefusal, RuleGateRefusal};
 mod env;
+pub(crate) mod env_mask;
 pub mod env_overrides;
 pub mod env_shadow;
+pub(crate) mod env_template;
 mod expansion;
 pub(crate) mod lenient;
 pub mod limits;
@@ -603,7 +605,7 @@ impl BackendEncryptionConfig {
         // `${env:NAME}` references survive redaction — a reference is not a
         // secret, and stripping it would break the env-ref round-trip.
         fn clear_unless_ref(slot: &mut Option<String>) {
-            if !slot.as_deref().is_some_and(is_env_ref) {
+            if !slot.as_deref().is_some_and(holds_env_ref) {
                 *slot = None;
             }
         }
@@ -1314,65 +1316,6 @@ pub fn unknown_flat_root_keys(doc: &serde_yaml::Value) -> Vec<String> {
         .collect()
 }
 
-/// Shortest env value treated as a secret when it occurs in several fields
-/// (see [`Config::with_env_refs_reinserted`]). 16: a region (`us-east-1`) or
-/// a host name shared by two fields is not a secret.
-const SHARED_REF_MIN_LEN: usize = 16;
-
-/// The label of a sequence item in an env-ref path: its `name` when it is a
-/// mapping with one (a backend, a user, a rule: stable when the list is
-/// reordered), else its index.
-fn push_seq_label(label: &mut String, index: usize, item: &serde_yaml::Value) {
-    match item.get("name").and_then(serde_yaml::Value::as_str) {
-        Some(name) => {
-            label.push_str("/[");
-            label.push_str(name);
-            label.push(']');
-        }
-        None => {
-            label.push_str("/#");
-            label.push_str(&index.to_string());
-        }
-    }
-}
-
-fn push_key_label(label: &mut String, key: &serde_yaml::Value) {
-    label.push('/');
-    match key.as_str() {
-        Some(k) => label.push_str(k),
-        None => label.push_str(&serde_yaml::to_string(key).unwrap_or_default()),
-    }
-}
-
-/// Every path (see [`push_seq_label`]) of a String scalar equal to `value`.
-fn env_ref_value_paths(
-    v: &serde_yaml::Value,
-    value: &str,
-    label: &mut String,
-    out: &mut Vec<String>,
-) {
-    match v {
-        serde_yaml::Value::String(s) if s == value => out.push(label.clone()),
-        serde_yaml::Value::Sequence(seq) => {
-            for (i, item) in seq.iter().enumerate() {
-                let len = label.len();
-                push_seq_label(label, i, item);
-                env_ref_value_paths(item, value, label, out);
-                label.truncate(len);
-            }
-        }
-        serde_yaml::Value::Mapping(map) => {
-            for (key, item) in map {
-                let len = label.len();
-                push_key_label(label, key);
-                env_ref_value_paths(item, value, label, out);
-                label.truncate(len);
-            }
-        }
-        _ => {}
-    }
-}
-
 impl Config {
     /// Load configuration from a file. YAML is the only supported format;
     /// a `.toml` path fails loudly with [`TOML_REMOVED_MSG`] (operators
@@ -1406,10 +1349,18 @@ impl Config {
         // file from disk is unambiguously "render against my environment"; the
         // admin `config apply` path parses a doc body via `from_yaml_str` and is
         // deliberately NOT expanded (it would resolve against the server's env).
-        let (content, env_refs) = expand_env_vars_recording(&content)?;
-        let mut cfg = Self::from_yaml_str(&content)?;
+        Self::from_template_with(&content, &process_env)
+    }
+
+    /// The load of a config file's text, with an injected environment: the
+    /// text is expanded and parsed, and the config records the value of each
+    /// reference and the template of each string that holds one (by path).
+    pub(crate) fn from_template_with(text: &str, env: EnvLookup) -> Result<Self, ConfigError> {
+        let (expanded, mut env_refs) = expansion::expand_env_with_recording(text, env)?;
+        let mut cfg = Self::from_yaml_str(&expanded)?;
+        let tree = serde_yaml::to_value(&cfg).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        env_refs.frozen = Arc::new(env_template::Frozen::record(text, &tree)?);
         cfg.env_refs = env_refs;
-        cfg.record_env_ref_paths();
         Ok(cfg)
     }
 
@@ -1630,6 +1581,9 @@ impl Config {
                     spool: self.tuning.spool_max,
                     per_upload: self.tuning.multipart_relay_upload_max,
                     total_multipart: self.tuning.multipart_total_max,
+                    multipart_principal_share_percent: Some(
+                        self.tuning.multipart_principal_share_percent,
+                    ),
                     max_object_size: self.max_object_size,
                     s3_backend,
                     s3_proxy_encrypted,
@@ -1734,10 +1688,9 @@ impl Config {
         let mut secrets = env_overrides::secret_env_values(running, env);
         secrets.extend(env_overrides::secret_env_values(&file_view, env));
         for (name, value) in secrets {
-            if !already_in_file.contains(&value)
-                && tree_has_string(&file_tree, &value)
-                && env_refs.insert(name.clone(), value).is_none()
-            {
+            if !already_in_file.contains(&value) && tree_has_string(&file_tree, &value) {
+                env_template::record_secret_env_templates(&file_tree, &name, &value, &mut env_refs);
+                env_refs.insert(name.clone(), value);
                 report.refs_added.push(name);
             }
         }
@@ -1745,7 +1698,6 @@ impl Config {
         report.refs_added.dedup();
 
         file_view.env_refs = env_refs;
-        file_view.record_env_ref_paths();
         file_view.apply_env_overrides_tracked(env);
         // What the ORIGINAL file held stays allowed; the edit cannot add to it.
         file_view.env_shadow.1 = running.env_shadow.1.clone();
@@ -2105,6 +2057,11 @@ impl Config {
                 backend: self.backend.clone(),
                 encryption: self.backend_encryption.clone(),
             });
+            // The copy keeps every `${env:…}` reference of the singleton.
+            self.env_refs
+                .derive_templates("/backend", "/backends/[default]");
+            self.env_refs
+                .derive_templates("/backend_encryption", "/backends/[default]/encryption");
         }
         if self.backends.iter().any(|b| b.name == named.name) {
             return Err(format!("Backend '{}' already exists", named.name));
@@ -2610,129 +2567,69 @@ impl Config {
         }
     }
 
-    /// Re-insert `${env:NAME}` references for every scalar whose value the
-    /// loaded document originally resolved from the environment (see
-    /// [`Self::env_refs`]). This is what makes the IaC round-trip lossless:
-    /// the persisted file and the exported document carry the refs, not the
-    /// materialized secrets.
-    ///
-    /// Mechanics: the config is serialized to a YAML value tree and every
-    /// String scalar that EXACTLY equals a recorded env value is replaced by
-    /// `${env:NAME}` (a short value found in several fields stays; see
-    /// below). Deterministic on collisions (two names with the same
-    /// value → the lexicographically-first name wins). Non-string scalars
-    /// (a ref that expanded into a number/bool field) are left materialized,
-    /// and so is a typed field that serializes as a string but cannot hold
-    /// a ref (`listen_addr: SocketAddr`, an enum): that one target is
-    /// skipped, never the whole reinsertion (which wrote every ref-sourced
-    /// secret in plaintext).
-    /// Record where each SHORT env value sits in the config tree, when it
-    /// sits in exactly one field: [`Self::with_env_refs_reinserted`]
-    /// re-emits a short value only there. Called right after the refs are
-    /// recorded (file load, document apply, section resolve).
-    pub fn record_env_ref_paths(&mut self) {
-        let Ok(tree) = serde_yaml::to_value(&*self) else {
-            return;
-        };
-        let mut found: Vec<(String, String)> = Vec::new();
-        for (name, value) in self.env_refs.iter() {
-            if value.len() >= SHARED_REF_MIN_LEN || self.env_refs.paths.contains_key(name) {
-                continue;
-            }
-            let mut hits = Vec::new();
-            env_ref_value_paths(&tree, value, &mut String::new(), &mut hits);
-            if let [only] = hits.as_slice() {
-                found.push((name.clone(), only.clone()));
-            }
-        }
-        self.env_refs.paths.extend(found);
-    }
-
-    pub fn with_env_refs_reinserted(&self) -> Self {
-        if self.env_refs.is_empty() {
+    /// The config with every string written as the text that a file or an
+    /// export holds (S7). A string with a template at its path, whose value
+    /// is still what the template expands to, becomes that template: the
+    /// secret stays a reference. Any other string is escaped by `escape`, so
+    /// a literal that holds `${env:` is never expanded when the text is read
+    /// again. A map key is escaped too. A string in a field that cannot hold
+    /// the text (a typed field) is left as it is: that one target is
+    /// skipped, never the whole rewrite.
+    pub fn with_file_text(&self, escape: env_template::Escape) -> Self {
+        if self.env_refs.rendered {
             return self.clone();
         }
-        // Inverse map value → ref-string; BTreeMap iteration makes the
-        // first (lexicographically smallest) name win on duplicate values.
-        let mut inverse: std::collections::BTreeMap<&str, String> =
-            std::collections::BTreeMap::new();
-        for (name, value) in &self.env_refs {
-            if !value.is_empty() {
-                inverse
-                    .entry(value.as_str())
-                    .or_insert_with(|| self.env_refs.ref_text(name));
-            }
-        }
-
-        // A SHORT value (a region, a port) is re-emitted only at the path
-        // recorded for it, while the value there is unchanged: matched by
-        // value alone, an edit of the ref's own field turned another field
-        // that holds the same literal into the ref. A secret-length value
-        // (>= SHARED_REF_MIN_LEN) is rewritten in every field (S9): the file
-        // used the ref twice, or a GUI edit copied the secret; either way
-        // plaintext on disk is the worse outcome.
-
         /// One step of a path into the value tree.
         enum Seg {
             Key(serde_yaml::Value),
             Idx(usize),
         }
-
-        /// The path of every String scalar to rewrite, with its ref. A
-        /// secret-length value is rewritten wherever it is; a short one only
-        /// at the path recorded for its name (`label` is that path so far).
-        fn collect(
-            v: &serde_yaml::Value,
-            path: &mut Vec<Seg>,
-            label: &mut String,
-            refs: (&std::collections::BTreeMap<&str, String>, &EnvRefs),
-            out: &mut Vec<(Vec<Seg>, String)>,
-        ) {
-            let (inverse, env_refs) = refs;
+        struct Rewrite<'a> {
+            refs: &'a EnvRefs,
+            escape: env_template::Escape,
+            path: Vec<Seg>,
+            targets: Vec<(Vec<Seg>, String)>,
+        }
+        fn collect(v: &serde_yaml::Value, label: &mut String, st: &mut Rewrite<'_>) {
             match v {
                 serde_yaml::Value::String(s) => {
-                    let at_recorded_path = || {
-                        env_refs.iter().any(|(name, value)| {
-                            value == s && env_refs.paths.get(name) == Some(label)
-                        })
-                    };
-                    if s.len() >= SHARED_REF_MIN_LEN || at_recorded_path() {
-                        if let Some(reference) = inverse.get(s.as_str()) {
-                            let copy = path
-                                .iter()
-                                .map(|seg| match seg {
-                                    Seg::Key(k) => Seg::Key(k.clone()),
-                                    Seg::Idx(i) => Seg::Idx(*i),
-                                })
-                                .collect();
-                            out.push((copy, reference.clone()));
-                        }
+                    let text = env_template::file_text(label, s, st.refs, st.escape);
+                    if text != *s {
+                        let copy = st
+                            .path
+                            .iter()
+                            .map(|seg| match seg {
+                                Seg::Key(k) => Seg::Key(k.clone()),
+                                Seg::Idx(i) => Seg::Idx(*i),
+                            })
+                            .collect();
+                        st.targets.push((copy, text));
                     }
                 }
                 serde_yaml::Value::Sequence(seq) => {
                     for (i, item) in seq.iter().enumerate() {
                         let len = label.len();
-                        push_seq_label(label, i, item);
-                        path.push(Seg::Idx(i));
-                        collect(item, path, label, refs, out);
-                        path.pop();
+                        label.push_str(&env_template::item_label(i, item));
+                        st.path.push(Seg::Idx(i));
+                        collect(item, label, st);
+                        st.path.pop();
                         label.truncate(len);
                     }
                 }
                 serde_yaml::Value::Mapping(map) => {
                     for (key, value) in map {
                         let len = label.len();
-                        push_key_label(label, key);
-                        path.push(Seg::Key(key.clone()));
-                        collect(value, path, label, refs, out);
-                        path.pop();
+                        label.push('/');
+                        label.push_str(key.as_str().unwrap_or_default());
+                        st.path.push(Seg::Key(key.clone()));
+                        collect(value, label, st);
+                        st.path.pop();
                         label.truncate(len);
                     }
                 }
                 _ => {}
             }
         }
-
         fn at<'a>(v: &'a mut serde_yaml::Value, path: &[Seg]) -> Option<&'a mut serde_yaml::Value> {
             path.iter().try_fold(v, |v, seg| match (seg, v) {
                 (Seg::Key(k), serde_yaml::Value::Mapping(m)) => m.get_mut(k),
@@ -2740,44 +2637,70 @@ impl Config {
                 _ => None,
             })
         }
+        /// Escape the keys that hold a `$`.
+        fn escape_keys(v: &mut serde_yaml::Value, escape: env_template::Escape) {
+            match v {
+                serde_yaml::Value::Sequence(seq) => {
+                    seq.iter_mut().for_each(|i| escape_keys(i, escape))
+                }
+                serde_yaml::Value::Mapping(map) => {
+                    let old = std::mem::take(map);
+                    for (key, mut value) in old {
+                        escape_keys(&mut value, escape);
+                        let key = match key.as_str() {
+                            Some(k) if k.contains('$') => serde_yaml::Value::String(
+                                env_template::escape_literal(k, escape, false),
+                            ),
+                            _ => key,
+                        };
+                        map.insert(key, value);
+                    }
+                }
+                _ => {}
+            }
+        }
 
         let mut tree = match serde_yaml::to_value(self) {
             Ok(tree) => tree,
             Err(e) => {
                 // Serializing Config does not fail in practice (every
                 // persist and export does it); nothing to rewrite without it.
-                tracing::warn!("env-ref reinsertion: cannot serialize config ({e})");
+                tracing::warn!("file text: cannot serialize config ({e})");
                 return self.clone();
             }
         };
-        let mut targets = Vec::new();
-        collect(
-            &tree,
-            &mut Vec::new(),
-            &mut String::new(),
-            (&inverse, &self.env_refs),
-            &mut targets,
-        );
+        let mut st = Rewrite {
+            refs: &self.env_refs,
+            escape,
+            path: Vec::new(),
+            targets: Vec::new(),
+        };
+        collect(&tree, &mut String::new(), &mut st);
+        let targets = st.targets;
         let original = tree.clone();
-        for (path, reference) in &targets {
+        for (path, text) in &targets {
             if let Some(slot) = at(&mut tree, path) {
-                *slot = serde_yaml::Value::String(reference.clone());
+                *slot = serde_yaml::Value::String(text.clone());
             }
         }
-        let mut cfg = match serde_yaml::from_value::<Config>(tree) {
+        // Every attempt escapes the keys: a key with `${env:` is never a reference.
+        let typed = |mut tree: serde_yaml::Value| {
+            escape_keys(&mut tree, escape);
+            serde_yaml::from_value::<Config>(tree)
+        };
+        let mut cfg = match typed(tree.clone()) {
             Ok(cfg) => cfg,
             Err(_) => {
-                // Some target is a typed field that cannot hold a ref. Apply
-                // the targets one at a time and keep each that still parses.
+                // Some target is a typed field that cannot hold the text.
+                // Apply the targets one at a time and keep each that parses.
                 let mut tree = original;
                 let mut last_good: Option<Config> = None;
-                for (path, reference) in &targets {
+                for (path, text) in &targets {
                     let Some(slot) = at(&mut tree, path) else {
                         continue;
                     };
-                    let before =
-                        std::mem::replace(slot, serde_yaml::Value::String(reference.clone()));
-                    match serde_yaml::from_value::<Config>(tree.clone()) {
+                    let before = std::mem::replace(slot, serde_yaml::Value::String(text.clone()));
+                    match typed(tree.clone()) {
                         Ok(cfg) => last_good = Some(cfg),
                         Err(_) => {
                             if let Some(slot) = at(&mut tree, path) {
@@ -2788,10 +2711,10 @@ impl Config {
                 }
                 match last_good {
                     Some(cfg) => cfg,
-                    None => match serde_yaml::from_value::<Config>(tree) {
+                    None => match typed(tree) {
                         Ok(cfg) => cfg,
                         Err(e) => {
-                            tracing::warn!("env-ref reinsertion: config does not round-trip ({e})");
+                            tracing::warn!("file text: config does not round-trip ({e})");
                             return self.clone();
                         }
                     },
@@ -2801,105 +2724,9 @@ impl Config {
         // `env_refs` / `env_shadow` are #[serde(skip)] — restore them so
         // chained serializers (and future persists) keep the provenance.
         cfg.env_refs = self.env_refs.clone();
+        cfg.env_refs.rendered = true;
         cfg.env_shadow = self.env_shadow.clone();
         cfg
-    }
-
-    /// Resolve any full-scalar `${env:NAME}` string field back to its value.
-    /// The inverse of [`Self::with_env_refs_reinserted`], for the section-PUT
-    /// ingest path: section GETs now EMIT refs for ref-sourced secrets, so a
-    /// GUI round-trip echoes the literal `"${env:NAME}"` string back — without
-    /// this resolution that literal would silently REPLACE the real secret.
-    /// It also makes refs first-class in the GUI: an operator can type
-    /// `${env:NAME}` into a field and it resolves like the file loader would.
-    ///
-    /// Lookup order per ref: recorded provenance (`env_refs`) → the ref's
-    /// own `:-default` → hard error (fail loud, same contract as file load).
-    /// The process environment is consulted only for names the operator put
-    /// in `DGP_CONFIG_ENV_ALLOWLIST`: a section body is admin input, and
-    /// reading any env var for it leaks secrets (S7). Newly resolved names are recorded into
-    /// `env_refs` so future persists re-emit the ref. Only strings that are
-    /// EXACTLY one ref resolve — mid-string refs in GUI fields stay literal.
-    pub fn resolve_env_ref_scalars(&mut self) -> Result<(), ConfigError> {
-        /// `found`: each name the body names in a whole ref, with the path
-        /// of the field (see [`push_seq_label`]).
-        fn walk(
-            v: &mut serde_yaml::Value,
-            refs: &mut std::collections::BTreeMap<String, String>,
-            label: &mut String,
-            found: &mut Vec<(String, String)>,
-        ) -> Result<(), ConfigError> {
-            match v {
-                serde_yaml::Value::String(s) if is_env_ref(s) => {
-                    // Record provenance ONLY when the lookup supplied the
-                    // value — a ref satisfied by its `:-default` is not
-                    // recorded, mirroring `expand_env_vars_recording`.
-                    let mut hits: Vec<(String, String)> = Vec::new();
-                    let resolved = expand_env_with(s, |name| {
-                        // Provenance, else an allowlisted name only (S7):
-                        // see `expand_env_admin`.
-                        let v = expansion::admin_env_lookup(name, refs);
-                        if let Some(val) = &v {
-                            if !val.is_empty() {
-                                hits.push((name.to_string(), val.clone()));
-                            }
-                        }
-                        v
-                    })?;
-                    found.extend(hits.iter().map(|(name, _)| (name.clone(), label.clone())));
-                    refs.extend(hits);
-                    *s = resolved;
-                    Ok(())
-                }
-                serde_yaml::Value::Sequence(seq) => {
-                    for (i, item) in seq.iter_mut().enumerate() {
-                        let len = label.len();
-                        push_seq_label(label, i, item);
-                        walk(item, refs, label, found)?;
-                        label.truncate(len);
-                    }
-                    Ok(())
-                }
-                serde_yaml::Value::Mapping(map) => {
-                    for (key, value) in map.iter_mut() {
-                        let len = label.len();
-                        push_key_label(label, key);
-                        walk(value, refs, label, found)?;
-                        label.truncate(len);
-                    }
-                    Ok(())
-                }
-                _ => Ok(()),
-            }
-        }
-
-        let mut refs = self.env_refs.clone();
-        let mut tree =
-            serde_yaml::to_value(&*self).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        let mut found = Vec::new();
-        walk(&mut tree, &mut refs, &mut String::new(), &mut found)?;
-        let mut resolved: Config =
-            serde_yaml::from_value(tree).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        // Review A2: the body names the field of each ref. A name written in
-        // exactly one field gets that path (the field moved: a renamed
-        // backend, a shifted list item); the path recorded at load went
-        // stale, and the persist wrote the literal. A name in several
-        // fields has no one path, as at load.
-        let mut sites: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-        for (name, label) in found {
-            sites.entry(name).or_default().push(label);
-        }
-        for (name, labels) in sites {
-            match labels.as_slice() {
-                [only] => refs.paths.insert(name, only.clone()),
-                _ => refs.paths.remove(&name),
-            };
-        }
-        resolved.env_refs = refs;
-        resolved.record_env_ref_paths();
-        resolved.env_shadow = std::mem::take(&mut self.env_shadow);
-        *self = resolved;
-        Ok(())
     }
 
     /// Clone the config with *infrastructure* secrets redacted. Matches the
@@ -2967,12 +2794,12 @@ impl Config {
         // doesn't lose the operator's in-memory values). `${env:...}`
         // references survive — they ARE the env-var/secret-manager form.
         for u in &mut export.iam_users {
-            if !is_env_ref(&u.secret_access_key) {
+            if !holds_env_ref(&u.secret_access_key) {
                 u.secret_access_key.clear();
             }
         }
         for p in &mut export.auth_providers {
-            if !p.client_secret.as_deref().is_some_and(is_env_ref) {
+            if !p.client_secret.as_deref().is_some_and(holds_env_ref) {
                 p.client_secret = None;
             }
         }
@@ -2989,7 +2816,7 @@ impl Config {
         // reference is not a secret (see the env-ref round-trip docs on
         // [`Self::env_refs`]).
         fn clear_unless_ref(slot: &mut Option<String>) {
-            if !slot.as_deref().is_some_and(is_env_ref) {
+            if !slot.as_deref().is_some_and(holds_env_ref) {
                 *slot = None;
             }
         }
@@ -3004,7 +2831,9 @@ impl Config {
             c.clear_env_slots();
             c
         });
-        let mut export = file_view.with_env_refs_reinserted().redact_for_export();
+        let mut export = file_view
+            .with_file_text(env_template::Escape::Minimal)
+            .redact_for_export();
         // An access key id (bootstrap pair and every S3 backend) is an
         // identifier, not a secret: the operator must see which key is
         // configured. The secret stays hidden; an unchanged id keeps it on
@@ -3032,7 +2861,7 @@ impl Config {
         // visible on purpose (operators must verify them; credentials belong in
         // headers, not the URL).
         for value in export.event_delivery.webhook_headers.values_mut() {
-            if !is_env_ref(value) {
+            if !holds_env_ref(value) {
                 *value = REDACTED_SENTINEL.to_string();
             }
         }
@@ -3042,7 +2871,7 @@ impl Config {
             .event_delivery
             .slack_bot_token
             .as_deref()
-            .is_some_and(|t| !is_env_ref(t))
+            .is_some_and(|t| !holds_env_ref(t))
         {
             export.event_delivery.slack_bot_token = Some(REDACTED_SENTINEL.to_string());
         }
@@ -3058,12 +2887,12 @@ impl Config {
                 .event_delivery
                 .webhook_url
                 .as_deref()
-                .is_some_and(|u| !is_env_ref(u))
+                .is_some_and(|u| !holds_env_ref(u))
             {
                 export.event_delivery.webhook_url = Some(REDACTED_SENTINEL.to_string());
             }
             for url in export.event_delivery.webhook_urls.iter_mut() {
-                if !is_env_ref(url) {
+                if !holds_env_ref(url) {
                     *url = REDACTED_SENTINEL.to_string();
                 }
             }
@@ -3091,17 +2920,19 @@ impl Config {
     }
 
     pub(crate) fn to_canonical_yaml_with(&self, env: EnvLookup) -> Result<String, ConfigError> {
-        let export = self
-            .file_view()?
-            .with_env_refs_reinserted()
+        let file = self.file_view()?;
+        let checked = serde_yaml::to_value(file.with_file_text(env_template::Escape::None))
+            .map_err(|e| ConfigError::Parse(e.to_string()))?;
+        self.refuse_env_secret_leaks(&checked, env)?;
+        let export = file
+            .with_file_text(env_template::Escape::Minimal)
             .redact_for_export();
         let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
-        let tree =
-            serde_yaml::to_value(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        self.refuse_env_secret_leaks(&tree, env)?;
         // Serialize the typed value, not the tree: the tree widens f32 to
         // f64 (`0.42` would print as `0.41999998688697815`).
-        serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))
+        let text =
+            serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        env_template::restore_typed_templates(&text, &self.env_refs, env_template::Escape::Minimal)
     }
 
     /// Persist-variant serializers: preserve per-backend encryption keys
@@ -3125,24 +2956,25 @@ impl Config {
     ) -> Result<String, ConfigError> {
         // The FILE view: env-overridden fields get the file's value back, so
         // an env value (a secret above all) never lands in the file.
-        let export = self
-            .file_view()?
-            .with_env_refs_reinserted()
+        let file = self.file_view()?;
+        let checked = serde_yaml::to_value(file.with_file_text(env_template::Escape::None))
+            .map_err(|e| ConfigError::Parse(e.to_string()))?;
+        self.refuse_env_secret_leaks(&checked, env)?;
+        let export = file
+            .with_file_text(env_template::Escape::Full)
             .redact_for_persist();
         let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
-        // The load path expands the WHOLE file text (`$$`→`$`, `${env:NAME}`→
-        // value). A runtime-entered literal containing `$$` or a `${env:...}`-
-        // shaped substring would therefore round-trip WRONG through persist→load
-        // (`pay $$10` reloads as `pay $10`; a bearer token with `${env:X}` gets
-        // expanded/erased). Escape materialized scalars ($→$$) so load's inverse
-        // recovers the original. A re-inserted `${env:NAME}` ref (produced above)
-        // is LEFT intact — it's meant to expand. Symmetric: load's `$$`→`$`
-        // exactly undoes this, so repeated persist/load is stable.
-        let mut tree =
-            serde_yaml::to_value(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        self.refuse_env_secret_leaks(&tree, env)?;
-        escape_dollar_for_persist(&mut tree);
-        serde_yaml::to_string(&tree).map_err(|e| ConfigError::Parse(e.to_string()))
+        // `with_file_text(Full)` already wrote the templates and escaped every other `$`.
+        let text =
+            serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let text = env_template::restore_typed_templates(
+            &text,
+            &self.env_refs,
+            env_template::Escape::Full,
+        )?;
+        // A restart expands this text: it may hold a reference only where we may write one.
+        env_template::refuse_unrecorded_refs(&text, &self.env_refs)?;
+        Ok(text)
     }
 
     /// Persist the current config to a file atomically. Always writes
@@ -3169,6 +3001,12 @@ impl Config {
         let content = self.to_canonical_yaml_for_persist()?;
         atomic_write(std::path::Path::new(path), content.as_bytes())
     }
+
+    /// `Err` when [`Self::persist_to_file`] would refuse this config for any
+    /// reason but the file write. A writer asks it before the change is live.
+    pub fn check_persistable(&self) -> Result<(), ConfigError> {
+        self.to_canonical_yaml_for_persist().map(|_| ())
+    }
 }
 
 /// What `Config::reapply_env_overrides` found. Paths are dotted flat
@@ -3192,38 +3030,6 @@ pub(crate) fn tree_has_string(tree: &serde_yaml::Value, needle: &str) -> bool {
         serde_yaml::Value::Mapping(m) => m.values().any(|v| tree_has_string(v, needle)),
         serde_yaml::Value::Tagged(t) => tree_has_string(&t.value, needle),
         _ => false,
-    }
-}
-
-/// Is this scalar EXACTLY a re-inserted `${env:NAME}` / `${env:NAME:-default}`
-/// reference (produced by `with_env_refs_reinserted`)? Such scalars must be left
-/// intact so the load-time expander resolves them; every other scalar is a
-/// materialized literal whose `$` must be escaped for persist.
-fn is_whole_env_ref(s: &str) -> bool {
-    s.strip_prefix("${env:")
-        .and_then(|rest| rest.strip_suffix('}'))
-        .map(|inner| !inner.contains('{') && !inner.contains('}'))
-        .unwrap_or(false)
-}
-
-/// Escape `$`→`$$` in every materialized string scalar of the value tree so the
-/// load-time env expander (`$$`→`$`) round-trips it losslessly. Whole `${env:…}`
-/// refs are left intact (they are meant to expand). See
-/// [`Config::to_canonical_yaml_for_persist`].
-fn escape_dollar_for_persist(v: &mut serde_yaml::Value) {
-    match v {
-        serde_yaml::Value::String(s) => {
-            if !is_whole_env_ref(s) && s.contains('$') {
-                *s = s.replace('$', "$$");
-            }
-        }
-        serde_yaml::Value::Sequence(seq) => seq.iter_mut().for_each(escape_dollar_for_persist),
-        serde_yaml::Value::Mapping(map) => {
-            for (_, val) in map.iter_mut() {
-                escape_dollar_for_persist(val);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -3355,6 +3161,11 @@ pub enum ConfigError {
 
     #[error("malformed `${{...}}` reference in config: {0}")]
     BadEnvRef(String),
+
+    /// An admin document used a reference where the running config does not
+    /// (see `env_template`).
+    #[error("{0}")]
+    EnvRefRefused(String),
 
     #[error("environment variable {0} expands to a value containing a newline or control character; such a value cannot be substituted into the config without breaking its structure — quote it or use a file reference")]
     UnsafeEnvValue(String),

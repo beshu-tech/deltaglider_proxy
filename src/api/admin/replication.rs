@@ -179,7 +179,7 @@ pub async fn run_now(
         dir_concurrency: repl.dir_concurrency,
     };
     let rule_owned = rule.clone();
-    tokio::spawn(async move {
+    tokio::spawn(crate::deltaglider::spool::as_background(async move {
         let result = replication::run_rule_gated(
             db_arc.clone(),
             &engine,
@@ -212,7 +212,7 @@ pub async fn run_now(
                 rule_owned.name, e
             );
         }
-    });
+    }));
 
     // 202 Accepted — the run started; poll the jobs list / run history for
     // progress and the final outcome. Totals are 0 here (not yet known).
@@ -546,7 +546,7 @@ pub async fn verify(
     let rule_clone = rule.clone();
     let db_for_task = db_arc.clone();
     let cancels = state.parity_cancels.clone();
-    tokio::spawn(async move {
+    tokio::spawn(crate::deltaglider::spool::as_background(async move {
         // Catch a panic in the audit so the lease + 'running' status are ALWAYS
         // settled — otherwise a panicked task would leave the lease stuck for the
         // full TTL and the UI polling a never-ending 'running' forever.
@@ -672,7 +672,7 @@ pub async fn verify(
         {
             map.remove(&rule_clone.name);
         }
-    });
+    }));
 
     // Return the (now 'running') status immediately.
     let row = {

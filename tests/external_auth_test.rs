@@ -792,3 +792,100 @@ async fn oauth_callback_answers_a_multibyte_code_and_state() {
         "the callback dropped the connection instead of answering: {resp:?}"
     );
 }
+
+// ── A stored secret never follows a new destination ──
+
+async fn stored_secret_is_set(admin: &reqwest::Client, endpoint: &str, name: &str) -> bool {
+    let list: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/ext-auth/providers", endpoint))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("provider {name} not listed: {list}"))
+        .get("client_secret")
+        .is_some_and(|v| !v.is_null())
+}
+
+async fn put_provider(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    id: i64,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    admin
+        .put(format!(
+            "{}/_/api/admin/ext-auth/providers/{}",
+            endpoint, id
+        ))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_moved_issuer_with_no_new_secret_clears_the_stored_secret() {
+    let (server, admin) = setup().await;
+    let endpoint = server.endpoint();
+    let created = create_provider(&admin, &endpoint, "dest-move").await;
+    let id = created["id"].as_i64().unwrap();
+    assert!(stored_secret_is_set(&admin, &endpoint, "dest-move").await);
+
+    // Controls: an edit that moves nothing keeps the secret.
+    for body in [
+        json!({ "display_name": "Renamed display" }),
+        json!({ "name": "dest-move-renamed" }),
+        json!({ "issuer_url": "https://accounts.google.com" }),
+        json!({ "extra_config": {} }),
+    ] {
+        let resp = put_provider(&admin, &endpoint, id, body.clone()).await;
+        assert!(resp.status().is_success(), "{body}: {}", resp.status());
+    }
+    assert!(
+        stored_secret_is_set(&admin, &endpoint, "dest-move-renamed").await,
+        "an edit that moves no destination keeps the secret"
+    );
+
+    // The issuer moves and the request names no secret: the secret is gone.
+    let resp = put_provider(
+        &admin,
+        &endpoint,
+        id,
+        json!({ "issuer_url": "https://login.example.org" }),
+    )
+    .await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    assert!(
+        !stored_secret_is_set(&admin, &endpoint, "dest-move-renamed").await,
+        "the stored secret followed the new issuer"
+    );
+
+    // A move together with a new secret stores the new secret.
+    let resp = put_provider(
+        &admin,
+        &endpoint,
+        id,
+        json!({ "issuer_url": "https://login.example.net", "client_secret": "typed-again-777" }),
+    )
+    .await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    assert!(stored_secret_is_set(&admin, &endpoint, "dest-move-renamed").await);
+
+    // Network policy lives in extra_config: moving it clears the secret too.
+    let resp = put_provider(
+        &admin,
+        &endpoint,
+        id,
+        json!({ "extra_config": { "allow_local": true } }),
+    )
+    .await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+    assert!(!stored_secret_is_set(&admin, &endpoint, "dest-move-renamed").await);
+}

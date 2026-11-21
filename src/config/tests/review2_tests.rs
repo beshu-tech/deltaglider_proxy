@@ -7,16 +7,18 @@ use crate::config::*;
 /// the fallback clone writes EVERY ref-sourced secret in plaintext.
 #[test]
 fn review2_ref_in_typed_field_does_not_abort_reinsertion() {
-    let mut cfg = Config {
-        secret_access_key: Some("custom-secret-value-1".into()),
-        ..Default::default()
+    let tpl =
+        "access:\n  secret_access_key: ${env:MYSECRET}\nadvanced:\n  listen_addr: ${env:LISTEN}\n";
+    let env = |n: &str| match n {
+        "LISTEN" => Some("0.0.0.0:9123".to_string()),
+        "MYSECRET" => Some("custom-secret-value-1".to_string()),
+        _ => None,
     };
-    cfg.listen_addr = "0.0.0.0:9123".parse().unwrap();
-    cfg.env_refs.insert("LISTEN".into(), "0.0.0.0:9123".into());
-    cfg.env_refs
-        .insert("MYSECRET".into(), "custom-secret-value-1".into());
+    let cfg = Config::from_template_with(tpl, &env).unwrap();
     assert_eq!(
-        cfg.with_env_refs_reinserted().secret_access_key.as_deref(),
+        cfg.with_file_text(env_template::Escape::Minimal)
+            .secret_access_key
+            .as_deref(),
         Some("${env:MYSECRET}")
     );
 }
@@ -32,14 +34,14 @@ fn review2_region_value_in_two_fields_stays_uncoupled() {
         ..Default::default()
     };
     cfg.env_refs.insert("REGION".into(), "us-east-1".into());
-    let out = cfg.with_env_refs_reinserted();
+    let out = cfg.with_file_text(env_template::Escape::Minimal);
     assert_eq!(
         (
             out.access_key_id.as_deref(),
             out.secret_access_key.as_deref()
         ),
         (Some("us-east-1"), Some("us-east-1")),
-        "a non-secret shared value got coupled to ${{env:REGION}}"
+        "a field with no template got coupled to ${{env:REGION}}"
     );
 }
 

@@ -126,6 +126,38 @@ fn form_body_len_truth_table() {
 }
 
 #[test]
+fn every_multipart_post_is_found_by_its_content_type() {
+    let post = axum::http::Method::POST;
+    let with = |values: &[&str]| {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(axum::http::header::CONTENT_TYPE, v.parse().unwrap());
+        }
+        h
+    };
+    for ct in [
+        "multipart/form-data; boundary=x",
+        "Multipart/Form-Data;boundary=x",
+        "multipart/form-data",
+        "text/plain, multipart/form-data",
+    ] {
+        assert!(is_multipart_post(&post, &with(&[ct])), "{ct}");
+    }
+    assert!(is_multipart_post(
+        &post,
+        &with(&["text/plain", "multipart/form-data; boundary=x"])
+    ));
+    for ct in ["application/xml", "text/plain", "multipart/mixed", ""] {
+        assert!(!is_multipart_post(&post, &with(&[ct])), "{ct}");
+    }
+    assert!(!is_multipart_post(&post, &HeaderMap::new()));
+    assert!(!is_multipart_post(
+        &axum::http::Method::PUT,
+        &with(&["multipart/form-data; boundary=x"])
+    ));
+}
+
+#[test]
 fn the_file_part_is_named_file_or_has_a_file_name() {
     assert!(is_file_part("file", None));
     assert!(is_file_part("upload", Some("a.bin")));
@@ -435,6 +467,21 @@ async fn a_bad_signature_or_policy_never_reads_the_file() {
             "SignatureDoesNotMatch",
         ),
         (
+            // The answer of a wrong secret: it must not tell that the key
+            // id is unknown.
+            "unknown access key",
+            {
+                let mut form = Form::valid("f/x.jpg", data.clone(), &[]);
+                for (name, value) in &mut form.before {
+                    if name == "x-amz-credential" {
+                        *value = "AKNOBODY0000000000/20260507/us-east-1/s3/aws4_request".into();
+                    }
+                }
+                form
+            },
+            "SignatureDoesNotMatch",
+        ),
+        (
             "expired policy",
             Form::signed("f/x.jpg", data.clone(), &[], SK, "2000-01-01T00:00:00Z"),
             "AccessDenied",
@@ -467,6 +514,45 @@ async fn a_bad_signature_or_policy_never_reads_the_file() {
         rig.assert_restored(what);
         assert!(rig.stored("f/x.jpg").await.is_none(), "{what}: stored");
     }
+}
+
+/// The IAM verdict of a form (`AccessDenied`: the key may not write there)
+/// is shown only after the signature verified: a wrong secret for the same
+/// key gets `SignatureDoesNotMatch`, as an unknown key does.
+#[tokio::test]
+async fn a_form_shows_the_iam_verdict_only_after_its_signature_verifies() {
+    use crate::iam::{IamIndex, IamUser, Permission};
+    let rig = Rig::new().await;
+    let read_only = IamUser {
+        id: 1,
+        name: "reader".into(),
+        access_key_id: AK.into(),
+        secret_access_key: SK.into(),
+        enabled: true,
+        created_at: String::new(),
+        permissions: vec![Permission {
+            id: 1,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["bkt/*".into()],
+            conditions: None,
+        }],
+        group_ids: vec![],
+        auth_source: "local".into(),
+        iam_policies: vec![],
+    };
+    rig.iam
+        .store(Arc::new(IamState::Iam(IamIndex::from_users(vec![
+            read_only,
+        ]))));
+    let data = body(KIB);
+    let right = Form::valid("f/x.jpg", data.clone(), &[]);
+    let err = rig.post_form(&right).await.unwrap_err();
+    assert_eq!(err.code(), "AccessDenied", "right secret: {err:?}");
+    let wrong = Form::signed("f/x.jpg", data, &[], "WRONG", "2099-01-01T00:00:00Z");
+    let err = rig.post_form(&wrong).await.unwrap_err();
+    assert_eq!(err.code(), "SignatureDoesNotMatch", "wrong secret: {err:?}");
+    assert!(rig.stored("f/x.jpg").await.is_none());
 }
 
 /// Every refusal during or after the file: the right code, nothing

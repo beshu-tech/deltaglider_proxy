@@ -111,13 +111,14 @@ pub(super) async fn get_object(
                 }
             };
             if let Some((stream, content_length, metadata)) = ranged {
+                let held_spool = crate::deltaglider::spool::HeldSpool::NOTHING;
                 let last_byte = first + content_length.saturating_sub(1);
                 let content_range = format!("bytes {first}-{last_byte}/{}", metadata.file_size);
                 return ranged_response(
                     svc,
                     &input,
                     reader,
-                    stream,
+                    (stream, held_spool),
                     content_length,
                     content_range,
                     &metadata,
@@ -151,7 +152,7 @@ pub(super) async fn get_object(
         let end_inclusive = checked.end.saturating_sub(1);
         let content_range = format!("bytes {start}-{end_inclusive}/{file_size}");
 
-        if let Some((stream, content_length, metadata)) = engine
+        if let Some((stream, content_length, metadata, held_spool)) = engine
             .retrieve_stream_range(&input.bucket, &input.key, start, end_inclusive, None)
             .await?
         {
@@ -160,7 +161,7 @@ pub(super) async fn get_object(
                 svc,
                 &input,
                 reader,
-                stream,
+                (stream, held_spool),
                 content_length,
                 content_range,
                 &metadata,
@@ -259,12 +260,19 @@ fn ranged_response(
     svc: &DeltaGliderS3Service,
     input: &s3s::dto::GetObjectInput,
     reader: Reader,
-    stream: BoxStream<'static, Result<bytes::Bytes, StorageError>>,
+    (stream, held_spool): (
+        BoxStream<'static, Result<bytes::Bytes, StorageError>>,
+        crate::deltaglider::spool::HeldSpool,
+    ),
     content_length: u64,
     content_range: String,
     metadata: &FileMetadata,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
-    let body = s3s::dto::StreamingBlob::new(SyncStorageStream::new(stream));
+    let body = s3s::dto::StreamingBlob::new(SyncStorageStream::for_response(
+        &svc.state.engine.load(),
+        held_spool,
+        stream,
+    ));
     let mut output = get_object_output_from_metadata(metadata, body, reader)?;
     output.content_length = Some(i64::try_from(content_length).unwrap_or(i64::MAX));
     output.content_range = Some(content_range);
@@ -285,9 +293,16 @@ fn finish_get(
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
     let (body, metadata) = match response {
         RetrieveResponse::Streamed {
-            stream, metadata, ..
+            stream,
+            metadata,
+            held_spool,
+            ..
         } => {
-            let blob = s3s::dto::StreamingBlob::new(SyncStorageStream::new(stream));
+            let blob = s3s::dto::StreamingBlob::new(SyncStorageStream::for_response(
+                &svc.state.engine.load(),
+                held_spool,
+                stream,
+            ));
             (blob, metadata)
         }
         RetrieveResponse::Buffered { data, metadata, .. } => {
@@ -463,6 +478,26 @@ pub(super) async fn delete_objects(
     let mut keys = Vec::with_capacity(objects.len());
     for (i, obj) in objects.iter().enumerate() {
         let key = obj.key.trim_start_matches('/').to_string();
+        // An admission rule refuses this key; the other keys go on.
+        if admission_refusal(
+            &req.extensions,
+            crate::admission::Effect::Delete,
+            &input.bucket,
+            &key,
+        )
+        .is_some()
+        {
+            crate::audit::audit_log(
+                "access_denied",
+                auth_user.as_ref().map_or("anonymous", |u| u.name.as_str()),
+                "DeleteObjects",
+                &headers,
+                &input.bucket,
+                &key,
+            );
+            allowed[i] = false;
+            continue;
+        }
         if let Some(user) = auth_user.as_ref() {
             if !user.can_with_context(S3Action::Delete, &input.bucket, &key, &policy_context) {
                 crate::audit::audit_log(
@@ -583,6 +618,8 @@ pub(super) async fn put_object(
     crate::api::handlers::object_helpers::check_client_store_allowed(&svc.state, &input.bucket)
         .await?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
+    // A refused key fails here, before the body is read (as at CreateMultipartUpload).
+    crate::api::handlers::object_helpers::check_client_key(&input.bucket, &input.key)?;
     // One HeadBucket per bucket per 5 seconds, not one per PUT.
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
 

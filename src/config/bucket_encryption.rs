@@ -28,6 +28,16 @@ pub enum EncryptionSite {
 }
 
 impl EncryptionSite {
+    /// The flat path of the site's encryption block (the label that
+    /// `env_template` gives its fields).
+    pub fn template_path(&self) -> String {
+        match self {
+            Self::Singleton => "/backend_encryption".to_string(),
+            Self::Backend(name) => format!("/backends/[{name}]/encryption"),
+            Self::Bucket(name) => format!("/buckets/{name}/encryption"),
+        }
+    }
+
     /// Operator-facing name, for messages.
     pub fn label(&self) -> String {
         match self {

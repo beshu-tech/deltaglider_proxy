@@ -127,6 +127,8 @@ schemars = "0.8"
 ipnet = { version = "2.11", features = ["serde"] }
 # Glob patterns for admission block path_glob matcher.
 globset = "0.4"
+# DFA of a path_glob: answers "can a key below this prefix match" (already in the tree via globset).
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search"] }
 # Human-friendly duration parsing ("15m", "1h", "30s") — used by replication config.
 humantime = "2"
 

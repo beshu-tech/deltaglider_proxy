@@ -57,6 +57,15 @@ pub struct TraceResponse {
     /// function the live path uses). `null` for any other decision, and
     /// for a write: writes are never granted anonymously.
     pub anonymous_grant: Option<crate::admission::AnonymousGrant>,
+    /// `true` when the chain also decides per RESOURCE: a copy source, each
+    /// key of a batch delete, the key of a form POST and every listed key
+    /// meet the blocks that name a `bucket` or a `path_glob`. The decision
+    /// above is for the request line alone.
+    pub per_resource_rules: bool,
+    /// For a LIST: `true` when those rules narrow what the listing shows
+    /// (keys that a `deny` / `reject` refuses are dropped; an anonymous
+    /// LIST shows only the keys an `allow-anonymous` block admits).
+    pub listing_filtered: bool,
 }
 
 #[derive(Serialize)]
@@ -101,6 +110,26 @@ pub async fn trace_config(
         let grant = crate::admission::anonymous_grant(&decision, &req_info);
         (decision, grant)
     };
+    // The same construction as the live middleware.
+    let rules = crate::admission::ResourceRules::new(
+        chain.clone(),
+        &owned.method,
+        owned.source_ip,
+        owned.authenticated,
+    )
+    .map(|rules| match &decision {
+        crate::admission::Decision::AllowAnonymous { matched } => {
+            rules.admitted_anonymously_by(matched)
+        }
+        _ => rules,
+    });
+    let per_resource_rules = rules.is_some();
+    let listing_filtered = owned.key.is_empty()
+        && !owned.bucket.is_empty()
+        && matches!(owned.method.as_str(), "GET" | "HEAD")
+        && rules
+            .as_ref()
+            .is_some_and(|r| r.affects_bucket(&owned.bucket));
 
     // `TraceResolved` echoes the parsed inputs back so operators can
     // verify the parser agreed with their mental model.
@@ -124,6 +153,8 @@ pub async fn trace_config(
             },
             admission: decision,
             anonymous_grant,
+            per_resource_rules,
+            listing_filtered,
         }),
     )
 }

@@ -11,6 +11,7 @@ pub(crate) mod drain;
 pub mod error_page;
 pub(crate) mod errors;
 pub mod handlers;
+pub mod input_limits;
 pub mod request_target;
 pub mod s3_router;
 pub mod s3s_hooks;

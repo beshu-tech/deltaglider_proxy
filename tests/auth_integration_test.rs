@@ -1349,9 +1349,9 @@ async fn test_wrong_secret_signatures_are_rate_limited() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
-    // The IP is locked out now: even the right secret gets SlowDown.
+    // The key is locked out at this address now: a wrong secret gets SlowDown.
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let resp = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+    let resp = build_signed_get(&server.endpoint(), &path, "testkey", "wrong-secret", &now)
         .header("x-forwarded-for", "10.0.0.98")
         .send()
         .await
@@ -1359,7 +1359,19 @@ async fn test_wrong_secret_signatures_are_rate_limited() {
     assert_eq!(
         resp.status().as_u16(),
         503,
-        "wrong-secret signatures must lock the IP out"
+        "wrong-secret signatures must lock the key out"
+    );
+    // The right secret is still served: a lockout never refuses a request
+    // whose signature verifies.
+    let resp = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+        .header("x-forwarded-for", "10.0.0.98")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a verified request was refused"
     );
     // Another IP is not affected, and a verified request still succeeds.
     let resp = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
@@ -1370,8 +1382,60 @@ async fn test_wrong_secret_signatures_are_rate_limited() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// Anyone at an address can lock out a key id by sending bad signatures for
+/// it (the id is public). With the production limiter (100 failures), the
+/// locked-out key's correctly signed request from the same address is still
+/// served at once; a further bad signature gets 503.
+#[tokio::test]
+async fn a_locked_out_key_id_still_serves_its_verified_requests() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let path = format!("/{}", server.bucket());
+    // Concurrent, so the progressive delay of each refused response (up to
+    // 5 s) does not add up.
+    let sends = (0..105).map(|_| {
+        let (endpoint, path) = (endpoint.clone(), path.clone());
+        async move {
+            let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            build_signed_get(&endpoint, &path, "testkey", "wrong-secret", &now)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let statuses = futures::future::join_all(sends).await;
+    assert!(
+        statuses
+            .iter()
+            .all(|s| *s == StatusCode::FORBIDDEN || s.as_u16() == 503),
+        "{statuses:?}"
+    );
+    let started = std::time::Instant::now();
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let r = build_signed_get(&endpoint, &path, "testkey", "testsecret", &now)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "the locked-out key was refused");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a verified request was delayed: {:?}",
+        started.elapsed()
+    );
+    let r = build_signed_get(&endpoint, &path, "testkey", "wrong-secret", &now)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 503, "a further bad signature");
+}
+
 /// auth-1: requests that never reach a signature check (no credential, a
-/// malformed header, an unknown access key) do not feed the per-IP limiter.
+/// malformed header) do not feed the per-IP limiter. Unknown key ids do,
+/// like known ones: per address and id as sent.
 /// Behind a load balancer without `DGP_TRUSTED_PROXY_CIDRS` every client
 /// shares one peer IP, so counting them let any anonymous party lock the
 /// whole S3 API. And a locked-out IP still gets public-prefix reads: they
@@ -1399,7 +1463,7 @@ async fn requests_without_a_checked_signature_do_not_lock_out_the_peer() {
     assert_eq!(r.status(), StatusCode::OK);
     let anon = reqwest::Client::new();
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    for i in 0..5 {
+    for _ in 0..5 {
         let r = anon
             .get(format!("{endpoint}/{bucket}/private.txt"))
             .send()
@@ -1413,17 +1477,6 @@ async fn requests_without_a_checked_signature_do_not_lock_out_the_peer() {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::BAD_REQUEST, "malformed");
-        let r = build_signed_get(
-            &endpoint,
-            &format!("/{bucket}"),
-            &format!("WRONGKEY{i}"),
-            "irrelevant_secret",
-            &now,
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(r.status(), StatusCode::FORBIDDEN, "unknown key");
     }
     let r = signed
         .get(format!("{endpoint}/{bucket}/pub/a.txt"))
@@ -1432,7 +1485,56 @@ async fn requests_without_a_checked_signature_do_not_lock_out_the_peer() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "signed client locked out");
 
-    // Wrong secrets on a known key DO lock the IP out ...
+    // A key id that does not exist counts like one that does: per address
+    // and id as sent. The lockout of one id refuses neither another id nor a
+    // real key.
+    for _ in 0..3 {
+        let r = build_signed_get(
+            &endpoint,
+            &format!("/{bucket}"),
+            "WRONGKEY0",
+            "irrelevant_secret",
+            &now,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "unknown key");
+    }
+    let r = build_signed_get(
+        &endpoint,
+        &format!("/{bucket}"),
+        "WRONGKEY0",
+        "irrelevant_secret",
+        &now,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(r.status().as_u16(), 503, "an unknown id is not limited");
+    let r = build_signed_get(
+        &endpoint,
+        &format!("/{bucket}"),
+        "WRONGKEY1",
+        "irrelevant_secret",
+        &now,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "one id locked out another"
+    );
+    let r = signed
+        .get(format!("{endpoint}/{bucket}/pub/a.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "a real key was locked out");
+
+    // Wrong secrets on a known key DO lock that key out at this address ...
     for _ in 0..3 {
         let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let r = build_signed_get(&endpoint, &format!("/{bucket}"), "testkey", "wrong", &now)
@@ -1441,19 +1543,100 @@ async fn requests_without_a_checked_signature_do_not_lock_out_the_peer() {
             .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let r = build_signed_get(&endpoint, &format!("/{bucket}"), "testkey", "wrong", &now)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 503, "wrong secrets lock the key out");
+    // ... but the right secret is served, and so is a public read.
     let r = signed
         .get(format!("{endpoint}/{bucket}"))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 503, "wrong secrets lock the IP out");
-    // ... but a public read needs no credential and is still served.
+    assert_eq!(r.status(), StatusCode::OK, "a verified request was refused");
+    // A public read needs no credential and is still served.
     let r = anon
         .get(format!("{endpoint}/{bucket}/pub/a.txt"))
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "public read locked out");
+}
+
+/// A `multipart/form-data` POST that is not the browser-form shape (an
+/// `Authorization` header, a presigned query, a query string) is refused
+/// with 400 before s3s reads its body: s3s would buffer up to 5 GB of it
+/// in memory, whoever the sender claims to be. The request declares a huge
+/// body and sends a few bytes; the answer must come without the rest.
+#[tokio::test]
+async fn a_multipart_post_that_is_no_browser_form_is_refused_before_its_body_is_read() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let host = server.endpoint().trim_start_matches("http://").to_string();
+    let bucket = server.bucket().to_string();
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let sig = "0".repeat(64);
+    let header_auth = |ak: &str| {
+        format!(
+            "Authorization: AWS4-HMAC-SHA256 Credential={ak}/20260101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature={sig}\r\nx-amz-date: {now}\r\n"
+        )
+    };
+    let presigned = |ak: &str| {
+        format!(
+            "/{bucket}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={ak}%2F20260101%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Date={now}&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature={sig}"
+        )
+    };
+    let cases: Vec<(&str, String, String)> = vec![
+        (
+            "header, unknown key",
+            format!("/{bucket}"),
+            header_auth("AKNOBODY"),
+        ),
+        (
+            "header, known key",
+            format!("/{bucket}"),
+            header_auth("testkey"),
+        ),
+        (
+            "header, object path",
+            format!("/{bucket}/k.txt"),
+            header_auth("AKNOBODY"),
+        ),
+        (
+            "presigned query, unknown key",
+            presigned("AKNOBODY"),
+            String::new(),
+        ),
+        (
+            "presigned query, known key",
+            presigned("testkey"),
+            String::new(),
+        ),
+    ];
+    for (what, target, auth) in cases {
+        let mut tcp = tokio::net::TcpStream::connect(&host).await.unwrap();
+        let head = format!(
+            "POST {target} HTTP/1.1\r\nHost: {host}\r\n{auth}\
+             Content-Type: multipart/form-data; boundary=XB\r\n\
+             Content-Length: 5368709120\r\n\r\n--XB\r\n"
+        );
+        tcp.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no answer: the proxy waits for the body"))
+            .unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(resp.starts_with("HTTP/1.1 400"), "{what}: {resp}");
+        assert!(resp.contains("InvalidRequest"), "{what}: {resp}");
+    }
 }
 
 /// A browser form POST. `secret: None` sends the form with no signature
@@ -1501,6 +1684,9 @@ fn form_post(endpoint: &str, bucket: &str, secret: Option<&str>) -> reqwest::Req
 /// does not feed the limiter; a wrong-secret form does.
 #[tokio::test]
 async fn form_post_counts_only_wrong_signatures_toward_lockout() {
+    crate::common::expect_server_errors(
+        "a locked-out form with a wrong signature gets 503 SlowDown",
+    );
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
         .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
@@ -1525,11 +1711,20 @@ async fn form_post_counts_only_wrong_signatures_toward_lockout() {
             .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN, "wrong secret");
     }
+    let r = form_post(&endpoint, &bucket, Some("guess-last"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 503, "wrong secrets lock the form out");
     let r = form_post(&endpoint, &bucket, Some("testsecret"))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 503, "wrong secrets lock the IP out");
+    assert_eq!(
+        r.status().as_u16(),
+        204,
+        "a form whose signature verifies was refused"
+    );
 }
 
 /// A signed form POST answers with the storage facts of the object, through
@@ -1974,7 +2169,7 @@ async fn test_unsigned_extra_header_is_tolerated() {
     // `accept-encoding` (which every real browser/curl would send)
     // to cover the common client path.
     let resp = req
-        .header("x-amz-custom-tracing", "trace-id-1234")
+        .header("x-custom-tracing", "trace-id-1234")
         .header("accept-encoding", "gzip, deflate")
         .send()
         .await
@@ -1987,6 +2182,38 @@ async fn test_unsigned_extra_header_is_tolerated() {
          SigV4 verifier should ignore headers outside the SignedHeaders set",
         resp.status()
     );
+}
+
+/// An `x-amz-*` header outside `SignedHeaders` is refused on header auth
+/// (it was not added by the signer); `x-amz-cf-id` (CloudFront) is the one
+/// exception.
+#[tokio::test]
+async fn test_unsigned_amz_header_is_refused_on_header_auth() {
+    let server = TestServer::builder()
+        .auth("spec-key", "spec-secret-1234567890")
+        .build()
+        .await;
+    let send = |extra: &'static str| {
+        let endpoint = server.endpoint();
+        async move {
+            let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            build_signed_get(
+                &endpoint,
+                "/",
+                "spec-key",
+                "spec-secret-1234567890",
+                &timestamp,
+            )
+            .header(extra, "x")
+            .send()
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    assert_eq!(send("x-amz-copy-source").await, StatusCode::FORBIDDEN);
+    assert_eq!(send("x-amz-meta-owner").await, StatusCode::FORBIDDEN);
+    assert_eq!(send("x-amz-cf-id").await, StatusCode::OK);
 }
 
 // ============================================================================
@@ -2410,9 +2637,9 @@ async fn test_duplicate_authorization_headers_do_not_bypass_signature() {
 }
 
 /// A low-privilege user signs a SigV2 presigned query with their OWN secret
-/// and adds a v4 `Authorization` header that names another user's key. s3s
-/// verifies the SigV2 query (the attacker); our middleware resolved the
-/// header (the victim). The two identities must match or the request fails.
+/// and adds a v4 `Authorization` header that names another user's key. SigV2
+/// is not supported, so the middleware refuses the request (400) before s3s
+/// verifies the query: the attacker never acts as the victim.
 #[tokio::test]
 async fn test_sigv2_query_cannot_borrow_another_users_identity() {
     let server = TestServer::builder()
@@ -2473,7 +2700,7 @@ async fn test_sigv2_query_cannot_borrow_another_users_identity() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::FORBIDDEN,
+        StatusCode::BAD_REQUEST,
         "a SigV2 query signed by mallory must not act as boss"
     );
 }
@@ -3123,7 +3350,7 @@ async fn review2_presigned_hits_do_not_reset_a_wrong_secret_loop() {
         }
     }
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let resp = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+    let resp = build_signed_get(&server.endpoint(), &path, "testkey", "wrong-secret", &now)
         .header("x-forwarded-for", "10.0.0.96")
         .send()
         .await
@@ -4207,7 +4434,7 @@ async fn review_b2_a_verified_request_does_not_clear_the_ip_failure_count() {
             assert_eq!(r.status(), StatusCode::FORBIDDEN);
         }
     }
-    let resp = signed("testsecret").send().await.unwrap();
+    let resp = signed("wrong-secret").send().await.unwrap();
     assert_eq!(
         resp.status().as_u16(),
         503,
@@ -4250,4 +4477,162 @@ async fn review_a13_a_contained_rule_does_not_stop_the_boot() {
         .send()
         .await
         .expect("alice signs in");
+}
+
+// ============================================================================
+// A failed signature during a lockout is delayed, and a delay holds no slot
+// ============================================================================
+
+/// A client that connects from the loopback address `from` (127.0.0.0/8 is local).
+fn client_from(from: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .local_address(from.parse::<std::net::IpAddr>().unwrap())
+        .build()
+        .unwrap()
+}
+
+async fn send_from(
+    client: &reqwest::Client,
+    request: reqwest::RequestBuilder,
+) -> reqwest::Response {
+    client.execute(request.build().unwrap()).await.unwrap()
+}
+
+fn signed_now(server: &TestServer, key: &str, secret: &str) -> reqwest::RequestBuilder {
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    build_signed_get(
+        &server.endpoint(),
+        &format!("/{}", server.bucket()),
+        key,
+        secret,
+        &now,
+    )
+}
+
+/// During a lockout a wrong signature waits the longest progressive delay
+/// before its 503, so the lockout never makes a guess cheaper than before it.
+/// A verified request is served at once.
+#[tokio::test]
+async fn a_failed_signature_during_a_lockout_gets_the_longest_delay() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
+        .build()
+        .await;
+    for _ in 0..3 {
+        let r = signed_now(&server, "testkey", "wrong-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+    let started = std::time::Instant::now();
+    let r = signed_now(&server, "testkey", "testsecret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "a verified request is served");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let started = std::time::Instant::now();
+    let r = signed_now(&server, "testkey", "wrong-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 503);
+    assert!(
+        started.elapsed() >= Duration::from_millis(4500),
+        "a wrong signature during a lockout answered after {:?}",
+        started.elapsed()
+    );
+}
+
+/// Failed signatures wait while they hold no request slot, and one address
+/// has a fixed number of wait places. With every place taken by sleeping
+/// failures, a request of that address is still checked: a right secret is
+/// served at once, a wrong one is answered at once with no wait, and the
+/// sleeping failures never pass the number of places.
+#[tokio::test]
+async fn a_full_address_still_serves_a_right_secret_and_answers_a_wrong_one_at_once() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_MAX_CONCURRENT_REQUESTS", "4")
+        .build()
+        .await;
+    // Past 10 failures every refusal waits.
+    let seeds = (0..20).map(|_| async {
+        signed_now(&server, "testkey", "wrong-secret")
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+    futures::future::join_all(seeds).await;
+
+    let (near, far) = (client_from("127.0.0.1"), client_from("127.0.0.2"));
+    let flood: Vec<_> = (0..60)
+        .map(|_| {
+            let request = signed_now(&server, "testkey", "wrong-secret");
+            let near = near.clone();
+            tokio::spawn(async move {
+                let sent = std::time::Instant::now();
+                let r = send_from(&near, request).await;
+                (r.status().as_u16(), sent.elapsed())
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // (d) A verified request of another address is served while they wait.
+    let t = std::time::Instant::now();
+    let r = send_from(&far, signed_now(&server, "testkey", "testsecret")).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "the verified request waited {:?} behind delayed failures",
+        t.elapsed()
+    );
+
+    // (a) The address is full, and its right secret is served at once.
+    let t = std::time::Instant::now();
+    let r = send_from(&near, signed_now(&server, "testkey", "testsecret")).await;
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "a right secret from a full address"
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "the right secret waited {:?}",
+        t.elapsed()
+    );
+    // (b) Its wrong secret gets the answer of any failure, at once.
+    let t = std::time::Instant::now();
+    let r = send_from(&near, signed_now(&server, "testkey", "wrong-secret")).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "a wrong secret");
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "the wrong secret waited {:?}",
+        t.elapsed()
+    );
+
+    // (c) At most the places sleep: the rest of the flood is answered at once.
+    let (mut at_once, mut slept) = (0, 0);
+    for s in flood {
+        let (status, took) = s.await.unwrap();
+        assert_eq!(status, 403, "a wrong signature is never a 503 here");
+        if took < Duration::from_secs(1) {
+            at_once += 1;
+        } else {
+            slept += 1;
+        }
+    }
+    assert!(slept <= 32, "{slept} failures slept; the cap is 32");
+    assert!(at_once >= 20, "60 failures, 32 places: {at_once} at once");
 }

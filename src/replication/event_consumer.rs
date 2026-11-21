@@ -620,6 +620,7 @@ fn classify_engine_error(
     use crate::deltaglider::EngineError;
     match e {
         EngineError::InvalidArgument(msg)
+        | EngineError::KeyRefused(msg)
         | EngineError::Storage(crate::storage::StorageError::InvalidKey(msg))
         | EngineError::Storage(crate::storage::StorageError::MetadataTooLarge(msg)) => {
             Box::new(PermanentKeyError(msg))
@@ -1721,6 +1722,7 @@ async fn apply_copy(
                 upload_concurrency: None,
                 keep_created_at: true,
                 commit_count: &crate::maintenance::gate::BY_ADMISSION,
+                origin: crate::types::WriteOrigin::Job,
             };
             // The copy starts from the HEAD above: no second source HEAD.
             let outcome = crate::transfer::admitted::copy_known(

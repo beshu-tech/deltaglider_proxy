@@ -73,6 +73,8 @@ pub(crate) type Hook =
 enum Arm {
     /// The call fails, each time.
     Fail(Fault),
+    /// The call fails this many more times, then goes on.
+    FailTimes(Fault, usize),
     /// The hook runs once, then the call goes on.
     Run(Hook),
 }
@@ -108,6 +110,14 @@ impl Faults {
         state
             .armed
             .insert((point, key.to_string()), Arm::Fail(fault));
+    }
+
+    /// The next `times` calls at `point` on `key` fail; later calls go on.
+    pub(crate) fn arm_times(&self, point: FaultPoint, key: &str, fault: Fault, times: usize) {
+        let mut state = self.0.lock().unwrap();
+        state
+            .armed
+            .insert((point, key.to_string()), Arm::FailTimes(fault, times));
     }
 
     /// Run `hook` once, at the next call at `point` on `key`.
@@ -220,14 +230,20 @@ impl Faults {
             let Some(arm) = state.armed.get(&k).cloned() else {
                 return Ok(());
             };
-            if matches!(arm, Arm::Run(_)) {
-                state.armed.remove(&k);
+            match arm {
+                Arm::Run(_) | Arm::FailTimes(_, 1) => {
+                    state.armed.remove(&k);
+                }
+                Arm::FailTimes(fault, n) => {
+                    state.armed.insert(k.clone(), Arm::FailTimes(fault, n - 1));
+                }
+                Arm::Fail(_) => {}
             }
             *state.fired.entry(k).or_default() += 1;
             arm
         };
         match arm {
-            Arm::Fail(fault) => Err(fault.error()),
+            Arm::Fail(fault) | Arm::FailTimes(fault, _) => Err(fault.error()),
             Arm::Run(hook) => {
                 hook().await;
                 Ok(())
@@ -345,6 +361,10 @@ impl FaultyFs {
 }
 
 impl StorageBackend for FaultyFs {
+    fn new_key_refusal(&self, bucket: &str, prefix: &str, filename: &str) -> Option<String> {
+        self.inner.new_key_refusal(bucket, prefix, filename)
+    }
+
     async fn flush_pending(&self) -> Result<(), StorageError> {
         self.inner.flush_pending().await
     }
@@ -725,6 +745,17 @@ impl StorageBackend for FaultyFs {
         self.armed(FaultPoint::ListReferencePrefixes, bucket, scope, "")
             .await?;
         self.inner.list_reference_prefixes(bucket, scope).await
+    }
+
+    async fn list_reference_prefix_stream(
+        &self,
+        bucket: &str,
+        scope: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<String, StorageError>>, StorageError>
+    {
+        self.armed(FaultPoint::ListReferencePrefixes, bucket, scope, "")
+            .await?;
+        self.inner.list_reference_prefix_stream(bucket, scope).await
     }
 
     async fn put_directory_marker(&self, bucket: &str, key: &str) -> Result<(), StorageError> {

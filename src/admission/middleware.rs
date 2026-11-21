@@ -75,9 +75,23 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
     let owned = extract_request_info(&request);
     let decision = super::evaluator::evaluate(&chain, &owned.as_ref());
     let grant = super::anonymous_grant(&decision, &owned.as_ref());
+    // Resources the request touches beyond its request line (a copy source,
+    // each key of a batch delete, every listed key) are checked against the
+    // same chain by the points that authorize them.
+    let resource_rules = super::ResourceRules::new(
+        chain.clone(),
+        &owned.method,
+        owned.source_ip,
+        owned.authenticated,
+    );
 
     match decision {
         Decision::AllowAnonymous { matched } => {
+            if let Some(rules) = resource_rules {
+                request
+                    .extensions_mut()
+                    .insert(rules.admitted_anonymously_by(&matched));
+            }
             request.extensions_mut().insert(AdmissionAllowAnonymous {
                 bucket: owned.bucket.clone(),
                 matched_block: matched,
@@ -85,7 +99,10 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
             });
         }
         Decision::Continue { .. } => {
-            // Fall through to SigV4 — no extension inserted.
+            // Fall through to SigV4.
+            if let Some(rules) = resource_rules {
+                request.extensions_mut().insert(rules);
+            }
         }
         Decision::Deny { matched } => {
             if let Some(metrics) = request.extensions().get::<std::sync::Arc<Metrics>>() {

@@ -228,6 +228,11 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // deployments that want immediate propagation instead of
         // waiting for the 5-minute poll tick.
         .route("/_/api/admin/config/sync-now", post(admin::sync_now))
+        // The operator's explicit reset of the generation floor and merge base.
+        .route(
+            "/_/api/admin/config/sync-floor/reset",
+            post(admin::reset_sync_floor),
+        )
         // This instance's config-sync state (last pull/push, errors, park).
         .route("/_/api/admin/config/sync", get(admin::sync_status))
         .route(

@@ -805,6 +805,7 @@ async fn copy_one_object(
         upload_concurrency: Some(upload_concurrency),
         keep_created_at: true,
         commit_count: &crate::maintenance::gate::BY_ADMISSION,
+        origin: crate::types::WriteOrigin::Job,
     };
     // Bound the copy: a stalled object fails fast instead of hanging until
     // lease lapse. `Elapsed` routes into the Err arm below.

@@ -113,6 +113,10 @@ pub struct ImportResult {
     /// another user). The caller ends the OAuth sessions bound to them.
     #[serde(skip)]
     pub stale_user_ids: Vec<i64>,
+    /// Set when a full restore kept the running bootstrap password although
+    /// the backup holds another one, with the reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_password: Option<String>,
 }
 
 /// Release that still converts a backup whose users carry no `id`.

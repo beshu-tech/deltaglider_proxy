@@ -35,6 +35,43 @@ pub struct AuthProviderConfig {
     pub updated_at: String,
 }
 
+/// Where a provider's client secret goes: issuer, type, `extra_config`. A change of any
+/// of them with no new secret clears the stored one, for every writer of a row.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Destination {
+    provider_type: String,
+    issuer_url: Option<String>,
+    extra_config: Option<serde_json::Value>,
+}
+
+impl Destination {
+    /// An absent, an empty and a `null` value are the same: no setting.
+    pub(crate) fn new(
+        provider_type: &str,
+        issuer_url: Option<&str>,
+        extra_config: Option<&serde_json::Value>,
+    ) -> Self {
+        let no_setting = |v: &&serde_json::Value| match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::Object(m) => m.is_empty(),
+            _ => false,
+        };
+        Self {
+            provider_type: provider_type.to_string(),
+            issuer_url: issuer_url.filter(|u| !u.is_empty()).map(str::to_string),
+            extra_config: extra_config.filter(|v| !no_setting(v)).cloned(),
+        }
+    }
+
+    pub(crate) fn of(p: &AuthProviderConfig) -> Self {
+        Self::new(
+            &p.provider_type,
+            p.issuer_url.as_deref(),
+            p.extra_config.as_ref(),
+        )
+    }
+}
+
 /// Default OAuth/OIDC scopes. Shared with the declarative-IAM YAML
 /// projection (`iam/declarative.rs`) so both serde shapes agree.
 pub(crate) fn default_scopes() -> String {
@@ -291,7 +328,23 @@ impl ConfigDb {
         id: i64,
         req: &UpdateAuthProviderRequest,
     ) -> Result<AuthProviderConfig, ConfigDbError> {
+        let current = self.get_auth_provider(id)?;
         let tx = self.conn.unchecked_transaction()?;
+        // The stored secret never follows a new destination (see [`Destination`]).
+        let moved = Destination::of(&current)
+            != Destination::new(
+                req.provider_type
+                    .as_deref()
+                    .unwrap_or(&current.provider_type),
+                req.issuer_url.as_deref().or(current.issuer_url.as_deref()),
+                req.extra_config.as_ref().or(current.extra_config.as_ref()),
+            );
+        if moved && req.client_secret.as_deref().is_none_or(str::is_empty) {
+            tx.execute(
+                "UPDATE auth_providers SET client_secret = NULL WHERE id = ?1",
+                params![id],
+            )?;
+        }
         if let Some(ref name) = req.name {
             tx.execute(
                 "UPDATE auth_providers SET name = ?1 WHERE id = ?2",
@@ -1101,6 +1154,74 @@ mod tests {
             issuer_url: Some("https://issuer.example.com".into()),
             scopes: "openid".into(),
             extra_config: None,
+        }
+    }
+
+    #[test]
+    fn a_destination_ignores_an_empty_setting() {
+        let none = Destination::new("oidc", None, None);
+        assert_eq!(
+            none,
+            Destination::new("oidc", Some(""), Some(&serde_json::json!({})))
+        );
+        assert_eq!(
+            none,
+            Destination::new("oidc", None, Some(&serde_json::Value::Null))
+        );
+        assert_ne!(none, Destination::new("oidc", Some("https://a"), None));
+        assert_ne!(none, Destination::new("github", None, None));
+        assert_ne!(
+            none,
+            Destination::new(
+                "oidc",
+                None,
+                Some(&serde_json::json!({"allow_local": true}))
+            )
+        );
+    }
+
+    /// THE rule: a stored secret never follows a new destination.
+    #[test]
+    fn an_update_that_moves_the_destination_clears_the_secret_unless_a_new_one_comes() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let p = db.create_auth_provider(&make_provider_req("dest")).unwrap();
+        let secret = |db: &ConfigDb| db.get_auth_provider(p.id).unwrap().client_secret;
+        let with = |f: &dyn Fn(&mut UpdateAuthProviderRequest)| {
+            let mut r = no_change();
+            f(&mut r);
+            r
+        };
+        // Moves nothing: the secret stays.
+        for r in [
+            with(&|r| r.name = Some("renamed".into())),
+            with(&|r| r.scopes = Some("openid email".into())),
+            with(&|r| r.client_id = Some("other-id".into())),
+            with(&|r| r.issuer_url = Some("https://issuer.example.com".into())),
+            with(&|r| r.extra_config = Some(serde_json::json!({}))),
+        ] {
+            db.update_auth_provider(p.id, &r).unwrap();
+            assert_eq!(secret(&db).as_deref(), Some("csec"));
+        }
+        // A new issuer with a new secret: the new secret.
+        db.update_auth_provider(
+            p.id,
+            &with(&|r| {
+                r.issuer_url = Some("https://b.example.com".into());
+                r.client_secret = Some("fresh".into());
+            }),
+        )
+        .unwrap();
+        assert_eq!(secret(&db).as_deref(), Some("fresh"));
+        // A new issuer alone, a new type alone, a new policy alone: no secret.
+        for r in [
+            with(&|r| r.issuer_url = Some("https://c.example.com".into())),
+            with(&|r| r.provider_type = Some("oidc-other".into())),
+            with(&|r| r.extra_config = Some(serde_json::json!({"allow_local": true}))),
+        ] {
+            db.update_auth_provider(p.id, &with(&|x| x.client_secret = Some("again".into())))
+                .unwrap();
+            db.update_auth_provider(p.id, &r).unwrap();
+            assert_eq!(secret(&db), None, "{r:?}");
         }
     }
 

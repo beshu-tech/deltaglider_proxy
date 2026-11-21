@@ -1176,6 +1176,355 @@ async fn open_window_with_an_active_job_leaves_no_marker() {
     assert_eq!(c.job(first).await["status"], "succeeded");
 }
 
+impl Conv {
+    /// The warning that the boot check logs about a bucket that it did not
+    /// convert, once it is there (`needle` in the text of a WARN line).
+    async fn wait_for_warning(&self, needle: &str) -> String {
+        let mut text = String::new();
+        for _ in 0..300 {
+            let logs: serde_json::Value = self
+                .admin
+                .get(format!(
+                    "{}/_/api/admin/logs?level=warn&limit=500",
+                    self.server.endpoint()
+                ))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            text = logs.to_string();
+            if text.contains(needle) {
+                return text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("no warning with {needle:?}: {text}");
+    }
+
+    /// Start the boot conversion, wait until the job converted the history
+    /// and closed the window, and return with the key claim in place.
+    async fn converted_at_boot(bucket: &str, n: usize) -> Self {
+        let c = Self::start(bucket, n, &[("DGP_BOOT_PLAINTEXT_CHECK", "true")], false).await;
+        for _ in 0..600 {
+            if !c.audit("encryption_conversion_opened").await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(c.audit("encryption_conversion_opened").await.len(), 1);
+        c.wait_done().await;
+        assert!(!c.marker_file().exists(), "the job closed the window");
+        c
+    }
+
+    /// What a writer on the raw disk does: delete the key claim and replace
+    /// a stored object with plaintext (the old file goes first, with its seal).
+    fn forge(&self, key: &str, body: &[u8]) {
+        let claim = self.marker_file().with_file_name(".dg-key-claim");
+        let _ = std::fs::remove_file(claim);
+        let _ = std::fs::remove_file(self.blob(key));
+        self.plant(
+            key,
+            body,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+    }
+
+    fn delete_jobs_db(&self) {
+        let dir = self.server.config_path().parent().unwrap().to_path_buf();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("deltaglider_jobs.db")
+            {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+}
+
+/// A writer deletes the claim, forges a sealed object and pads the first 100 keys with
+/// plaintext. The boot scans the whole bucket, so it opens no window (no record here).
+#[tokio::test]
+async fn padding_the_first_hundred_keys_does_not_open_a_boot_window() {
+    crate::common::expect_server_errors("a refused read of a forged object answers 500");
+    let mut c = Conv::converted_at_boot("padboot", 6).await;
+    c.forge("h-00.txt", b"EVIL");
+    for i in 0..100 {
+        c.plant(
+            &format!("!pad-{i:03}.txt"),
+            b"pad",
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+    }
+    // The jobs DB goes while no proxy runs: a live one still holds the file.
+    c.server.kill();
+    c.delete_jobs_db();
+    c.server.respawn_with_env(&[]).await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    // The boot check ends with its warning: it saw plaintext and refused.
+    c.wait_for_warning("the bucket holds encrypted objects too")
+        .await;
+    assert!(!c.marker_file().exists(), "no window over a padded listing");
+    assert_eq!(c.audit("encryption_conversion_opened").await.len(), 0);
+    assert_eq!(
+        c.get("h-00.txt").await.0,
+        500,
+        "the forged object is refused"
+    );
+    assert_eq!(
+        c.get("h-01.txt").await,
+        (200, body_of(1)),
+        "a sealed one reads"
+    );
+}
+
+/// What the boot check did about a bucket: it opened a window, or it refused.
+#[derive(Debug, PartialEq, Eq)]
+enum BootVerdict {
+    Opened,
+    Refused,
+}
+
+impl Conv {
+    /// Wait for the boot check of this bucket to end in a window or a refusal.
+    async fn boot_verdict(&self) -> BootVerdict {
+        for _ in 0..300 {
+            if !self.audit("encryption_conversion_opened").await.is_empty() {
+                return BootVerdict::Opened;
+            }
+            let logs: serde_json::Value = self
+                .admin
+                .get(format!(
+                    "{}/_/api/admin/logs?level=warn&limit=500",
+                    self.server.endpoint()
+                ))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let text = logs.to_string();
+            if text.contains("The boot did not convert it") || text.contains("plaintext check of") {
+                return BootVerdict::Refused;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the boot check of {} ended in neither", self.bucket);
+    }
+
+    /// After the conversion: `rel/v1.zip` (the baseline) and `rel/v2.zip`
+    /// (a delta), both written by the proxy, so both are sealed.
+    async fn put_sealed_delta(&self) {
+        let base = common::generate_binary(120_000, 3);
+        assert_eq!(self.put("rel/v1.zip", &base).await.0, 200);
+        let v2 = common::mutate_binary(&base, 0.01);
+        assert_eq!(self.put("rel/v2.zip", &v2).await.0, 200);
+        assert!(self.blob("rel/v2.zip.delta").exists(), "setup: a delta");
+        assert!(self.blob("rel/reference.bin").exists(), "setup: a baseline");
+    }
+
+    /// A writer on the raw disk removes every stored file of `rel/` but `keep`.
+    fn keep_only_in_rel(&self, keep: &str) {
+        let dir = self.blob("rel");
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            if entry.file_name() != keep {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        assert!(dir.join(keep).exists(), "setup: {keep} is stored");
+    }
+
+    /// A writer on the raw disk turns the history into plaintext and
+    /// deletes the key claim (no proxy runs, the jobs DB goes too).
+    fn wipe_the_proxy_evidence(&self, n: usize) {
+        for i in 0..n {
+            self.forge(&format!("h-{i:02}.txt"), b"EVIL");
+        }
+        self.delete_jobs_db();
+    }
+}
+
+/// A plaintext twin `rel/v2.zip` next to the sealed `rel/v2.zip.delta` must
+/// not hide the delta from the boot scan: the scan reads every stored form.
+#[tokio::test]
+async fn a_plaintext_twin_does_not_hide_a_sealed_delta_from_the_boot() {
+    crate::common::expect_server_errors("a refused read of a forged object answers 500");
+    let mut c = Conv::converted_at_boot("twinboot", 4).await;
+    c.put_sealed_delta().await;
+    c.server.kill();
+    c.wipe_the_proxy_evidence(4);
+    // The delta is the only sealed object left.
+    c.keep_only_in_rel("v2.zip.delta");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    c.plant("rel/v2.zip", b"EVIL-TWIN", old);
+    c.server.respawn_with_env(&[]).await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    assert_eq!(c.boot_verdict().await, BootVerdict::Refused);
+    assert!(!c.marker_file().exists(), "no window over a plaintext twin");
+    assert_eq!(c.get("h-00.txt").await.0, 500, "the plant is refused");
+}
+
+/// The baseline alone is sealed evidence: a plaintext object next to it
+/// must not hide it (a baseline is read only when a listed entry is a delta).
+#[tokio::test]
+async fn a_sealed_baseline_alone_stops_the_boot_window() {
+    crate::common::expect_server_errors("a refused read of a forged object answers 500");
+    let mut c = Conv::converted_at_boot("refboot", 4).await;
+    c.put_sealed_delta().await;
+    c.server.kill();
+    c.wipe_the_proxy_evidence(4);
+    c.keep_only_in_rel("reference.bin");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    c.plant("rel/v2.zip", b"EVIL-PLAIN", old);
+    c.server.respawn_with_env(&[]).await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    assert_eq!(c.boot_verdict().await, BootVerdict::Refused);
+    assert!(
+        !c.marker_file().exists(),
+        "no window over a sealed baseline"
+    );
+    assert_eq!(c.get("h-00.txt").await.0, 500, "the plant is refused");
+}
+
+/// A name that the engine refuses as a key (a backslash) says nothing: a conversion
+/// still starts. An I/O or backend error stops the scan (`seen_of` tests).
+#[tokio::test]
+async fn a_name_that_is_no_client_key_does_not_block_the_boot_conversion() {
+    const N: usize = 4;
+    let c = Conv::start("badname", N, &[], false).await;
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    c.plant("odd\\name.txt", b"PLAIN", old);
+    let mut c = c;
+    c.server
+        .respawn_with_env(&[("DGP_BOOT_PLAINTEXT_CHECK", "true")])
+        .await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    assert_eq!(c.boot_verdict().await, BootVerdict::Opened);
+    c.wait_done().await;
+    assert_eq!(c.plaintext_left(N), 0, "the job converted the history");
+}
+
+impl Conv {
+    /// A plaintext object that a raw writer adds: the boot check names it in
+    /// its refusal, which marks the end of the check.
+    fn plant_plain(&self, key: &str) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        self.plant(key, b"PLANT", old);
+    }
+
+    /// Forge the whole bucket as in `forge`, then restart WITHOUT touching the
+    /// jobs DB (the node's own record stays).
+    async fn forge_everything_and_restart(&mut self, n: usize) {
+        self.server.kill();
+        for i in 0..n {
+            self.forge(&format!("h-{i:02}.txt"), b"EVIL");
+        }
+        self.server.respawn_with_env(&[]).await;
+        self.admin = common::admin_http_client(&self.server.endpoint()).await;
+    }
+
+    /// A node that has no record of a bucket that already encrypts (an
+    /// upgrade): stop the server, delete the jobs DB, start it with `env`.
+    async fn restart_with_no_record(&mut self, env: &[(&str, &str)]) {
+        self.server.kill();
+        self.delete_jobs_db();
+        self.server.respawn_with_env(env).await;
+        self.admin = common::admin_http_client(&self.server.endpoint()).await;
+    }
+}
+
+/// A bucket that already encrypts, on a node with no record (an upgrade): the boot
+/// scan writes it, so a later forgery of every sealed object opens no window.
+#[tokio::test]
+async fn the_boot_scan_records_a_bucket_that_already_encrypts() {
+    crate::common::expect_server_errors("a refused read of a forged object answers 500");
+    const N: usize = 4;
+    let mut c = Conv::converted_at_boot("recscan", N).await;
+    c.server.kill();
+    // Sorts before the sealed objects, so the refusal names it.
+    c.plant_plain("!p.txt");
+    c.delete_jobs_db();
+    c.server.respawn_with_env(&[]).await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    c.wait_for_warning("the bucket holds encrypted objects too")
+        .await;
+    c.forge_everything_and_restart(N).await;
+    c.wait_for_warning("recorded that it encrypted the bucket")
+        .await;
+    assert!(!c.marker_file().exists(), "no window after the forgery");
+    assert_eq!(c.audit("encryption_conversion_opened").await.len(), 0);
+}
+
+/// A client read that opens a sealed object writes the record too (a
+/// read-only bucket never writes one any other way).
+#[tokio::test]
+async fn a_client_read_of_a_sealed_object_records_the_bucket() {
+    crate::common::expect_server_errors("a refused read of a forged object answers 500");
+    const N: usize = 4;
+    let mut c = Conv::converted_at_boot("recread", N).await;
+    c.restart_with_no_record(&[("DGP_BOOT_PLAINTEXT_CHECK", "false")])
+        .await;
+    assert_eq!(c.get("h-00.txt").await, (200, body_of(0)), "a sealed read");
+    c.plant_plain("p.txt");
+    c.forge_everything_and_restart(N).await;
+    c.wait_for_warning("recorded that it encrypted the bucket")
+        .await;
+    assert!(!c.marker_file().exists(), "no window after the forgery");
+}
+
+/// The key claim alone, found by the boot, writes the record: a writer who
+/// replaced every sealed object but left the claim cannot then delete it.
+#[tokio::test]
+async fn the_boot_records_a_bucket_from_its_key_claim() {
+    crate::common::expect_server_errors("a refused read of a forged object answers 500");
+    const N: usize = 4;
+    let mut c = Conv::converted_at_boot("reccl", N).await;
+    c.server.kill();
+    let claim = c.marker_file().with_file_name(".dg-key-claim");
+    for i in 0..N {
+        let _ = std::fs::remove_file(c.blob(&format!("h-{i:02}.txt")));
+        c.plant_plain(&format!("h-{i:02}.txt"));
+    }
+    assert!(claim.exists(), "setup: the claim stays");
+    c.delete_jobs_db();
+    c.server.respawn_with_env(&[]).await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    c.wait_for_warning("it holds a key claim").await;
+    c.server.kill();
+    std::fs::remove_file(&claim).unwrap();
+    c.server.respawn_with_env(&[]).await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    c.wait_for_warning("recorded that it encrypted the bucket")
+        .await;
+    assert!(!c.marker_file().exists(), "no window after the claim went");
+}
+
+/// The node's record that it encrypted the bucket outlives a storage writer: every sealed
+/// object replaced and the claim deleted. The boot opens no window and warns.
+#[tokio::test]
+async fn a_recorded_bucket_never_gets_a_boot_window() {
+    crate::common::expect_server_errors("a refused read of a forged object answers 500");
+    const N: usize = 6;
+    let mut c = Conv::converted_at_boot("recboot", N).await;
+    for i in 0..N {
+        c.forge(&format!("h-{i:02}.txt"), b"EVIL");
+    }
+    c.server.respawn_with_env(&[]).await;
+    c.admin = common::admin_http_client(&c.server.endpoint()).await;
+    let text = c.wait_for_warning("may have deleted the claim").await;
+    assert!(text.contains("recboot"), "{text}");
+    c.wait_for_warning("the boot never opens a window for such a bucket")
+        .await;
+    assert!(!c.marker_file().exists(), "no window for a recorded bucket");
+    assert_eq!(c.audit("encryption_conversion_opened").await.len(), 0);
+    assert_eq!(c.get("h-00.txt").await.0, 500);
+}
+
 /// Review X1: a restart-based deployment (operator, Helm, GitOps) adds the
 /// encryption to the config file. The boot finds plaintext, no key claim
 /// and no marker: it opens the window and queues the job of its run.

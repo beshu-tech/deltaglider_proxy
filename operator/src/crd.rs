@@ -100,6 +100,13 @@ pub struct RouterSpec {
     /// 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 and fc00::/7. Narrow it
     /// to your pod CIDR, because any pod in these ranges can name a client.
     pub trusted_proxy_cidrs: Option<Vec<String>>,
+    /// Keep the `X-Forwarded-For`, `Forwarded` and `X-Real-IP` headers that a
+    /// client sent (default false: the router deletes them and is the only
+    /// writer of the client address). Set it only when a layer-7 hop that you
+    /// trust (an Ingress controller or a CDN of yours) sits in front of the
+    /// router, sets the client address, and no client can reach the router
+    /// without passing through it.
+    pub trust_client_forwarded_for: Option<bool>,
     /// Create a NetworkPolicy `<name>-proxy` that admits ingress to the proxy
     /// pods only from this resource's router pods, on the proxy port (default
     /// false). Turn it on only after you check what else connects to the
@@ -176,6 +183,14 @@ impl DeltaGliderProxy {
             .filter(|c| !c.is_empty())
             .map(|c| c.join(","))
             .unwrap_or_else(|| DEFAULT_TRUSTED_PROXY_CIDRS.into())
+    }
+    /// Keep the client's own forwarding headers (`spec.router.trustClientForwardedFor`).
+    pub fn trust_client_forwarded_for(&self) -> bool {
+        self.spec
+            .router
+            .as_ref()
+            .and_then(|r| r.trust_client_forwarded_for)
+            .unwrap_or(false)
     }
     pub fn network_policy(&self) -> bool {
         self.spec

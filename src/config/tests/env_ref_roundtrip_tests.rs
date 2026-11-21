@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+use crate::config::env_template::Escape;
 use crate::config::*;
 
 const TEMPLATE: &str = r#"
@@ -47,6 +48,8 @@ storage:
     scratch:
       backend: local
       compression: ${env:UNSET_WITH_DEFAULT:-null}
+advanced:
+  public_url: https://hooks.example/${env:HOOK_PATH}
 "#;
 
 fn lookup(name: &str) -> Option<String> {
@@ -56,6 +59,7 @@ fn lookup(name: &str) -> Option<String> {
         "OIDC_CLIENT_SECRET" => Some("GOCSPX-oidc-789".into()),
         "REMOTE_KEY" => Some("AKREMOTE000000000000".into()),
         "REMOTE_SECRET" => Some("remote-secret-abc".into()),
+        "HOOK_PATH" => Some("T0123/B456/hook-token".into()),
         "LOCAL_AES_KEY" => {
             Some("00000000000000000000000000000000000000000000000000000000000000ff".into())
         }
@@ -64,25 +68,52 @@ fn lookup(name: &str) -> Option<String> {
 }
 
 fn load_template() -> Config {
-    let (expanded, refs) = expand_env_with_recording(TEMPLATE, lookup).expect("template expands");
-    let mut cfg = Config::from_yaml_str(&expanded).expect("expanded template parses");
-    cfg.env_refs = refs;
-    cfg.record_env_ref_paths();
-    cfg
+    Config::from_template_with(TEMPLATE, &lookup).expect("template loads")
+}
+
+fn render(cfg: &Config, path: &str) -> Option<String> {
+    cfg.env_refs
+        .template_at(path)
+        .map(|t| t.render(Escape::Minimal))
 }
 
 #[test]
-fn recording_captures_resolved_refs_but_not_defaults() {
-    let (_, refs) = expand_env_with_recording(TEMPLATE, lookup).unwrap();
-    assert_eq!(refs.len(), 6, "six refs resolved from env: {refs:?}");
-    assert_eq!(refs["CI_UPLOADER_SECRET"], "ci-secret-456");
-    // UNSET_WITH_DEFAULT fell back to its default — not recorded
-    // (re-emitting it as a bare ref would fail the next load).
-    assert!(!refs.contains_key("UNSET_WITH_DEFAULT"));
+fn load_records_the_value_and_the_template_of_every_reference() {
+    let cfg = load_template();
+    // Six names resolved from the environment (a value), one more used its
+    // default (no value: re-emitting it bare would fail the next load).
+    assert_eq!(cfg.env_refs.len(), 7, "{:?}", *cfg.env_refs);
+    assert_eq!(cfg.env_refs["CI_UPLOADER_SECRET"], "ci-secret-456");
+    assert!(!cfg.env_refs.contains_key("UNSET_WITH_DEFAULT"));
+    // Every string with a reference has a template, at its path.
+    for (path, text) in [
+        ("/secret_access_key", "${env:BOOTSTRAP_SECRET}"),
+        (
+            "/iam_users/[ci-uploader]/secret_access_key",
+            "${env:CI_UPLOADER_SECRET}",
+        ),
+        (
+            "/auth_providers/[google-sso]/client_secret",
+            "${env:OIDC_CLIENT_SECRET}",
+        ),
+        (
+            "/backends/[remote]/secret_access_key",
+            "${env:REMOTE_SECRET}",
+        ),
+        ("/backends/[local]/encryption/key", "${env:LOCAL_AES_KEY}"),
+        (
+            "/buckets/scratch/compression",
+            "${env:UNSET_WITH_DEFAULT:-null}",
+        ),
+        // An embedded reference is one template.
+        ("/public_url", "https://hooks.example/${env:HOOK_PATH}"),
+    ] {
+        assert_eq!(render(&cfg, path).as_deref(), Some(text), "{path}");
+    }
 }
 
 #[test]
-fn export_reemits_refs_and_never_the_secrets() {
+fn export_reemits_templates_and_never_the_secrets() {
     let cfg = load_template();
     // The export-endpoint chain: redact_all_secrets → to_canonical_yaml.
     let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
@@ -93,6 +124,7 @@ fn export_reemits_refs_and_never_the_secrets() {
         "${env:REMOTE_KEY}",
         "${env:REMOTE_SECRET}",
         "${env:LOCAL_AES_KEY}",
+        "https://hooks.example/${env:HOOK_PATH}",
     ] {
         assert!(exported.contains(r), "export must carry {r}:\n{exported}");
     }
@@ -101,19 +133,38 @@ fn export_reemits_refs_and_never_the_secrets() {
         "ci-secret-456",
         "GOCSPX-oidc-789",
         "remote-secret-abc",
+        "hook-token",
         "00000000000000000000000000000000000000000000000000000000000000ff",
     ] {
         assert!(!exported.contains(s), "export must not leak {s}");
     }
-    // And the export must still parse as a config document.
-    Config::from_yaml_str(&exported.replace("${env:", "${noexpand:"))
-        .expect("exported template re-parses");
+}
+
+/// The export of a boot file, applied unchanged as an admin document, is
+/// accepted and gives back the same values and the same templates.
+#[test]
+fn an_unchanged_export_is_admitted_and_lossless() {
+    let cfg = load_template();
+    let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
+    let (tree, added) =
+        env_template::admit_document(&exported, &cfg.env_refs, &|_| false, &|_| None)
+            .expect("the unchanged export is admitted");
+    assert!(added.templates.is_empty() && added.is_empty());
+    let text = serde_yaml::to_string(&tree).unwrap();
+    let back = Config::from_yaml_str(&text).unwrap();
+    assert_eq!(back.secret_access_key.as_deref(), Some("boot-secret-123"));
+    assert_eq!(
+        back.public_url.as_deref(),
+        Some("https://hooks.example/T0123/B456/hook-token")
+    );
+    assert_eq!(back.iam_users[0].secret_access_key, "ci-secret-456");
+    assert!(back.backends.iter().any(|b| b.name == "remote"));
 }
 
 #[test]
-fn persist_reemits_refs_even_after_runtime_mutation() {
+fn persist_reemits_templates_and_reloads_the_same_config() {
     let mut cfg = load_template();
-    // Simulate a GUI tweak: a non-secret change via the admin API.
+    // A GUI tweak of a non-secret field.
     cfg.max_object_size = (42 * 1024 * 1024).into();
     let dir = std::env::temp_dir().join(format!("dgp-envref-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -122,109 +173,94 @@ fn persist_reemits_refs_even_after_runtime_mutation() {
     let persisted = std::fs::read_to_string(&path).unwrap();
     std::fs::remove_dir_all(&dir).ok();
     assert!(persisted.contains("max_object_size: 44040192"));
-    assert!(
-        persisted.contains("${env:CI_UPLOADER_SECRET}"),
-        "persisted file keeps the user-secret ref:\n{persisted}"
-    );
-    assert!(persisted.contains("${env:LOCAL_AES_KEY}"));
-    assert!(!persisted.contains("ci-secret-456"));
-    // The persisted file must re-load against the same env (boot path).
-    let (re_expanded, _) = expand_env_with_recording(&persisted, lookup).unwrap();
-    let re = Config::from_yaml_str(&re_expanded).unwrap();
+    for r in [
+        "${env:CI_UPLOADER_SECRET}",
+        "${env:LOCAL_AES_KEY}",
+        "https://hooks.example/${env:HOOK_PATH}",
+    ] {
+        assert!(persisted.contains(r), "the file keeps {r}:\n{persisted}");
+    }
+    for s in ["ci-secret-456", "hook-token"] {
+        assert!(!persisted.contains(s), "{s} reached the file");
+    }
+    // The persisted file loads against the same env (boot path), with the
+    // same values and the same templates.
+    let re = Config::from_template_with(&persisted, &lookup).unwrap();
     assert_eq!(re.max_object_size_bytes(), 44040192);
     assert_eq!(re.iam_users[0].secret_access_key, "ci-secret-456");
+    // Every template comes back, a typed field's too, but one whose value
+    // is null: the field is not in the text, so there is nothing to write.
+    let mut want = cfg.env_refs.clone();
+    let mut frozen = (*want.frozen).clone();
+    frozen.templates.remove("/buckets/scratch/compression");
+    want.frozen = std::sync::Arc::new(frozen);
+    assert_eq!(re.env_refs, want);
 }
 
+/// S9, by path: a secret that the file wrote in two fields gets its
+/// template back in both, and plaintext never reaches the file.
 #[test]
-fn collision_resolves_deterministically() {
-    let mut cfg = Config {
-        access_key_id: Some("same-value".into()),
-        ..Default::default()
-    };
-    cfg.env_refs.insert("ZED".into(), "same-value".into());
-    cfg.env_refs.insert("ALPHA".into(), "same-value".into());
-    cfg.record_env_ref_paths();
-    let out = cfg.with_env_refs_reinserted();
-    assert_eq!(out.access_key_id.as_deref(), Some("${env:ALPHA}"));
-}
-
-#[test]
-fn no_refs_is_a_plain_clone() {
-    let cfg = Config::default();
-    assert_eq!(cfg.with_env_refs_reinserted(), cfg);
-}
-
-/// S9: a secret-length ref value that the file uses in two fields must
-/// not land on disk in plaintext. Both fields get the ref back.
-#[test]
-fn shared_secret_ref_is_reinserted_everywhere() {
-    let mut cfg = Config {
-        access_key_id: Some("AKIA-shared-secret-1".into()),
-        secret_access_key: Some("AKIA-shared-secret-1".into()),
-        ..Default::default()
-    };
-    cfg.env_refs
-        .insert("SHARED".into(), "AKIA-shared-secret-1".into());
-    let out = cfg.with_env_refs_reinserted();
+fn a_secret_used_in_two_fields_is_a_template_in_both() {
+    let tpl = "access:\n  access_key_id: ${env:SHARED}\n  secret_access_key: ${env:SHARED}\n";
+    let env = |n: &str| (n == "SHARED").then(|| "AKIA-shared-secret-1".to_string());
+    let cfg = Config::from_template_with(tpl, &env).unwrap();
+    let out = cfg.with_file_text(Escape::Minimal);
     assert_eq!(out.access_key_id.as_deref(), Some("${env:SHARED}"));
     assert_eq!(out.secret_access_key.as_deref(), Some("${env:SHARED}"));
     let yaml = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
     assert!(!yaml.contains("AKIA-shared-secret-1"), "{yaml}");
 }
 
+/// A field with no template never turns into a reference, whatever its
+/// value is: the match is by path, not by value.
 #[test]
-fn ambiguous_value_in_two_fields_is_not_reinserted() {
-    // A value that appears in TWO distinct fields is ambiguous — rewriting
-    // either into ${env:NAME} would couple the unrelated field to that env
-    // var. Both must stay materialized. (X-ray M55.)
-    let mut cfg = Config {
-        access_key_id: Some("hunter2".into()),
-        secret_access_key: Some("hunter2".into()),
-        ..Default::default()
-    };
-    cfg.env_refs.insert("SHARED".into(), "hunter2".into());
-    cfg.record_env_ref_paths();
-    let out = cfg.with_env_refs_reinserted();
+fn a_value_equal_to_a_recorded_value_is_not_turned_into_a_reference() {
+    let tpl = "access:\n  secret_access_key: ${env:S}\n";
+    let env = |n: &str| (n == "S").then(|| "hunter2-hunter2-hunter2".to_string());
+    let mut cfg = Config::from_template_with(tpl, &env).unwrap();
+    cfg.access_key_id = Some("hunter2-hunter2-hunter2".into());
+    let out = cfg.with_file_text(Escape::Minimal);
+    assert_eq!(out.secret_access_key.as_deref(), Some("${env:S}"));
     assert_eq!(
         out.access_key_id.as_deref(),
-        Some("hunter2"),
-        "ambiguous value must NOT be rewritten"
-    );
-    assert_eq!(out.secret_access_key.as_deref(), Some("hunter2"));
-
-    // But a value appearing exactly ONCE is still re-inserted.
-    let mut cfg2 = Config {
-        access_key_id: Some("only-here".into()),
-        ..Default::default()
-    };
-    cfg2.env_refs.insert("UNIQ".into(), "only-here".into());
-    cfg2.record_env_ref_paths();
-    assert_eq!(
-        cfg2.with_env_refs_reinserted().access_key_id.as_deref(),
-        Some("${env:UNIQ}")
+        Some("hunter2-hunter2-hunter2")
     );
 }
 
+/// A field that an edit changed is written as what it holds now.
 #[test]
-fn section_echo_back_resolves_instead_of_clobbering() {
-    // A GUI round-trip echoes the ref string a section GET emitted.
-    // resolve_env_ref_scalars must restore the real secret from
-    // provenance — NOT store the literal "${env:...}" string.
+fn an_edited_field_is_written_as_its_new_value() {
     let mut cfg = load_template();
-    cfg.iam_users[0].secret_access_key = "${env:CI_UPLOADER_SECRET}".into();
-    cfg.resolve_env_ref_scalars().unwrap();
-    assert_eq!(cfg.iam_users[0].secret_access_key, "ci-secret-456");
-    // And an operator-typed ref with a default resolves via the default
-    // when neither provenance nor process env has it.
-    cfg.access_key_id = Some("${env:DGP_DOES_NOT_EXIST_ANYWHERE:-fallback}".into());
-    cfg.resolve_env_ref_scalars().unwrap();
-    assert_eq!(cfg.access_key_id.as_deref(), Some("fallback"));
-    // An unresolvable ref fails loudly.
-    cfg.access_key_id = Some("${env:DGP_DOES_NOT_EXIST_ANYWHERE}".into());
-    assert!(cfg.resolve_env_ref_scalars().is_err());
-    // S7: a server env var the file never referenced does not resolve.
-    cfg.access_key_id = Some("${env:HOME}".into());
-    assert!(cfg.resolve_env_ref_scalars().is_err());
+    cfg.public_url = Some("https://elsewhere.example".into());
+    cfg.secret_access_key = Some("typed-by-hand".into());
+    let out = cfg.with_file_text(Escape::Minimal);
+    assert_eq!(out.public_url.as_deref(), Some("https://elsewhere.example"));
+    assert_eq!(out.secret_access_key.as_deref(), Some("typed-by-hand"));
+    assert_eq!(
+        out.iam_users[0].secret_access_key, "${env:CI_UPLOADER_SECRET}",
+        "the other templates stay"
+    );
+}
+
+/// A renamed backend does not keep the template of its old name: the file
+/// holds what the field holds. (The admin API refuses the reference at the
+/// new name, see `env_template::tests`.)
+#[test]
+fn a_renamed_field_loses_its_template() {
+    let mut cfg = load_template();
+    cfg.backends
+        .iter_mut()
+        .find(|b| b.name == "remote")
+        .unwrap()
+        .name = "remote-2".into();
+    let out = cfg.with_file_text(Escape::Minimal);
+    let renamed = out.backends.iter().find(|b| b.name == "remote-2").unwrap();
+    match &renamed.backend {
+        BackendConfig::S3 {
+            secret_access_key, ..
+        } => assert_eq!(secret_access_key.as_deref(), Some("remote-secret-abc")),
+        other => panic!("{other:?}"),
+    }
 }
 
 /// B037: a `${env:NAME:-default}` ref keeps its default through persist,
@@ -233,129 +269,166 @@ fn section_echo_back_resolves_instead_of_clobbering() {
 fn a_defaulted_ref_keeps_its_default_through_persist() {
     let tpl = "advanced:\n  log_level: ${env:LOG_LEVEL:-info}\n";
     let set = |n: &str| (n == "LOG_LEVEL").then(|| "debug".to_string());
-    let (exp, refs) = crate::config::expansion::expand_env_with_recording(tpl, set).unwrap();
-    let mut cfg = Config::from_yaml_str(&exp).unwrap();
-    cfg.env_refs = refs;
-    cfg.record_env_ref_paths();
+    let cfg = Config::from_template_with(tpl, &set).unwrap();
     let out = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
     assert!(out.contains("${env:LOG_LEVEL:-info}"), "{out}");
-    crate::config::expansion::expand_env_with_recording(&out, |_| None)
-        .expect("the persisted file needs LOG_LEVEL at the next boot");
+    Config::from_template_with(&out, &|_| None)
+        .expect("the persisted file loads without LOG_LEVEL");
 }
 
-/// B084: a short env value is re-emitted only where the ref was. After the
-/// GUI changed aws-dr's region (the field the ref filled), the value left
-/// in env_refs must not turn the minio backend's own literal region into
-/// `${env:DR_REGION}`.
+/// The text of a name with two different defaults is each site's own.
 #[test]
-fn a_short_ref_is_not_reinserted_into_an_unrelated_field() {
-    let tpl = "storage:\n  backends:\n  - name: aws-dr\n    type: s3\n    region: ${env:DR_REGION}\n  - name: minio\n    type: s3\n    endpoint: http://minio:9000\n    region: eu-central-1\n";
-    let set = |n: &str| (n == "DR_REGION").then(|| "us-east-1".to_string());
-    let (exp, refs) = crate::config::expansion::expand_env_with_recording(tpl, set).unwrap();
-    let mut cfg = Config::from_yaml_str(&exp).unwrap();
-    cfg.env_refs = refs;
-    cfg.record_env_ref_paths();
-    // The GUI edits: aws-dr moves to eu-west-1, minio to us-east-1.
-    for b in &mut cfg.backends {
-        if let BackendConfig::S3 { region, .. } = &mut b.backend {
-            *region = if b.name == "aws-dr" {
-                "eu-west-1"
-            } else {
-                "us-east-1"
-            }
-            .into();
-        }
-    }
-    let out = cfg.with_env_refs_reinserted();
-    for b in &out.backends {
-        if let BackendConfig::S3 { region, .. } = &b.backend {
-            assert!(!region.contains("${env:"), "{}: {region}", b.name);
-        }
-    }
-    // Unedited, the ref goes back where it was.
-    let mut cfg = Config::from_yaml_str(&exp).unwrap();
-    cfg.env_refs = crate::config::expansion::expand_env_with_recording(tpl, set)
-        .unwrap()
-        .1;
-    cfg.record_env_ref_paths();
-    let out = cfg.with_env_refs_reinserted();
-    let aws = out.backends.iter().find(|b| b.name == "aws-dr").unwrap();
-    assert!(
-        matches!(&aws.backend, BackendConfig::S3 { region, .. } if region == "${env:DR_REGION}")
+fn each_site_keeps_its_own_default() {
+    let tpl = "advanced:\n  log_level: ${env:L:-info}\n  config_sync_object_key: ${env:L:-other}\n";
+    let cfg = Config::from_template_with(tpl, &|_| Some("debug".into())).unwrap();
+    assert_eq!(
+        render(&cfg, "/log_level").as_deref(),
+        Some("${env:L:-info}")
+    );
+    assert_eq!(
+        render(&cfg, "/config_sync_object_key").as_deref(),
+        Some("${env:L:-other}")
     );
 }
 
-/// Review A2: a ref follows its field through a section write. The body
-/// carries the ref text at the field's new place (here a renamed backend);
-/// the path recorded at load went stale, so the persist wrote the literal.
+/// A literal that looks like a reference is escaped on persist and on
+/// export, so a restart never expands it.
 #[test]
-fn a_ref_follows_its_renamed_field_through_a_section_resolve() {
-    let tpl = "storage:\n  backends:\n  - name: aws-dr\n    type: s3\n    region: ${env:DR_REGION}\n  - name: minio\n    type: s3\n    endpoint: http://minio:9000\n    region: eu-central-1\n";
-    let set = |n: &str| (n == "DR_REGION").then(|| "us-east-1".to_string());
-    let (exp, refs) = crate::config::expansion::expand_env_with_recording(tpl, set).unwrap();
-    let mut old = Config::from_yaml_str(&exp).unwrap();
-    old.env_refs = refs;
-    old.record_env_ref_paths();
-    // The body as the GUI sends it back: the section GET showed the ref
-    // text, and the operator renamed the backend.
-    let mut incoming = old.with_env_refs_reinserted();
-    for b in &mut incoming.backends {
-        if b.name == "aws-dr" {
-            b.name = "aws-east".into();
-        }
-    }
-    incoming.env_refs = old.env_refs.clone();
-    incoming.resolve_env_ref_scalars().unwrap();
-    let out = incoming.with_env_refs_reinserted();
-    let region = |name: &str| match &out
-        .backends
-        .iter()
-        .find(|b| b.name == name)
-        .unwrap()
-        .backend
-    {
-        BackendConfig::S3 { region, .. } => region.clone(),
-        _ => unreachable!(),
+fn a_literal_that_looks_like_a_reference_is_written_escaped() {
+    let cfg = Config {
+        config_sync_object_key: Some("${env:HOME}".into()),
+        public_url: Some("https://h/${env:HOME}".into()),
+        ..Config::default()
     };
-    assert_eq!(region("aws-east"), "${env:DR_REGION}");
-    assert_eq!(region("minio"), "eu-central-1");
+    let persisted = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
+    assert!(persisted.contains("$${env:HOME}"), "{persisted}");
+    let exported = cfg.to_canonical_yaml().unwrap();
+    assert!(exported.contains("$${env:HOME}"), "{exported}");
+    for text in [&persisted, &exported] {
+        let env = |n: &str| (n == "HOME").then(|| "/home/leak".to_string());
+        let back = Config::from_template_with(text, &env).unwrap();
+        assert_eq!(back.config_sync_object_key.as_deref(), Some("${env:HOME}"));
+        assert_eq!(back.public_url.as_deref(), Some("https://h/${env:HOME}"));
+        assert!(back.env_refs.frozen.is_empty());
+    }
 }
 
-/// Review A3: a name written with different defaults at different sites
-/// (or with one and without one) keeps no default. The first default of a
-/// name went back at every site, so a secret written `${env:S}` came back
-/// as `${env:S:-}` and loaded EMPTY when S was unset.
+/// A map key that holds `${env:` is escaped too.
 #[test]
-fn a_name_with_two_defaults_keeps_neither() {
-    let secret = "  secret_access_key: ${env:S}\n";
-    let region = "    region: ${env:S:-}\n";
-    let backends = |region: &str| {
-        format!("storage:\n  backends:\n  - name: remote\n    type: s3\n    endpoint: http://minio:9000\n{region}")
+fn a_map_key_that_looks_like_a_reference_is_written_escaped() {
+    let mut cfg = Config::default();
+    cfg.event_delivery
+        .webhook_headers
+        .insert("X-${env:HOME}".into(), "v".into());
+    let persisted = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
+    assert!(persisted.contains("X-$${env:HOME}"), "{persisted}");
+    let env = |n: &str| (n == "HOME").then(|| "/home/leak".to_string());
+    let back = Config::from_template_with(&persisted, &env).unwrap();
+    assert!(back
+        .event_delivery
+        .webhook_headers
+        .contains_key("X-${env:HOME}"));
+}
+
+/// A reference in a typed (non-string) field is recorded and loads; the
+/// field is written as its value.
+#[test]
+fn a_reference_in_a_numeric_field_loads() {
+    let tpl = "advanced:\n  cache_size_mb: ${env:CACHE}\n";
+    let env = |n: &str| (n == "CACHE").then(|| "512".to_string());
+    let cfg = Config::from_template_with(tpl, &env).unwrap();
+    assert_eq!(cfg.cache_size_mb, 512);
+    assert_eq!(
+        render(&cfg, "/cache_size_mb").as_deref(),
+        Some("${env:CACHE}")
+    );
+}
+
+/// A flat boot file, a sectioned export and a storage shorthand name one
+/// field by one path.
+#[test]
+fn the_flat_shape_and_a_shorthand_record_the_flat_paths() {
+    let env = |n: &str| match n {
+        "AK" => Some("AKFLAT0000000000001".to_string()),
+        "SK" => Some("flat-secret-000000000000001".to_string()),
+        _ => None,
     };
-    let access = |secret: &str| format!("access:\n  access_key_id: admin\n{secret}");
-    // Both orders: the defaulted site first, and the secret first.
-    for tpl in [
-        format!("{}{}", backends(region), access(secret)),
-        format!("{}{}", access(secret), backends(region)),
-    ] {
-        let set = |n: &str| (n == "S").then(|| "sekret-value-000000000000001".to_string());
-        let (exp, refs) = crate::config::expansion::expand_env_with_recording(&tpl, set).unwrap();
-        let mut cfg = Config::from_yaml_str(&exp).unwrap();
-        cfg.env_refs = refs;
-        cfg.record_env_ref_paths();
-        let out = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
-        assert!(
-            !out.contains("${env:S:-"),
-            "a site got another site's default:\n{out}"
-        );
-        assert!(
-            crate::config::expansion::expand_env_with_recording(&out, |_| None).is_err(),
-            "the secret must fail loud without S:\n{out}"
-        );
-    }
-    // One default everywhere is kept (B037).
-    let tpl = "advanced:\n  log_level: ${env:L:-info}\nconfig_sync_object_key: ${env:L:-info}\n";
-    let (_, refs) =
-        crate::config::expansion::expand_env_with_recording(tpl, |_| Some("debug".into())).unwrap();
-    assert_eq!(refs.ref_text("L"), "${env:L:-info}");
+    let flat = Config::from_template_with(
+        "access_key_id: ${env:AK}\nsecret_access_key: ${env:SK}\n",
+        &env,
+    )
+    .unwrap();
+    let sectioned = Config::from_template_with(
+        "access:\n  access_key_id: ${env:AK}\n  secret_access_key: ${env:SK}\n",
+        &env,
+    )
+    .unwrap();
+    assert_eq!(flat.env_refs, sectioned.env_refs);
+    let shorthand = Config::from_template_with(
+        "storage:\n  s3: https://s3.example.test\n  access_key_id: ${env:AK}\n  secret_access_key: ${env:SK}\n",
+        &env,
+    )
+    .unwrap();
+    assert!(shorthand
+        .env_refs
+        .frozen
+        .templates
+        .contains_key("/backend/secret_access_key"));
+}
+
+/// The boot file has a whole reference in a typed field (an enum). A map key
+/// that an admin stored with `${env:SECRET}` in it is still written escaped:
+/// the typed-field path escapes keys like every other path.
+#[test]
+fn a_key_with_reference_text_is_escaped_when_a_typed_field_holds_a_reference() {
+    let env = |n: &str| match n {
+        "IAM_MODE" => Some("declarative".to_string()),
+        "SECRET" => Some("hunter2-hunter2-hunter2".to_string()),
+        _ => None,
+    };
+    let mut cfg = Config::from_template_with(
+        "access:\n  iam_mode: ${env:IAM_MODE}\nadvanced:\n  event_delivery:\n    webhook_url: https://hooks.example/in\n",
+        &env,
+    )
+    .unwrap();
+    cfg.event_delivery
+        .webhook_headers
+        .insert("${env:SECRET}".into(), "v".into());
+    let persisted = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
+    assert!(persisted.contains("$${env:SECRET}"), "{persisted}");
+    assert!(persisted.contains("${env:IAM_MODE}"), "{persisted}");
+    assert!(!persisted.contains("hunter2"), "{persisted}");
+    let back = Config::from_template_with(&persisted, &env).unwrap();
+    assert!(
+        back.event_delivery
+            .webhook_headers
+            .contains_key("${env:SECRET}"),
+        "the key is the literal text: {:?}",
+        back.event_delivery.webhook_headers
+    );
+    // The export is escaped the same way.
+    let exported = cfg.to_canonical_yaml().unwrap();
+    assert!(exported.contains("$${env:SECRET}"), "{exported}");
+}
+
+/// The last gate: a config whose text would hold a reference that the file
+/// does not have there is not written.
+#[test]
+fn the_persist_gate_fails_closed_on_an_unrecorded_reference() {
+    let mut cfg =
+        Config::from_template_with("advanced:\n  public_url: https://h/${env:P}\n", &|n| {
+            (n == "P").then(|| "token-0000".to_string())
+        })
+        .unwrap();
+    // A string that holds the reference text, put in the config the way a
+    // writer that skipped the escape would.
+    cfg.env_refs.rendered = true;
+    cfg.config_sync_object_key = Some("x-${env:P}".into());
+    let err = cfg
+        .to_canonical_yaml_for_persist_with(&|_| None)
+        .expect_err("refused");
+    assert!(
+        err.to_string().contains("refusing to write the config"),
+        "{err}"
+    );
 }

@@ -26,13 +26,26 @@ fn error_headers_keep_the_xml_content_type_only_with_a_body() {
 fn the_reserved_bucket_is_no_copy_source() {
     let registry = crate::bucket_policy::BucketPolicyRegistry::new(std::iter::empty(), 0.75)
         .with_reserved_bucket(Some("dgp-sync"));
-    let refused =
-        check_copy_source_access_s3s(&registry, None, "DGP-Sync", "k", None, &Default::default());
-    assert!(refused.is_err(), "a reserved copy source was read");
-    assert!(
-        check_copy_source_access_s3s(&registry, None, "other", "k", None, &Default::default())
-            .is_ok()
+    let refused = check_copy_source_access_s3s(
+        &registry,
+        None,
+        None,
+        "DGP-Sync",
+        "k",
+        None,
+        &Default::default(),
     );
+    assert!(refused.is_err(), "a reserved copy source was read");
+    assert!(check_copy_source_access_s3s(
+        &registry,
+        None,
+        None,
+        "other",
+        "k",
+        None,
+        &Default::default()
+    )
+    .is_ok());
 }
 
 /// X-ray H17: CopyObject source-read auth must honor IP-scoped conditions.
@@ -70,6 +83,7 @@ fn copy_source_access_honors_source_ip_condition() {
     assert!(
         check_copy_source_access_s3s(
             &crate::bucket_policy::BucketPolicyRegistry::new(std::iter::empty(), 0.75),
+            None,
             Some(&user),
             "src",
             "k",
@@ -83,6 +97,7 @@ fn copy_source_access_honors_source_ip_condition() {
     assert!(
         check_copy_source_access_s3s(
             &crate::bucket_policy::BucketPolicyRegistry::new(std::iter::empty(), 0.75),
+            None,
             Some(&user),
             "src",
             "k",
@@ -1190,55 +1205,61 @@ fn completed_parts_conversion_requires_etags() {
 /// the spool threshold into a spool file, at or below it into memory.
 #[tokio::test]
 async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
-    use crate::deltaglider::ingest::IngestedBody;
-    use crate::deltaglider::{DeltaGliderEngine, DynEngine};
-    let dir = tempfile::tempdir().unwrap();
-    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
-        crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
-            .await
-            .unwrap(),
-    );
-    let mut config = crate::config::Config::default();
-    config.tuning.spool_threshold_bytes = Some(64 * 1024);
-    let engine: DynEngine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
-    engine.create_bucket("src").await.unwrap();
-    let small: Vec<u8> = (0..32 * 1024u32).map(|i| (i * 7 % 251) as u8).collect();
-    let large: Vec<u8> = (0..200 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
-    for key in ["a/blob.dat", "a/app.zip"] {
-        for (body, spooled) in [(&large, true), (&small, false)] {
-            engine
-                .store("src", key, body, None, Default::default())
+    crate::deltaglider::spool::as_background(async {
+        use crate::deltaglider::ingest::IngestedBody;
+        use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
                 .await
-                .unwrap();
-            let size = engine.head("src", key).await.unwrap().file_size;
-            let (got, metadata) = read_copy_source(&engine, "src", key, "dst", size)
-                .await
-                .unwrap();
-            assert_eq!(metadata.file_size, size, "{key}");
-            assert_eq!(got.size(), body.len() as u64, "{key}");
-            match got {
-                IngestedBody::Spooled { spool, .. } if spooled => {
-                    assert_eq!(std::fs::read(spool.path()).unwrap(), *body, "{key}")
+                .unwrap(),
+        );
+        let mut config = crate::config::Config::default();
+        config.tuning.spool_threshold_bytes = Some(64 * 1024);
+        let engine: DynEngine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
+        engine.create_bucket("src").await.unwrap();
+        let small: Vec<u8> = (0..32 * 1024u32).map(|i| (i * 7 % 251) as u8).collect();
+        let large: Vec<u8> = (0..200 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+        for key in ["a/blob.dat", "a/app.zip"] {
+            for (body, spooled) in [(&large, true), (&small, false)] {
+                engine
+                    .store("src", key, body, None, Default::default())
+                    .await
+                    .unwrap();
+                let size = engine.head("src", key).await.unwrap().file_size;
+                let (got, metadata) = read_copy_source(&engine, "src", key, "dst", size)
+                    .await
+                    .unwrap();
+                assert_eq!(metadata.file_size, size, "{key}");
+                assert_eq!(got.size(), body.len() as u64, "{key}");
+                match got {
+                    IngestedBody::Spooled { spool, .. } if spooled => {
+                        assert_eq!(std::fs::read(spool.path()).unwrap(), *body, "{key}")
+                    }
+                    IngestedBody::Memory { data, .. } if !spooled => {
+                        assert_eq!(data, *body, "{key}")
+                    }
+                    other => panic!("{key}: {} bytes in the wrong medium: {other:?}", body.len()),
                 }
-                IngestedBody::Memory { data, .. } if !spooled => assert_eq!(data, *body, "{key}"),
-                other => panic!("{key}: {} bytes in the wrong medium: {other:?}", body.len()),
             }
         }
-    }
-    // A source that changed after the HEAD the conditionals judged is a
-    // retryable SlowDown, larger or smaller.
-    for head_size in [100 * 1024, 300 * 1024] {
-        engine
-            .store("src", "a/blob.dat", &large, None, Default::default())
-            .await
-            .unwrap();
-        let changed = read_copy_source(&engine, "src", "a/blob.dat", "dst", head_size).await;
-        assert_eq!(
-            changed.err().map(|e| e.code().as_str().to_string()),
-            Some("SlowDown".to_string()),
-            "{head_size}"
-        );
-    }
+        // A source that changed after the HEAD the conditionals judged is a
+        // retryable SlowDown, larger or smaller.
+        for head_size in [100 * 1024, 300 * 1024] {
+            engine
+                .store("src", "a/blob.dat", &large, None, Default::default())
+                .await
+                .unwrap();
+            let changed = read_copy_source(&engine, "src", "a/blob.dat", "dst", head_size).await;
+            assert_eq!(
+                changed.err().map(|e| e.code().as_str().to_string()),
+                Some("SlowDown".to_string()),
+                "{head_size}"
+            );
+        }
+    })
+    .await
 }
 
 /// N10: a multipart completion that tries no delta (a non-eligible key, the
@@ -1344,6 +1365,42 @@ fn a_form_post_writer_is_anonymous_only_as_the_anonymous_principal() {
     assert_eq!(Reader::of_principal(Some(&anon)), Reader::Anonymous);
 }
 
+/// An admission rule that may refuse a key directly in the folder withholds
+/// the delta facts, for a user and for open access alike: the facts of one
+/// object tell how well it compresses against the folder's other objects.
+#[test]
+fn delta_facts_are_withheld_when_a_rule_may_refuse_a_key_of_the_folder() {
+    use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
+    let chain = std::sync::Arc::new(crate::admission::AdmissionChain::from_config_parts(
+        &std::collections::BTreeMap::new(),
+        &[AdmissionBlockSpec {
+            name: "no-hidden".into(),
+            match_: MatchSpec {
+                bucket: Some("releases".into()),
+                path_glob: Some("secret/hidden*".into()),
+                ..Default::default()
+            },
+            action: ActionSpec::Simple(SimpleAction::Deny),
+        }],
+    ));
+    let rules = crate::admission::ResourceRules::new(chain, "PUT", None, true).expect("rules");
+    let mut ext = axum::http::Extensions::new();
+    ext.insert(rules);
+    let reader = |bucket: &str, key: &str| Reader::for_object(&ext, bucket, key);
+    assert_eq!(reader("releases", "secret/ok.zip"), Reader::OutsideFolder);
+    assert_eq!(reader("releases", "team/ok.zip"), Reader::Authenticated);
+    assert_eq!(
+        reader("releases", "ok.zip"),
+        Reader::Authenticated,
+        "the root folder holds no refused key"
+    );
+    assert_eq!(reader("other", "secret/ok.zip"), Reader::Authenticated);
+    assert_eq!(
+        Reader::for_form_writer(None, ext.get(), "releases", "secret/ok.zip"),
+        Reader::OutsideFolder
+    );
+}
+
 /// #120: only a reader of the whole folder gets the delta facts (write
 /// headers, HEAD/GET delta keys, LIST metadata); open access keeps them.
 #[test]
@@ -1385,11 +1442,11 @@ fn delta_facts_only_for_a_reader_of_the_whole_folder() {
     );
     let write_only = AuthenticatedUser::new("ci-uploader", "AK", vec![perm(&["write"], folder)]);
     assert_eq!(
-        Reader::for_form_writer(Some(&write_only), "releases", "v1/k"),
+        Reader::for_form_writer(Some(&write_only), None, "releases", "v1/k"),
         Reader::OutsideFolder
     );
     assert_eq!(
-        Reader::for_form_writer(None, "releases", "v1/k"),
+        Reader::for_form_writer(None, None, "releases", "v1/k"),
         Reader::Authenticated
     );
     assert_eq!(folder_of("a/b/c.zip"), "a/b/");

@@ -230,6 +230,29 @@ pub const DEFAULT_STATE_LOCK_WAIT_SECS: u64 = 60;
 /// The default of `DGP_BACKEND_SHARE_PERCENT`.
 pub const DEFAULT_BACKEND_SHARE_PERCENT: u8 = 75;
 
+/// The default of `DGP_SPOOL_READ_SHARE_PERCENT`.
+pub const DEFAULT_SPOOL_READ_SHARE_PERCENT: u8 = 25;
+
+/// The default of `DGP_SPOOL_READ_MAX_PERCENT`.
+pub const DEFAULT_SPOOL_READ_MAX_PERCENT: u8 = 75;
+
+/// The default of `DGP_RESPONSE_MAX_HOLD_SECS`: 6 hours.
+pub const DEFAULT_RESPONSE_MAX_HOLD_SECS: u64 = 21_600;
+
+/// The default of `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT`.
+pub const DEFAULT_MULTIPART_PRINCIPAL_SHARE_PERCENT: u8 = 25;
+
+/// `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT` read from `env` (1-100): THE
+/// parse, shared by the multipart store and the limits that report it.
+pub fn multipart_principal_share_percent(env: EnvLookup) -> u8 {
+    lookup_parse::<u8>(env, "DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT")
+        .unwrap_or(DEFAULT_MULTIPART_PRINCIPAL_SHARE_PERCENT)
+        .clamp(1, 100)
+}
+
+/// The default of `DGP_RESPONSE_STALL_SECS`.
+pub const DEFAULT_RESPONSE_STALL_SECS: u64 = 60;
+
 /// Env-only settings of one config snapshot. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTuning {
@@ -241,14 +264,39 @@ pub struct RuntimeTuning {
     /// `DGP_HEADER_READ_TIMEOUT_SECS` (at least 1): the time a client has
     /// to send the head of a request, and the keep-alive idle limit.
     pub header_read_timeout_secs: u64,
+    /// `DGP_H2_IDLE_TIMEOUT_SECS` (at least 1): the most time an HTTP/2
+    /// connection that already got a response below status 400 stays open
+    /// with no request in flight.
+    pub h2_idle_timeout_secs: u64,
     /// `DGP_MAX_CONNECTIONS` (at least 1): the most connections open at
     /// once. `None`: 4 x `max_concurrent_requests`, at least 4096
     /// (`serve::ListenerLimits`).
     pub max_connections: Option<usize>,
+    /// `DGP_MAX_CONNECTIONS_PER_IP` (at least 1): the most connections open
+    /// at once from one TCP peer address. `None`: a quarter of the
+    /// connection cap, at least 1 (`serve::ListenerLimits`).
+    pub max_connections_per_ip: Option<usize>,
     /// `DGP_BACKEND_SHARE_PERCENT` (1-100): the most of the request slots
     /// that the requests to one backend may hold when several backends are
     /// configured. The spool reads the same variable for its budget.
     pub backend_share_percent: u8,
+    /// `DGP_SPOOL_READ_SHARE_PERCENT` (1-100): the most of the spool budget
+    /// that the reads of one principal may hold together. The spool reads
+    /// the same variable once at boot.
+    pub spool_read_share_percent: u8,
+    /// `DGP_SPOOL_READ_MAX_PERCENT` (1-100): the most of the spool budget
+    /// that all reads together may hold; writes keep the rest. The spool
+    /// reads the same variable once at boot.
+    pub spool_read_max_percent: u8,
+    /// `DGP_RESPONSE_STALL_SECS` (at least 1): the length of one window in
+    /// which a response body that holds spool space must be read at its
+    /// minimum rate (64 KiB, or more for a large file) or it ends.
+    pub response_stall_secs: u64,
+    /// `DGP_RESPONSE_MAX_HOLD_SECS` (at least 1): the time after which a
+    /// response body that holds spool space is released whatever its client
+    /// does; the minimum rate of a window grows with the file's size to
+    /// keep this bound.
+    pub response_max_hold_secs: u64,
     /// `DGP_CORS_PERMISSIVE` (dev mode).
     pub cors_permissive: bool,
     /// `DGP_DEBUG_HEADERS`.
@@ -289,6 +337,11 @@ pub struct RuntimeTuning {
     /// `DGP_MAX_TOTAL_MULTIPART_BYTES`: what all open multipart uploads may
     /// hold together (`None` = half of the budget).
     pub multipart_total_max: Option<u64>,
+    /// `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT` (1-100): the share of one
+    /// principal of the open uploads and of the part bytes
+    /// ([`crate::budget_share`]). The multipart store reads the same variable
+    /// once at boot.
+    pub multipart_principal_share_percent: u8,
     /// The effective limits of this snapshot ([`super::Config::resolve_limits`]).
     /// `None` until the spool measured its disk at boot (a unit test, `config
     /// lint`): `auto` then reads as the defaults of earlier releases.
@@ -355,10 +408,30 @@ impl RuntimeTuning {
                 crate::serve::DEFAULT_HEADER_READ_TIMEOUT.as_secs(),
             )
             .max(1),
+            h2_idle_timeout_secs: parse_or(
+                "DGP_H2_IDLE_TIMEOUT_SECS",
+                crate::serve::DEFAULT_H2_IDLE_TIMEOUT.as_secs(),
+            )
+            .max(1),
             max_connections: lookup_parse::<usize>(env, "DGP_MAX_CONNECTIONS").map(|n| n.max(1)),
+            max_connections_per_ip: lookup_parse::<usize>(env, "DGP_MAX_CONNECTIONS_PER_IP")
+                .map(|n| n.max(1)),
             backend_share_percent: lookup_parse::<u8>(env, "DGP_BACKEND_SHARE_PERCENT")
                 .unwrap_or(DEFAULT_BACKEND_SHARE_PERCENT)
                 .clamp(1, 100),
+            spool_read_share_percent: lookup_parse::<u8>(env, "DGP_SPOOL_READ_SHARE_PERCENT")
+                .unwrap_or(DEFAULT_SPOOL_READ_SHARE_PERCENT)
+                .clamp(1, 100),
+            spool_read_max_percent: lookup_parse::<u8>(env, "DGP_SPOOL_READ_MAX_PERCENT")
+                .unwrap_or(DEFAULT_SPOOL_READ_MAX_PERCENT)
+                .clamp(1, 100),
+            response_stall_secs: parse_or("DGP_RESPONSE_STALL_SECS", DEFAULT_RESPONSE_STALL_SECS)
+                .max(1),
+            response_max_hold_secs: parse_or(
+                "DGP_RESPONSE_MAX_HOLD_SECS",
+                DEFAULT_RESPONSE_MAX_HOLD_SECS,
+            )
+            .max(1),
             cors_permissive: lookup_bool(env, "DGP_CORS_PERMISSIVE", false),
             debug_headers: lookup_bool(env, "DGP_DEBUG_HEADERS", false),
             trust_proxy_headers: lookup_bool(env, "DGP_TRUST_PROXY_HEADERS", false),
@@ -380,6 +453,7 @@ impl RuntimeTuning {
             spool_max: super::limits::parse_spool_setting(env("DGP_SPOOL_MAX_BYTES").as_deref()).0,
             multipart_relay_upload_max: lookup_parse(env, "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES"),
             multipart_total_max: lookup_parse(env, "DGP_MAX_TOTAL_MULTIPART_BYTES"),
+            multipart_principal_share_percent: multipart_principal_share_percent(env),
             limits: None,
             // 0 would abandon the blocking tasks at once.
             shutdown_timeout_secs: parse_or(
@@ -465,8 +539,15 @@ mod tests {
         ("DGP_REQUEST_TIMEOUT_SECS", Zero::Floor1),
         ("DGP_MAX_CONCURRENT_REQUESTS", Zero::Floor1),
         ("DGP_HEADER_READ_TIMEOUT_SECS", Zero::Floor1),
+        ("DGP_H2_IDLE_TIMEOUT_SECS", Zero::Floor1),
         ("DGP_MAX_CONNECTIONS", Zero::Floor1),
+        ("DGP_MAX_CONNECTIONS_PER_IP", Zero::Floor1),
         ("DGP_BACKEND_SHARE_PERCENT", Zero::Floor1),
+        ("DGP_SPOOL_READ_SHARE_PERCENT", Zero::Floor1),
+        ("DGP_SPOOL_READ_MAX_PERCENT", Zero::Floor1),
+        ("DGP_RESPONSE_MAX_HOLD_SECS", Zero::Floor1),
+        ("DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT", Zero::Floor1),
+        ("DGP_RESPONSE_STALL_SECS", Zero::Floor1),
         // 0 would refuse every signed request (RequestTimeTooSkewed).
         ("DGP_CLOCK_SKEW_SECONDS", Zero::Floor1),
         (
@@ -713,6 +794,12 @@ mod tests {
         );
         assert_eq!(t.spool_threshold_bytes, None);
         assert_eq!(t.spool_acquire_timeout_secs, 120);
+        assert_eq!(t.spool_read_share_percent, 25);
+        assert_eq!(
+            (t.spool_read_max_percent, t.response_max_hold_secs),
+            (75, 21_600)
+        );
+        assert_eq!(t.response_stall_secs, 60);
         assert_eq!(
             t.disk_monitor,
             DiskMonitorTuning {
@@ -773,6 +860,10 @@ mod tests {
             ("DGP_CODEC_ABSOLUTE_SECS", "11"),
             ("DGP_SPOOL_THRESHOLD_BYTES", "12"),
             ("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", "13"),
+            ("DGP_SPOOL_READ_SHARE_PERCENT", "40"),
+            ("DGP_RESPONSE_STALL_SECS", "21"),
+            ("DGP_SPOOL_READ_MAX_PERCENT", "60"),
+            ("DGP_RESPONSE_MAX_HOLD_SECS", "3600"),
             ("DGP_DISK_MONITOR_INTERVAL_SECS", "4"),
             ("DGP_DISK_LOW_PERCENT", "20"),
             ("DGP_DISK_HIGH_PERCENT", "99"),
@@ -808,6 +899,14 @@ mod tests {
         );
         assert_eq!(t.spool_threshold_bytes, Some(12));
         assert_eq!(t.spool_acquire_timeout_secs, 13);
+        assert_eq!(
+            (t.spool_read_share_percent, t.response_stall_secs),
+            (40, 21)
+        );
+        assert_eq!(
+            (t.spool_read_max_percent, t.response_max_hold_secs),
+            (60, 3600)
+        );
         // A percent is kept in 1 to 50.
         assert_eq!(
             t.disk_monitor,

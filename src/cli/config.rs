@@ -499,26 +499,30 @@ async fn apply_async(
 ) -> Result<i32, CliError> {
     let yaml =
         std::fs::read_to_string(input).map_err(|e| CliError::Io(format!("read {input}: {e}")))?;
-    // Expand ${VAR} / ${VAR:-default} against the OPERATOR's environment before
-    // sending — apply-from-disk is symmetric with a server loading the file, so
-    // the same secret-free-template-plus-env workflow works for `config apply`.
-    // Escape the result so the server's own expansion pass is a no-op on
-    // it: without this a literal `$$` became `$` twice over, and an expanded
-    // value that contains `${env:..}` was expanded again on the server.
-    let yaml = crate::config::expand_env_vars(&yaml)
-        .map(|y| crate::config::escape_dollars(&y))
-        .map_err(|e| CliError::Rejected(format!("{input}: {e}")))?;
-    if yaml.trim().is_empty() {
+    let raw = yaml;
+    if raw.trim().is_empty() {
         return Err(CliError::Rejected(
             "refusing to apply an empty YAML body".into(),
         ));
     }
 
     let client = admin_login(&opts).await?;
-    let url = format!(
-        "{}/_/api/admin/config/apply",
-        opts.server.trim_end_matches('/')
-    );
+    let base = opts.server.trim_end_matches('/');
+    // Expand against the OPERATOR's environment and escape; a reference that the
+    // server's export holds at the same place stays one (the server keeps that place).
+    let export_url = format!("{base}/_/api/admin/config/export");
+    let export = client
+        .get(&export_url)
+        .send()
+        .await
+        .map_err(|e| CliError::Http(format!("GET {export_url}: {e}")))?
+        .text()
+        .await
+        .map_err(|e| CliError::Http(format!("GET {export_url}: {e}")))?;
+    let yaml =
+        crate::config::env_template::cli_document(&raw, &export, &crate::config::process_env)
+            .map_err(|e| CliError::Rejected(format!("{input}: {e}")))?;
+    let url = format!("{base}/_/api/admin/config/apply");
 
     let mut req = client.post(&url).json(&serde_json::json!({ "yaml": yaml }));
     if !confirm.key_removal.is_empty() {

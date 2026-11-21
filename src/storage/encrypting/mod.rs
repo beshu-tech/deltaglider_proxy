@@ -28,6 +28,7 @@ mod bucket_tests;
 pub mod conversion;
 #[cfg(test)]
 mod conversion_tests;
+mod encrypts_record;
 mod format;
 #[cfg(test)]
 mod read_rule_tests;
@@ -45,6 +46,7 @@ pub use token_heal::LISTING_TOKEN_MISSES;
 
 pub use seal::{ENCRYPTION_MARKER_KEYS, PRESENTED_MARKER_VALUE};
 
+pub use encrypts_record::EncryptsRecord;
 pub use format::*;
 pub use sentinel::KeySentinel;
 pub use witness::{WitnessGate, WitnessGateState, WITNESS_BACKEND_DEFAULT};
@@ -195,6 +197,8 @@ pub struct EncryptionPolicies {
     atomicity: Arc<AtomicityGate>,
     /// The foreign-key sentinel of each slot (same keys as `slots`).
     sentinels: parking_lot::Mutex<std::collections::HashMap<String, Arc<KeySentinel>>>,
+    /// The node's own record of the buckets that it encrypted (`encrypts_record.rs`).
+    record: Arc<EncryptsRecord>,
 }
 
 impl EncryptionPolicies {
@@ -207,6 +211,12 @@ impl EncryptionPolicies {
     /// (filled by `coordination::BackendCapabilityCache`).
     pub fn atomicity_gate(&self) -> Arc<AtomicityGate> {
         self.atomicity.clone()
+    }
+
+    /// The record of the buckets that this node encrypted, for every engine
+    /// of the lineage (`install` it once the jobs DB is open).
+    pub fn encrypts_record(&self) -> Arc<EncryptsRecord> {
+        self.record.clone()
     }
 
     /// The foreign-key sentinel of slot `key`: an engine rebuild keeps the
@@ -370,6 +380,8 @@ pub struct EncryptingBackend<B: StorageBackend> {
     sentinel: Option<Arc<KeySentinel>>,
     /// The atomic-writes gate (named by the witness's backend name).
     atomicity: Option<Arc<AtomicityGate>>,
+    /// The node's record of the buckets that it encrypted.
+    record: Option<Arc<EncryptsRecord>>,
     /// Heals listing-token misses (`token_heal.rs`).
     healer: token_heal::TokenHealer,
     /// The conversion windows of this wrapper's buckets (`conversion.rs`).
@@ -390,10 +402,25 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             witness: None,
             sentinel: None,
             atomicity: None,
+            record: None,
             healer: Default::default(),
             windows: Default::default(),
             ignored: Default::default(),
             built: None,
+        }
+    }
+
+    /// Note the buckets that this wrapper seals, claims or converts in the
+    /// node's own record.
+    pub fn with_record(mut self, record: Arc<EncryptsRecord>) -> Self {
+        self.record = Some(record);
+        self
+    }
+
+    /// Note that `bucket` encrypts, by the first event `why`.
+    async fn note_encrypts(&self, bucket: &str, why: &str) {
+        if let Some(record) = &self.record {
+            record.note(&self.conversion_identity(bucket), why).await;
         }
     }
 
@@ -548,6 +575,10 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             return Ok(());
         };
         let write = site.as_ref().map(|s| s.fingerprint());
+        // A write that seals comes next: the node remembers the bucket first.
+        if write.is_some() {
+            self.note_encrypts(bucket, "sealed a write").await;
+        }
         let held = |fp: &sentinel::Fingerprint| cfg.ring().get(fp).is_some();
         let now = std::time::Instant::now;
         let mut refusal = sentinel.refusal(bucket, now(), held);
@@ -1038,16 +1069,28 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         // The apply's steps judge the bucket by the built config.
         match op {
             Op::Open { window_secs, mode } => {
-                return Ok(Reply::Opened(
-                    self.open_marker(bucket, window_secs, mode).await?,
-                ))
+                let opened = self.open_marker(bucket, window_secs, mode).await?;
+                self.note_encrypts(bucket, "opened a conversion").await;
+                return Ok(Reply::Opened(opened));
             }
             Op::CloseAsBuilt { run } => {
                 let cfg = self.built_config();
-                return Ok(Reply::Changed(
-                    self.change_marker(bucket, &cfg, None, run.as_ref(), |_| None)
-                        .await?,
-                ));
+                let changed = self
+                    .change_marker(bucket, &cfg, None, run.as_ref(), |_| None)
+                    .await?;
+                self.note_encrypts(bucket, "closed a conversion").await;
+                return Ok(Reply::Changed(changed));
+            }
+            Op::NoteEncrypts { why } => {
+                self.note_encrypts(bucket, why).await;
+                return Ok(Reply::Encrypts(Ok(true)));
+            }
+            Op::Encrypts => {
+                let recorded = match &self.record {
+                    Some(record) => record.recorded(&self.conversion_identity(bucket)).await,
+                    None => Err("this backend keeps no record".to_string()),
+                };
+                return Ok(Reply::Encrypts(recorded));
             }
             _ => {}
         }
@@ -1060,8 +1103,14 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             Op::Extend { run, deadline } => {
                 Reply::Changed(self.extend_conversion(bucket, &run, deadline).await?)
             }
-            Op::Close { run } => Reply::Changed(self.close_conversion(bucket, &run).await?),
-            Op::Open { .. } | Op::CloseAsBuilt { .. } => unreachable!("answered above"),
+            Op::Close { run } => {
+                let changed = self.close_conversion(bucket, &run).await?;
+                self.note_encrypts(bucket, "closed a conversion").await;
+                Reply::Changed(changed)
+            }
+            Op::Open { .. } | Op::CloseAsBuilt { .. } | Op::Encrypts | Op::NoteEncrypts { .. } => {
+                unreachable!("answered above")
+            }
         })
     }
 
@@ -1431,6 +1480,10 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         let closed = conversion::Window::Closed;
         let first = self.present_raw(bucket, prefix, object, raw, &closed);
         if !first.as_ref().is_err_and(seal::is_plaintext_refusal) {
+            // A seal that opens is proof that this proxy encrypted the bucket.
+            if first.as_ref().is_ok_and(|o| o.sealed.is_some()) {
+                self.note_encrypts(bucket, "opened a sealed object").await;
+            }
             return first;
         }
         let (mut window, fresh) = self.window_and_freshness(bucket).await;
@@ -2498,6 +2551,10 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
             .await
     }
 
+    fn new_key_refusal(&self, bucket: &str, prefix: &str, filename: &str) -> Option<String> {
+        self.inner.new_key_refusal(bucket, prefix, filename)
+    }
+
     fn multipart_storage_label(&self, bucket: &str) -> &'static str {
         if !self.writes_plaintext(bucket) {
             return "aes256-gcm-proxy";
@@ -2844,6 +2901,9 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
         if let Some(sentinel) = &self.sentinel {
             sentinel.forget(b);
         }
+        if let Some(record) = &self.record {
+            record.forget(&self.conversion_identity(b)).await;
+        }
         Ok(())
     }
     async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
@@ -2905,6 +2965,14 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
     }
     async fn list_reference_prefixes(&self, b: &str, s: &str) -> Result<Vec<String>, StorageError> {
         self.inner.list_reference_prefixes(b, s).await
+    }
+    async fn list_reference_prefix_stream(
+        &self,
+        b: &str,
+        s: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<String, StorageError>>, StorageError>
+    {
+        self.inner.list_reference_prefix_stream(b, s).await
     }
     async fn total_size(&self, b: Option<&str>) -> Result<u64, StorageError> {
         self.inner.total_size(b).await

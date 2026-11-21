@@ -106,6 +106,18 @@ impl RangeSpoolCache {
         self.fills.load(Ordering::SeqCst)
     }
 
+    /// The cached spool of `key` if it is fresh and not being filled now:
+    /// a hit that needs no fill, and so no reservation.
+    pub(crate) fn peek(&self, key: &RangeSpoolKey) -> Option<Arc<Spool>> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let slot = self.slots.lock().get(key).cloned()?;
+        let entry = slot.entry.try_lock().ok()?;
+        let e = entry.as_ref()?;
+        (e.created.elapsed() < self.ttl).then(|| e.spool.clone())
+    }
+
     /// The verified spool of `key`: the cached one while it is fresh, else
     /// the result of `fill` (which must verify it), cached. A concurrent
     /// caller of the same key waits for the running fill. A failed fill is

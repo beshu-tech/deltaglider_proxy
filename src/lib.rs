@@ -15,6 +15,7 @@ pub mod audit;
 pub mod background;
 pub mod bucket_policy;
 pub mod bucket_usage;
+pub mod budget_share;
 pub mod cli;
 pub mod config;
 pub mod config_apply;
@@ -35,6 +36,7 @@ pub mod iam;
 pub mod init;
 pub mod job_loop;
 pub mod lifecycle;
+pub mod linear_glob;
 pub mod logs;
 pub mod maintenance;
 pub mod metadata_cache;
@@ -717,6 +719,186 @@ storage:
         );
     }
 
+    /// THE rule of a new bootstrap hash: `install_bootstrap_hash` needs a
+    /// `BootstrapAuthority` (the current password, or a session that logged
+    /// in with it). The callers of the installer and the makers of an
+    /// authority are the functions named here; a new one fails this test.
+    #[test]
+    fn a_new_bootstrap_hash_needs_a_bootstrap_authority() {
+        const PW: &str = "src/api/admin/config/password.rs";
+        const BK: &str = "src/api/admin/backup.rs";
+        // (what the line calls, [(file, function)])
+        let rules: [(&str, &[(&str, &str)]); 3] = [
+            (
+                "install_bootstrap_hash(",
+                &[
+                    (PW, "change_password"),
+                    (BK, "apply_secrets"),
+                    (BK, "roll_back"),
+                ],
+            ),
+            (
+                "BootstrapAuthority::prove_current_password(",
+                &[(PW, "change_password")],
+            ),
+            ("BootstrapAuthority::of_request(", &[(BK, "import_backup")]),
+        ];
+        for (call, allowed) in rules {
+            let mut callers = Vec::new();
+            for (rel, text) in crate::source_scan::prod_sources("src") {
+                let prod = crate::source_scan::prod_mask(&text);
+                for (at, line) in text.lines().enumerate() {
+                    if !prod[at]
+                        || line.trim_start().starts_with("//")
+                        || line.contains("fn ")
+                        || !line.contains(call)
+                    {
+                        continue;
+                    }
+                    callers.push((rel.clone(), crate::source_scan::enclosing_fn(&text, at).0));
+                }
+            }
+            callers.sort();
+            callers.dedup();
+            let mut want: Vec<(String, String)> = allowed
+                .iter()
+                .map(|(f, n)| (f.to_string(), n.to_string()))
+                .collect();
+            want.sort();
+            assert_eq!(
+                callers, want,
+                "a new caller of {call} skips the bootstrap rule"
+            );
+        }
+    }
+
+    /// THE rule of an environment reference in admin input (S7): the judge
+    /// `env_template::admit_*` runs before any expansion, and only these
+    /// functions hand admin text to it. No admin file expands text itself.
+    #[test]
+    fn admin_text_meets_env_references_only_through_the_judge() {
+        const DOC: &str = "src/api/admin/config/document_level.rs";
+        const SEC: &str = "src/api/admin/config/section_level.rs";
+        const BK: &str = "src/api/admin/backup.rs";
+        let rules: [(&str, &[(&str, &str)]); 2] = [
+            (
+                "admit_document(",
+                &[
+                    (DOC, "parse_and_validate_yaml"),
+                    (BK, "hydrate_restore_doc"),
+                ],
+            ),
+            ("admit_section_body(", &[(SEC, "section_write")]),
+        ];
+        for (call, allowed) in rules {
+            let mut callers = Vec::new();
+            for (rel, text) in crate::source_scan::prod_sources("src") {
+                let prod = crate::source_scan::prod_mask(&text);
+                for (at, line) in text.lines().enumerate() {
+                    if !prod[at]
+                        || line.trim_start().starts_with("//")
+                        || line.contains("fn ")
+                        || !line.contains(call)
+                    {
+                        continue;
+                    }
+                    callers.push((rel.clone(), crate::source_scan::enclosing_fn(&text, at).0));
+                }
+            }
+            callers.sort();
+            callers.dedup();
+            let mut want: Vec<(String, String)> = allowed
+                .iter()
+                .map(|(f, n)| (f.to_string(), n.to_string()))
+                .collect();
+            want.sort();
+            assert_eq!(callers, want, "a new caller of {call} skips the judge");
+        }
+        // The expanders that read text as a whole are for files the operator
+        // wrote and for the CLI: never for a request.
+        for (rel, text) in crate::source_scan::prod_sources("src/api") {
+            let prod = crate::source_scan::prod_text(&text);
+            for name in [
+                "expand_env_vars(",
+                "expand_env_with(",
+                "expand_env_doc_with(",
+            ] {
+                assert!(!prod.contains(name), "{rel} expands text with {name}");
+            }
+        }
+    }
+
+    /// The frozen set (S7) is made once, when a config file is loaded, and no
+    /// admin code assigns or edits it; every writer meets it in the one
+    /// transition gate and the config-write pipeline.
+    #[test]
+    fn the_frozen_set_is_made_at_load_and_judged_by_every_writer() {
+        let mut makers = Vec::new();
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            let prod = crate::source_scan::prod_text(&text);
+            if prod.contains("Frozen::record(") {
+                makers.push(rel.clone());
+            }
+            for edit in [
+                ".frozen =",
+                ".frozen.templates.insert",
+                "frozen.destinations.insert",
+            ] {
+                if rel != "src/config/env_template.rs" && rel != "src/config/mod.rs" {
+                    assert!(!prod.contains(edit), "{rel} edits the frozen set: {edit}");
+                }
+            }
+            // Only the end of a migrate route drops frozen entries.
+            if rel != "src/config/expansion.rs" {
+                assert!(!prod.contains("make_mut(&mut self.frozen)"), "{rel}");
+            }
+        }
+        assert_eq!(makers, ["src/config/mod.rs"], "only the file load freezes");
+        let gates = std::fs::read_to_string("src/api/admin/config/transition.rs").unwrap();
+        assert!(
+            crate::source_scan::prod_text(&gates).contains("write::frozen_check("),
+            "the transition gate must judge the frozen set"
+        );
+        let write = crate::source_scan::prod_text(
+            &std::fs::read_to_string("src/api/admin/config/write.rs").unwrap(),
+        );
+        let apply =
+            crate::source_scan::prod_text(&std::fs::read_to_string("src/config_apply.rs").unwrap());
+        assert!(
+            apply.contains("MaskedView::of(&rollback, true)"),
+            "the background writer must edit a masked view"
+        );
+        for call in [
+            "frozen_check(old, &incoming, false)",
+            "MaskedView::of(old, false)",
+            "build_over_masked_frozen(cfg,",
+        ] {
+            assert!(write.contains(call), "the write pipeline lost {call}");
+        }
+    }
+
+    /// The authority cannot be forged: its field and its constructors are
+    /// private to `password.rs`, and the password check runs inside it.
+    #[test]
+    fn the_bootstrap_authority_is_made_only_in_its_own_module() {
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            if rel == "src/api/admin/config/password.rs" {
+                continue;
+            }
+            let prod = crate::source_scan::prod_text(&text);
+            assert!(
+                !prod.contains("BootstrapAuthority(") && !prod.contains("from_session_method"),
+                "{rel} makes a BootstrapAuthority"
+            );
+        }
+        let own = crate::source_scan::prod_text(include_str!("api/admin/config/password.rs"));
+        assert!(
+            !own.contains("pub(crate) fn from_") && !own.contains("pub fn from_"),
+            "a public constructor of BootstrapAuthority"
+        );
+        assert!(own.contains("fn prove_current_password") && own.contains("bcrypt::verify("));
+    }
+
     #[test]
     fn checker_truth_table() {
         let schema = serde_json::json!({
@@ -747,6 +929,45 @@ mod source_guards {
     use crate::source_scan::{
         out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
+
+    /// DGP input limit, in two places. `api::input_limits` checks the key of the
+    /// path (every method) and the query text of a LIST (one middleware,
+    /// outside admission and SigV4), and the key field of a form POST. Every
+    /// other key text (a copy source, the keys of a DeleteObjects body, the
+    /// keys and prefixes of the admin bulk endpoints) reaches a policy only
+    /// through `CompiledPolicy::evaluate`, which denies text over the limit
+    /// for a principal that is not an unconditional admin
+    /// (`text_over_the_limit_is_denied_for_everyone_but_an_unconditional_admin`;
+    /// guard `iam_rs_evaluates_only_through_ask_iam_rs`). A new entry point
+    /// with key text in the URL must be added here.
+    #[test]
+    fn every_s3_text_input_is_length_checked() {
+        for (file, function, call) in [
+            (
+                "src/api/handlers/form_post.rs",
+                "read_form_head",
+                "input_limits::check_key(",
+            ),
+            (
+                "src/api/input_limits.rs",
+                "input_limits_middleware",
+                "check_target(",
+            ),
+        ] {
+            let body = crate::source_scan::prod_fn_text(file, function);
+            assert!(body.contains(call), "{file}::{function} must call {call}");
+        }
+        let router = crate::source_scan::read("src/api/s3_router.rs");
+        let layers = router
+            .matches("input_limits::input_limits_middleware")
+            .count();
+        assert_eq!(layers, 1, "the S3 router layers the length check once");
+        assert!(
+            router.find("input_limits::input_limits_middleware")
+                > router.find("crate::admission::admission_middleware"),
+            "the length check is a layer outside admission (it comes after it in the chain)"
+        );
+    }
 
     /// F13 (#145): everything that can stop a boot for an environment reason
     /// (the state-directory lock, the spool, the listener, TLS, the bootstrap
@@ -3450,7 +3671,8 @@ mod source_guards {
                     && o.segs[o.segs.len() - 2] == "bcrypt"
                     && o.segs[o.segs.len() - 1] == "verify"
             }) || before("iam_user_secret_valid")
-                || before("probe_key"))
+                || before("probe_key")
+                || before("prove_current_password"))
     }
 
     #[test]
@@ -3500,8 +3722,9 @@ mod source_guards {
                         continue; // the definition of the check fn
                     }
                     sites += 1;
+                    // A guard taken as a parameter was entered by the caller.
                     assert!(
-                        head.contains("RateLimitGuard::enter"),
+                        head.contains("RateLimitGuard::enter") || head.contains("RateLimitGuard<"),
                         "{file}: `{check}` without a RateLimitGuard before it in its fn"
                     );
                 }
@@ -4404,6 +4627,264 @@ mod source_guards {
         );
     }
 
+    /// The calls that ask IAM about a client resource.
+    const IAM_CHECKS: [&str; 4] = [
+        "can_with_context",
+        "can",
+        "user_can_see_listed_key",
+        // The folder-wide read that gates the delta facts: a caller that may
+        // read the folder by policy still must not learn about a key that a rule refuses.
+        "can_read_whole_prefix",
+    ];
+
+    /// The calls that ask the admission rules, with the files where each
+    /// counts (`refusal` is also the name of other gates).
+    const ADMISSION_CHECKS: [(&str, &[&str]); 5] = [
+        ("admission_refusal", &[]),
+        ("may_refuse_in_folder", &[]),
+        ("lists_key", &[]),
+        ("list_refusal", &[]),
+        (
+            "refusal",
+            &["src/api/admin/objects.rs", "src/api/handlers/form_post.rs"],
+        ),
+    ];
+
+    /// (file, function, why it need not ask the rules in its own body).
+    const NO_ADMISSION_CHECK: &[(&str, &str, &str)] = &[
+        (
+            "src/iam/middleware.rs",
+            "authorization_middleware",
+            "the key of the request line: the admission middleware ran the chain on it first",
+        ),
+        (
+            "src/iam/permissions.rs",
+            "can_list_prefix_with_context",
+            "a pure IAM predicate; the list filter (iam/listing.rs) adds the rules",
+        ),
+        (
+            "src/iam/permissions.rs",
+            "user_can_see_listed_key",
+            "a pure IAM predicate; its callers (list filter, ListMultipartUploads) add `lists_key`",
+        ),
+        (
+            "src/iam/permissions.rs",
+            "user_can_see_common_prefix",
+            "a pure IAM predicate; the list filter (iam/listing.rs) adds the rules",
+        ),
+        (
+            "src/iam/types.rs",
+            "can_read_whole_prefix",
+            "a pure IAM predicate; its one caller `Reader::narrow` also asks `may_refuse_in_folder`",
+        ),
+        (
+            "src/iam/permissions.rs",
+            "may_attempt_batch_delete",
+            "a bucket-level gate; DeleteObjects asks `admission_refusal` for each key",
+        ),
+    ];
+
+    /// Functions that take the admission answer from their caller: every
+    /// caller must ask the rules itself.
+    const ASKED_BY_CALLER: &[(&str, &str, &str)] = &[
+        (
+            "src/s3_adapter_s3s/copy.rs",
+            "check_copy_source_access_s3s",
+            "takes the `Refusal` of the source as an argument",
+        ),
+        (
+            "src/api/handlers/form_post.rs",
+            "authenticate_form_post",
+            "its one caller asks `ResourceRules::refusal` for the form key right after",
+        ),
+    ];
+
+    /// The functions of `src` that call an IAM check and no admission check.
+    fn unasked_functions(src: &crate::source_scan::ast::Source) -> Vec<String> {
+        let callers: std::collections::BTreeSet<usize> = IAM_CHECKS
+            .iter()
+            .flat_map(|name| src.prod.calls_named(name).map(|c| c.func))
+            .collect();
+        callers
+            .into_iter()
+            .filter(|&func| {
+                !ADMISSION_CHECKS.iter().any(|(name, files)| {
+                    (files.is_empty() || files.contains(&src.rel.as_str()))
+                        && src.prod.calls_named(name).any(|c| c.func == func)
+                })
+            })
+            .map(|func| src.fn_name(func).to_string())
+            .collect()
+    }
+
+    /// A function that asks IAM about a client resource also asks the
+    /// admission rules in its own body, so a new authorization point cannot
+    /// skip them. A function that must not is named with its reason.
+    #[test]
+    fn every_function_that_authorizes_a_resource_asks_the_admission_rules() {
+        let mut bad = Vec::new();
+        let mut named = std::collections::BTreeSet::new();
+        for src in crate::source_scan::ast::src() {
+            for name in unasked_functions(src) {
+                let known = NO_ADMISSION_CHECK
+                    .iter()
+                    .chain(ASKED_BY_CALLER)
+                    .find(|(file, f, _)| *file == src.rel && *f == name);
+                match known {
+                    Some(entry) => {
+                        named.insert(entry.1);
+                    }
+                    None => bad.push(format!("{}::{name}", src.rel)),
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "these functions ask IAM about a resource and never the admission rules (add the \
+             check, or name the function in NO_ADMISSION_CHECK / ASKED_BY_CALLER with the \
+             reason):\n{}",
+            bad.join("\n")
+        );
+        for (_, name, _) in NO_ADMISSION_CHECK.iter().chain(ASKED_BY_CALLER) {
+            assert!(
+                named.contains(name),
+                "`{name}` no longer asks IAM: remove it from the lists"
+            );
+        }
+        // A function that takes the answer from its caller: every caller asks.
+        for (_, callee, _) in ASKED_BY_CALLER {
+            let mut callers = 0;
+            for src in crate::source_scan::ast::src() {
+                for call in src.prod.calls_named(callee) {
+                    callers += 1;
+                    assert!(
+                        ADMISSION_CHECKS.iter().any(|(name, files)| {
+                            (files.is_empty() || files.contains(&src.rel.as_str()))
+                                && src.prod.calls_named(name).any(|c| c.func == call.func)
+                        }),
+                        "{}::{} calls {callee} and never asks the admission rules",
+                        src.rel,
+                        src.fn_name(call.func)
+                    );
+                }
+            }
+            assert!(
+                callers > 0,
+                "{callee} has no caller: remove it from the list"
+            );
+        }
+        // LISTs (the S3 LIST, ListMultipartUploads) filter through the rules too.
+        for rel in [
+            "src/s3_adapter_s3s/list.rs",
+            "src/s3_adapter_s3s/multipart.rs",
+        ] {
+            let text =
+                std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/").to_string() + rel)
+                    .expect("list file");
+            assert!(
+                text.contains("ResourceRules"),
+                "{rel} ignores the admission rules"
+            );
+        }
+    }
+
+    /// Files where a CLIENT writes: they take the strict key gate
+    /// (`WriteOrigin::Client`), never the job gate.
+    const CLIENT_WRITE_FILES: &[&str] = &[
+        "src/api/admin/objects.rs",
+        "src/api/handlers/form_post.rs",
+        "src/api/handlers/object_helpers.rs",
+        "src/cli/transfer_io.rs",
+        "src/deltaglider/engine/conditional.rs",
+        "src/s3_adapter_s3s/copy.rs",
+        "src/s3_adapter_s3s/multipart.rs",
+        "src/s3_adapter_s3s/object.rs",
+    ];
+
+    /// Files of background jobs that copy keys that already exist: they take
+    /// the destination's own rule (`WriteOrigin::Job`), never the client gate.
+    const JOB_WRITE_FILES: &[&str] = &[
+        "src/deltaglider/engine/rewrite.rs",
+        "src/lifecycle/worker.rs",
+        "src/maintenance/backfill.rs",
+        "src/maintenance/migrate.rs",
+        "src/replication/event_consumer.rs",
+        "src/replication/parity.rs",
+        "src/replication/worker.rs",
+    ];
+
+    /// The production text of `rel`: everything before its first `#[cfg(test)]`.
+    fn production_text(rel: &str) -> String {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/").to_string() + rel)
+                .unwrap_or_else(|e| panic!("{rel}: {e}"));
+        text.split("#[cfg(test)]").next().unwrap().to_string()
+    }
+
+    /// The write gate of a key follows who writes: a client entry point never
+    /// names the job gate and a job never names the client gate, so a client
+    /// write cannot slip in through the lenient rule.
+    #[test]
+    fn client_entry_points_use_the_client_write_gate() {
+        for rel in CLIENT_WRITE_FILES {
+            let text = production_text(rel);
+            assert!(
+                !text.contains("WriteOrigin::Job"),
+                "{rel} is a client entry point: it takes `WriteOrigin::Client`"
+            );
+        }
+        for rel in [
+            "src/api/admin/objects.rs",
+            "src/api/handlers/object_helpers.rs",
+            "src/s3_adapter_s3s/multipart.rs",
+            "src/cli/transfer_io.rs",
+        ] {
+            assert!(
+                production_text(rel).contains("WriteOrigin::Client"),
+                "{rel} names no write gate"
+            );
+        }
+        for rel in JOB_WRITE_FILES {
+            let text = production_text(rel);
+            assert!(
+                !text.contains("WriteOrigin::Client"),
+                "{rel} is a background job: it takes `WriteOrigin::Job`"
+            );
+        }
+        for rel in [
+            "src/maintenance/migrate.rs",
+            "src/replication/worker.rs",
+            "src/lifecycle/worker.rs",
+        ] {
+            assert!(
+                production_text(rel).contains("WriteOrigin::Job"),
+                "{rel} names no write gate"
+            );
+        }
+    }
+
+    /// The scan flags a function that asks IAM and not the rules, and passes
+    /// one that asks both.
+    #[test]
+    fn the_admission_scan_sees_a_missing_check() {
+        let missing = "fn delete_all(user: &U) { user.can_with_context(a, b, c, d); }\n\
+                       fn fine(user: &U, r: &R) { user.can_with_context(a, b, c, d); admission_refusal(r); }\n\
+                       fn other(g: &G) { g.refusal(); }\n\
+                       fn facts(u: &U) { u.can_read_whole_prefix(a, b); }\n\
+                       fn facts_ok(u: &U, r: &R) { u.can_read_whole_prefix(a, b); r.may_refuse_in_folder(c); }\n";
+        let src = crate::source_scan::ast::parse("src/s3_adapter_s3s/object.rs", missing);
+        assert_eq!(
+            unasked_functions(&src),
+            vec!["delete_all".to_string(), "facts".to_string()]
+        );
+        // `refusal` counts only in the files that use the rules' own method.
+        let wrong_file = "fn f(u: &U, g: &G) { u.can(a, b, c); g.refusal(); }";
+        let src = crate::source_scan::ast::parse("src/spool.rs", wrong_file);
+        assert_eq!(unasked_functions(&src), vec!["f".to_string()]);
+        let right_file = crate::source_scan::ast::parse("src/api/admin/objects.rs", wrong_file);
+        assert!(unasked_functions(&right_file).is_empty());
+    }
+
     #[test]
     fn request_path_reads_no_env() {
         // A file of the request path that reads the environment on purpose
@@ -4560,6 +5041,102 @@ mod source_guards {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    /// Every door that can read a large object sets a spool scope (a principal
+    /// or the background): a read outside every scope is refused. Each source
+    /// file that calls an engine read API is listed with the file that sets
+    /// its scope and what it sets; a new caller must be added here.
+    #[test]
+    fn every_door_that_reads_large_objects_sets_a_spool_scope() {
+        const DOORS: &[(&str, &str, &str)] = &[
+            (
+                "src/s3_adapter_s3s/object.rs",
+                "src/api/s3_router.rs",
+                "principal_spool_scope",
+            ),
+            (
+                "src/s3_adapter_s3s/copy.rs",
+                "src/api/s3_router.rs",
+                "principal_spool_scope",
+            ),
+            (
+                "src/api/admin/objects.rs",
+                "src/api/admin/auth.rs",
+                "spool::as_principal",
+            ),
+            (
+                "src/transfer.rs",
+                "src/background.rs",
+                "spool::as_background",
+            ),
+            (
+                "src/maintenance/backfill.rs",
+                "src/background.rs",
+                "spool::as_background",
+            ),
+            (
+                "src/cli/transfer_io.rs",
+                "src/main.rs",
+                "spool::as_background",
+            ),
+            ("src/cli/stats.rs", "src/main.rs", "spool::as_background"),
+        ];
+        // Tasks that read and that a handler or a loop spawns: they enter the
+        // scope themselves (a spawned task inherits nothing).
+        const SPAWNERS: &[(&str, &str)] = &[
+            ("src/api/admin/replication.rs", "spool::as_background"),
+            ("src/api/admin/lifecycle.rs", "spool::as_background"),
+            ("src/maintenance/worker.rs", "spool::as_background"),
+            ("src/transfer.rs", "capture_context"),
+            ("src/api/admin/objects.rs", "capture_context"),
+        ];
+        let needles = [
+            ".retrieve(",
+            ".retrieve_stream(",
+            ".retrieve_stream_fresh(",
+            ".retrieve_stream_range(",
+            ".retrieve_range_fresh(",
+        ];
+        let files = rust_files("src");
+        let test_files = out_of_line_test_modules(&files);
+        let mut callers: std::collections::BTreeSet<String> = Default::default();
+        for file in files {
+            let rel = rel_path(&file);
+            if test_files.contains(&file)
+                || rel.starts_with("src/deltaglider/engine/")
+                || rel.starts_with("src/storage/")
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let mask = prod_mask(&text);
+            let hit = text.lines().enumerate().any(|(i, line)| {
+                mask[i]
+                    && !line.trim_start().starts_with("//")
+                    && needles.iter().any(|n| line.contains(n))
+            });
+            if hit {
+                callers.insert(rel);
+            }
+        }
+        let listed: std::collections::BTreeSet<String> =
+            DOORS.iter().map(|(f, _, _)| f.to_string()).collect();
+        assert_eq!(
+            callers, listed,
+            "a file reads large objects through the engine: list its scope in DOORS"
+        );
+        for (file, setter, needle) in DOORS {
+            let text = crate::source_scan::read(setter);
+            assert!(
+                text.contains(needle),
+                "{file} reads objects; {setter} must set the scope with {needle}"
+            );
+        }
+        for (file, needle) in SPAWNERS {
+            let text = crate::source_scan::read(file);
+            assert!(text.contains(needle), "{file} must contain {needle}");
+        }
     }
 
     /// A whole-object read (`engine.retrieve`, the storage `get_object` /

@@ -1897,3 +1897,113 @@ async fn newest_migrate_job(admin: &reqwest::Client, endpoint: &str) -> serde_js
         .cloned()
         .unwrap_or(serde_json::Value::Null)
 }
+
+/// Keys that an earlier release stored with a case variant of a reserved name
+/// (`logs/run.DELTA`, `Reference.Bin`, `a/.Dg/x`) migrate: a copy of an
+/// existing key is judged by the destination backend's own rule, so the
+/// migration does not stop at the page that holds one.
+#[tokio::test]
+async fn test_migrate_copies_keys_with_a_legacy_reserved_name() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let probe = dir_b.path().join(".case-probe");
+    std::fs::write(&probe, b"").unwrap();
+    let insensitive = dir_b.path().join(".CASE-PROBE").exists();
+    std::fs::remove_file(&probe).unwrap();
+    if insensitive {
+        eprintln!("skipping: the data directory is case-insensitive");
+        return;
+    }
+    let bucket = "migold";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 3).await;
+    let legacy = [("logs", "run.DELTA"), ("", "Reference.Bin"), ("a/.Dg", "x")];
+    for (prefix, name) in legacy {
+        let dir = dir_a.path().join(bucket).join("deltaspaces").join(prefix);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), format!("legacy {prefix}/{name}")).unwrap();
+    }
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(job["progress"]["failed"], 0, "job: {job}");
+    assert_eq!(job["progress"]["processed"], 6, "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    for (prefix, name) in legacy {
+        assert!(
+            dir_b
+                .path()
+                .join(bucket)
+                .join("deltaspaces")
+                .join(prefix)
+                .join(name)
+                .exists(),
+            "{prefix}/{name} must arrive on the destination"
+        );
+    }
+    let key = "logs/run.DELTA";
+    let bytes = get_bytes(&http, &endpoint, bucket, key).await;
+    assert_eq!(bytes, b"legacy logs/run.DELTA");
+}
+
+/// A key whose folder is named like a baseline, a delta, a temp file or a
+/// folder marker (an earlier release stored it) is refused by a filesystem
+/// destination on every disk. The migration records the keys, goes on with the
+/// others, and stops before the verify and the switch with a message that
+/// names the keys: the bucket stays on its source.
+#[tokio::test]
+async fn test_migrate_stops_at_keys_whose_folder_collides_on_the_destination() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migcoll";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 3).await;
+    let refused = [
+        ("a/reference.bin", "x"),
+        ("a/b.delta", "y"),
+        ("a/.dg-tmp.z", "w"),
+        ("a/.dg-folder-marker", "m"),
+    ];
+    for (prefix, name) in refused.iter().chain([("a", "fine.txt")].iter()) {
+        let dir = dir_a.path().join(bucket).join("deltaspaces").join(prefix);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), format!("legacy {prefix}/{name}")).unwrap();
+    }
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_migrate_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "failed", "job: {job}");
+    assert_eq!(job["progress"]["failed"], 4, "job: {job}");
+    assert_eq!(job["progress"]["processed"], 4, "job: {job}");
+    let text = job.to_string();
+    assert!(text.contains("a/reference.bin/x"), "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        None,
+        "the bucket stays on its source"
+    );
+    let dst = dir_b.path().join(bucket).join("deltaspaces");
+    for (prefix, _) in refused {
+        assert!(!dst.join(prefix).exists(), "{prefix} must not be created");
+    }
+}

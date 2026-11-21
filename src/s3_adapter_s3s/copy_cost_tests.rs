@@ -294,7 +294,9 @@ async fn a_client_copy_follows_the_client_metadata_rules() {
     .into();
     let stored = engine
         .store_with_multipart_etag(
-            &engine.lock_object_write("b", "run/mp.zip").await,
+            &engine
+                .lock_object_write("b", "run/mp.zip", crate::types::WriteOrigin::Client)
+                .await,
             "b",
             "run/mp.zip",
             &data,
@@ -410,44 +412,49 @@ async fn a_copy_that_must_not_be_a_delta_goes_through_the_store() {
 /// refused and not shipped as a delta.
 #[tokio::test]
 async fn a_fast_copy_above_the_delta_limit_is_stored_whole() {
-    let (endpoint, _fake) = crate::storage::fake_s3::start().await;
-    let on_fake = || async {
-        let config = crate::config::BackendConfig::S3 {
-            endpoint: Some(endpoint.clone()),
-            region: "us-east-1".into(),
-            force_path_style: true,
-            access_key_id: Some("k".into()),
-            secret_access_key: Some("s".into()),
-            allow_local: true,
-            session_token: None,
+    crate::deltaglider::spool::as_background(async {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let on_fake = || async {
+            let config = crate::config::BackendConfig::S3 {
+                endpoint: Some(endpoint.clone()),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            };
+            let s3 = crate::storage::S3Backend::new(
+                &config,
+                crate::storage::NativeEncryptionConfig::None,
+            )
+            .await
+            .unwrap();
+            let b: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
+            b
         };
-        let s3 =
-            crate::storage::S3Backend::new(&config, crate::storage::NativeEncryptionConfig::None)
-                .await
-                .unwrap();
-        let b: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(s3);
-        b
-    };
-    let metrics = Arc::new(crate::metrics::Metrics::new());
-    // Write the 64 KiB fixture with the default limit.
-    let writer = engine_on(on_fake().await, &crate::config::Config::default(), &metrics);
-    writer.create_bucket("b").await.unwrap();
-    let keys = crate::deltaglider::store_deltas(&writer, "run", 2).await;
-    let config = crate::config::Config {
-        max_object_size: (32 * 1024).into(),
-        ..Default::default()
-    };
-    let small = engine_on(on_fake().await, &config, &metrics);
-    let state = AppState::for_tests(small);
-    let svc = service(state.clone());
-    copy::copy_object(
-        &svc,
-        request(copy_input(("b", &keys[1]), ("b", "run/copy.zip"), None)),
-    )
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        // Write the 64 KiB fixture with the default limit.
+        let writer = engine_on(on_fake().await, &crate::config::Config::default(), &metrics);
+        writer.create_bucket("b").await.unwrap();
+        let keys = crate::deltaglider::store_deltas(&writer, "run", 2).await;
+        let config = crate::config::Config {
+            max_object_size: (32 * 1024).into(),
+            ..Default::default()
+        };
+        let small = engine_on(on_fake().await, &config, &metrics);
+        let state = AppState::for_tests(small);
+        let svc = service(state.clone());
+        copy::copy_object(
+            &svc,
+            request(copy_input(("b", &keys[1]), ("b", "run/copy.zip"), None)),
+        )
+        .await
+        .unwrap();
+        let head = state.engine.load().head("b", "run/copy.zip").await.unwrap();
+        assert!(!head.is_delta(), "{:?}", head.storage_info);
+    })
     .await
-    .unwrap();
-    let head = state.engine.load().head("b", "run/copy.zip").await.unwrap();
-    assert!(!head.is_delta(), "{:?}", head.storage_info);
 }
 
 /// A source overwritten after the HEAD that the conditionals judged: the
@@ -494,56 +501,59 @@ async fn a_source_that_changes_under_a_fast_copy_answers_slowdown() {
 /// time). The parts now read one verified reconstruction.
 #[tokio::test]
 async fn the_parts_of_a_delta_source_share_one_decode() {
-    let (s3, _fake) = crate::storage::fake_s3_backend().await;
-    let f = Fixture::new(
-        DynStorageBackend::new_box(s3),
-        crate::config::Config::default(),
-    )
-    .await;
-    let engine = f.engine();
-    let (body, source) = engine.retrieve("b", &f.keys[1]).await.unwrap();
-    assert!(source.is_delta());
-    let upload_id = f
-        .state
-        .multipart
-        .create("c1", "parts/copy.zip", None, Default::default())
-        .unwrap();
-    let before = codec_runs(&f.metrics).1;
-    let len = body.len();
-    let ranges = [
-        (0, len / 3 - 1),
-        (len / 3, 2 * len / 3 - 1),
-        (2 * len / 3, len - 1),
-    ];
-    for (n, (start, end)) in ranges.iter().enumerate() {
-        let input = s3s::dto::UploadPartCopyInput::builder()
-            .bucket("c1".into())
-            .key("parts/copy.zip".into())
-            .upload_id(upload_id.clone())
-            .part_number(n as i32 + 1)
-            .copy_source(s3s::dto::CopySource::Bucket {
-                bucket: "b".into(),
-                key: f.keys[1].clone().into(),
-                version_id: None,
-            })
-            .copy_source_range(Some(format!("bytes={start}-{end}")))
-            .build()
+    crate::deltaglider::spool::as_background(async {
+        let (s3, _fake) = crate::storage::fake_s3_backend().await;
+        let f = Fixture::new(
+            DynStorageBackend::new_box(s3),
+            crate::config::Config::default(),
+        )
+        .await;
+        let engine = f.engine();
+        let (body, source) = engine.retrieve("b", &f.keys[1]).await.unwrap();
+        assert!(source.is_delta());
+        let upload_id = f
+            .state
+            .multipart
+            .create("c1", "parts/copy.zip", None, Default::default())
             .unwrap();
-        let out = copy::upload_part_copy(&f.svc, request(input))
-            .await
-            .unwrap();
-        let etag = out.output.copy_part_result.unwrap().e_tag.unwrap();
-        let want = format!(
-            "\"{}\"",
-            hex::encode(md5::Md5::digest(&body[*start..=*end]))
+        let before = codec_runs(&f.metrics).1;
+        let len = body.len();
+        let ranges = [
+            (0, len / 3 - 1),
+            (len / 3, 2 * len / 3 - 1),
+            (2 * len / 3, len - 1),
+        ];
+        for (n, (start, end)) in ranges.iter().enumerate() {
+            let input = s3s::dto::UploadPartCopyInput::builder()
+                .bucket("c1".into())
+                .key("parts/copy.zip".into())
+                .upload_id(upload_id.clone())
+                .part_number(n as i32 + 1)
+                .copy_source(s3s::dto::CopySource::Bucket {
+                    bucket: "b".into(),
+                    key: f.keys[1].clone().into(),
+                    version_id: None,
+                })
+                .copy_source_range(Some(format!("bytes={start}-{end}")))
+                .build()
+                .unwrap();
+            let out = copy::upload_part_copy(&f.svc, request(input))
+                .await
+                .unwrap();
+            let etag = out.output.copy_part_result.unwrap().e_tag.unwrap();
+            let want = format!(
+                "\"{}\"",
+                hex::encode(md5::Md5::digest(&body[*start..=*end]))
+            );
+            assert_eq!(etag, parse_s3s_etag(&want).unwrap(), "part {}", n + 1);
+        }
+        assert_eq!(
+            codec_runs(&f.metrics).1 - before,
+            1,
+            "one decode for 3 parts"
         );
-        assert_eq!(etag, parse_s3s_etag(&want).unwrap(), "part {}", n + 1);
-    }
-    assert_eq!(
-        codec_runs(&f.metrics).1 - before,
-        1,
-        "one decode for 3 parts"
-    );
+    })
+    .await
 }
 
 /// Store `n` bytes of noise as the passthrough object `b/key`.
@@ -760,79 +770,82 @@ async fn a_source_that_changes_under_a_server_side_copy_answers_slowdown() {
 /// whole reference.bin into memory.
 #[tokio::test]
 async fn a_large_reference_object_copies_from_one_verified_spool_file() {
-    let (s3, fake) = crate::storage::fake_s3_backend().await;
-    let mut config = crate::config::Config::default();
-    config.tuning.spool_threshold_bytes = Some(1024);
-    let f = Fixture::new(DynStorageBackend::new_box(s3), config).await;
-    let engine = f.engine();
-    let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
-    let meta = FileMetadata::new_reference(
-        "a.zip".into(),
-        "a.zip".into(),
-        hex::encode(sha2::Sha256::digest(&body)),
-        hex::encode(md5::Md5::digest(&body)),
-        body.len() as u64,
-        None,
-    );
-    use crate::storage::StorageBackendExt;
-    engine
-        .storage()
-        .put_reference(
-            "b",
-            "legacy",
-            bytes::Bytes::from(body.clone()),
-            &meta,
-            crate::deltaglider::RefWriteProof::for_tests(),
-        )
-        .await
-        .unwrap();
-    engine
-        .storage()
-        .put_passthrough(
-            "b",
-            "legacy",
-            "a.zip",
-            bytes::Bytes::from(body.clone()),
-            &meta,
-        )
-        .await
-        .unwrap();
-    fake.clear();
+    crate::deltaglider::spool::as_background(async {
+        let (s3, fake) = crate::storage::fake_s3_backend().await;
+        let mut config = crate::config::Config::default();
+        config.tuning.spool_threshold_bytes = Some(1024);
+        let f = Fixture::new(DynStorageBackend::new_box(s3), config).await;
+        let engine = f.engine();
+        let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+        let meta = FileMetadata::new_reference(
+            "a.zip".into(),
+            "a.zip".into(),
+            hex::encode(sha2::Sha256::digest(&body)),
+            hex::encode(md5::Md5::digest(&body)),
+            body.len() as u64,
+            None,
+        );
+        use crate::storage::StorageBackendExt;
+        engine
+            .storage()
+            .put_reference(
+                "b",
+                "legacy",
+                bytes::Bytes::from(body.clone()),
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+        engine
+            .storage()
+            .put_passthrough(
+                "b",
+                "legacy",
+                "a.zip",
+                bytes::Bytes::from(body.clone()),
+                &meta,
+            )
+            .await
+            .unwrap();
+        fake.clear();
 
-    f.copy(("b", "legacy/a.zip"), ("c2", "x/a.zip"), None)
-        .await
-        .unwrap();
-    let upload_id = f
-        .state
-        .multipart
-        .create("c1", "parts/copy.zip", None, Default::default())
-        .unwrap();
-    let input = s3s::dto::UploadPartCopyInput::builder()
-        .bucket("c1".into())
-        .key("parts/copy.zip".into())
-        .upload_id(upload_id)
-        .part_number(1)
-        .copy_source(s3s::dto::CopySource::Bucket {
-            bucket: "b".into(),
-            key: "legacy/a.zip".into(),
-            version_id: None,
-        })
-        .build()
-        .unwrap();
-    let out = copy::upload_part_copy(&f.svc, request(input))
-        .await
-        .unwrap();
-    let etag = out.output.copy_part_result.unwrap().e_tag.unwrap();
-    let want = format!("\"{}\"", hex::encode(md5::Md5::digest(&body)));
-    assert_eq!(etag, parse_s3s_etag(&want).unwrap());
+        f.copy(("b", "legacy/a.zip"), ("c2", "x/a.zip"), None)
+            .await
+            .unwrap();
+        let upload_id = f
+            .state
+            .multipart
+            .create("c1", "parts/copy.zip", None, Default::default())
+            .unwrap();
+        let input = s3s::dto::UploadPartCopyInput::builder()
+            .bucket("c1".into())
+            .key("parts/copy.zip".into())
+            .upload_id(upload_id)
+            .part_number(1)
+            .copy_source(s3s::dto::CopySource::Bucket {
+                bucket: "b".into(),
+                key: "legacy/a.zip".into(),
+                version_id: None,
+            })
+            .build()
+            .unwrap();
+        let out = copy::upload_part_copy(&f.svc, request(input))
+            .await
+            .unwrap();
+        let etag = out.output.copy_part_result.unwrap().e_tag.unwrap();
+        let want = format!("\"{}\"", hex::encode(md5::Md5::digest(&body)));
+        assert_eq!(etag, parse_s3s_etag(&want).unwrap());
 
-    let reference_gets = fake
-        .requests()
-        .iter()
-        .filter(|r| r.starts_with("GET ") && r.contains("legacy/reference.bin"))
-        .count();
-    assert_eq!(reference_gets, 1, "{:#?}", fake.requests());
-    assert_eq!(engine.retrieve("c2", "x/a.zip").await.unwrap().0, body);
+        let reference_gets = fake
+            .requests()
+            .iter()
+            .filter(|r| r.starts_with("GET ") && r.contains("legacy/reference.bin"))
+            .count();
+        assert_eq!(reference_gets, 1, "{:#?}", fake.requests());
+        assert_eq!(engine.retrieve("c2", "x/a.zip").await.unwrap().0, body);
+    })
+    .await
 }
 
 /// D1 (6b): a client CopyObject whose request is dropped while its write is

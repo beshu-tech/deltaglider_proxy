@@ -278,6 +278,9 @@ fn rebuild_iam_index_inner(
 
     let count = users.len();
     let group_count = groups.len();
+    if let Ok(rules) = db.load_group_mapping_rules() {
+        iam::external_auth::mapping::warn_email_regex_rules_that_changed(&rules);
+    }
     let state = IamIndex::build_iam_state(users, groups, when_empty);
     iam_state.store(Arc::new(state));
     // Bump AFTER the store so observers see the new state when they

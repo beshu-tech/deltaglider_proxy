@@ -240,6 +240,11 @@ pub struct ConfigDbSync {
     /// compare-and-swap uses its `If-Match` form. While it is unknown, the
     /// upload fails closed and stays parked.
     profile: crate::coordination::if_match::ProfileCell,
+    /// The node-local jobs DB that keeps the generation floor
+    /// ([`Self::with_jobs_db`]); `None`: no floor.
+    jobs_db: Option<Arc<Mutex<crate::config_db::JobsDb>>>,
+    /// What the floor belongs to: endpoint, bucket and object key of this sync.
+    floor_target: String,
 }
 
 impl ConfigDbSync {
@@ -281,6 +286,13 @@ impl ConfigDbSync {
                  it is flushed before any download"
             );
         }
+        let floor_target = format!(
+            "{}\0{sync_bucket}\0{object_key}",
+            match backend_config {
+                BackendConfig::S3 { endpoint, .. } => endpoint.as_deref().unwrap_or(""),
+                _ => "",
+            }
+        );
         Ok(Self {
             s3_client: client,
             bucket: sync_bucket,
@@ -295,6 +307,8 @@ impl ConfigDbSync {
             health: parking_lot::Mutex::new(SyncHealth::default()),
             status: Default::default(),
             profile: Default::default(),
+            jobs_db: None,
+            floor_target,
         })
         .inspect(|s: &Self| s.publish_health())
     }
@@ -317,6 +331,77 @@ impl ConfigDbSync {
     pub fn with_status(mut self, status: crate::coordination::CoordinationStatus) -> Self {
         self.status = status;
         self
+    }
+
+    /// Keep the generation floor in the node-local jobs DB: per sync target, the
+    /// last generation this node confirmed. It outlives `.sync-base`, never syncs.
+    pub fn with_jobs_db(mut self, db: Option<Arc<Mutex<crate::config_db::JobsDb>>>) -> Self {
+        self.jobs_db = db;
+        self
+    }
+
+    /// The generation floor (`0`: none). An unreadable floor fails the pull
+    /// instead of reading as "no floor".
+    async fn generation_floor(&self) -> Result<i64, String> {
+        match &self.jobs_db {
+            Some(db) => db
+                .lock()
+                .await
+                .sync_floor(&self.floor_target)
+                .map_err(|e| format!("the sync generation floor could not be read: {e}")),
+            None => Ok(0),
+        }
+    }
+
+    /// Raise the floor to `generation` after this node accepted or uploaded it.
+    async fn raise_generation_floor(&self, generation: i64) {
+        let Some(db) = &self.jobs_db else { return };
+        if let Err(e) = db
+            .lock()
+            .await
+            .raise_sync_floor(&self.floor_target, generation)
+        {
+            warn!("Config DB sync: the generation floor could not be raised to {generation}: {e}");
+        }
+    }
+
+    /// The operator's reset: forget the floor of this sync target and delete the merge base,
+    /// so the next pull accepts the bucket's copy. Returns the floor it dropped.
+    pub async fn reset_generation_floor(&self) -> Result<i64, String> {
+        let Some(db) = &self.jobs_db else {
+            return Err("this instance has no jobs database, so it keeps no floor".to_string());
+        };
+        // An upload or a pull in flight must not raise the floor or write the base after it.
+        let _guard = self.upload_lock.lock().await;
+        let dropped = {
+            let db = db.lock().await;
+            let dropped = db
+                .sync_floor(&self.floor_target)
+                .map_err(|e| format!("the floor could not be read: {e}"))?;
+            db.reset_sync_floor(&self.floor_target)
+                .map_err(|e| format!("the floor could not be reset: {e}"))?;
+            dropped
+        };
+        match tokio::fs::remove_file(sync_base_path(&self.local_path)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("the merge base could not be deleted: {e}")),
+        }
+        Ok(dropped)
+    }
+
+    /// Raise the floor of this sync target to the generation of the readable merge base:
+    /// a node upgraded to this release has a floor before its first sync event.
+    pub async fn seed_generation_floor(&self, config_db: &Option<Arc<Mutex<ConfigDb>>>) {
+        let Some(db) = config_db else { return };
+        let _guard = self.upload_lock.lock().await;
+        let base = db
+            .lock()
+            .await
+            .base_generation(&sync_base_path(&self.local_path), self.db_key());
+        if let Some(generation) = base.filter(|g| *g > 0) {
+            self.raise_generation_floor(generation).await;
+        }
     }
 
     /// Did this process confirm the local IAM database against the bucket?
@@ -1640,6 +1725,12 @@ pub async fn upload_with_reconcile(
         match sync.upload(data.clone()).await {
             Ok(()) => {
                 write_sync_base(&sync.local_path, &data).await;
+                // Under the upload lock the local generation is the uploaded one.
+                if let Some(db) = config_db {
+                    if let Ok(generation) = db.lock().await.sync_generation() {
+                        sync.raise_generation_floor(generation).await;
+                    }
+                }
                 sync.record_push(Ok(()));
                 return Ok(());
             }
@@ -1836,6 +1927,14 @@ async fn pull_locked(
             return Err(e);
         }
     };
+    let floor = match sync.generation_floor().await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&dl.temp_path).await;
+            sync.record_pull(Err(e.clone()));
+            return Err(e);
+        }
+    };
     let merged = reopen_and_rebuild_iam(
         config_db,
         db_key,
@@ -1843,12 +1942,16 @@ async fn pull_locked(
         external_auth,
         sessions,
         &dl.temp_path,
+        floor,
         context,
     )
     .await;
     let applied = merged.is_ok();
+    if let Ok(generation) = &merged {
+        sync.raise_generation_floor(*generation).await;
+    }
     match &merged {
-        Ok(()) => sync.record_pull(Ok(())),
+        Ok(_) => sync.record_pull(Ok(())),
         Err(e) => {
             sync.record_pull_failure(e.failure, format!("the IAM merge failed: {}", e.message))
         }
@@ -1883,8 +1986,10 @@ async fn pull_locked(
 ///
 /// Gracefully no-ops when `config_db` is `None` (legacy/open-access
 /// mode, no IAM DB to reopen).
-/// Returns `Ok` if the IAM merge was applied (so the caller can commit the
-/// downloaded ETag); `Err(why)` on any failure, so the next poll retries.
+/// Returns the sync generation of the accepted copy if the IAM merge was
+/// applied (so the caller can commit the downloaded ETag and raise the
+/// generation floor); `Err(why)` on any failure, so the next poll retries.
+/// `floor`: the generation floor of the node (`ConfigDb::merge_iam_from`).
 #[allow(clippy::too_many_arguments)]
 pub async fn reopen_and_rebuild_iam(
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
@@ -1893,13 +1998,14 @@ pub async fn reopen_and_rebuild_iam(
     external_auth: &Option<Arc<ExternalAuthManager>>,
     sessions: Option<&Arc<crate::session::SessionStore>>,
     downloaded: &std::path::Path,
+    floor: i64,
     context: &str,
-) -> Result<(), MergeError> {
+) -> Result<i64, MergeError> {
     let Some(db_arc) = config_db else {
         // No live DB (legacy/open mode) — nothing to merge into. Drop the temp.
         // Treat as applied (there's no IAM to converge), so we don't re-download.
         let _ = tokio::fs::remove_file(downloaded).await;
-        return Ok(());
+        return Ok(0);
     };
     let db = db_arc.lock().await;
     // B3: merge ONLY the IAM tables out of the downloaded peer DB into the live
@@ -1908,7 +2014,7 @@ pub async fn reopen_and_rebuild_iam(
     // them. D16: a three-way merge
     // against the last synced DB, so a change on either side survives.
     let base = sync_base_path(db.local_path());
-    let merge = db.merge_iam_from(downloaded, Some(&base), db_key);
+    let merge = db.merge_iam_from(downloaded, Some(&base), db_key, floor);
     let report = match merge {
         Ok(report) => {
             // The downloaded copy is what the bucket holds now: the next base.
@@ -2004,7 +2110,7 @@ pub async fn reopen_and_rebuild_iam(
             context
         );
     }
-    Ok(())
+    Ok(report.remote_generation)
 }
 
 /// Rebuild the in-memory IAM index from `db` (after a sync merge). A read
@@ -2025,6 +2131,9 @@ fn rebuild_iam_index(
     let groups = db.load_groups().map_err(|e| read("IAM groups", e))?;
     let count = users.len();
     let group_count = groups.len();
+    if let Ok(rules) = db.load_group_mapping_rules() {
+        crate::iam::external_auth::mapping::warn_email_regex_rules_that_changed(&rules);
+    }
     // An empty synced DB applies THIS node's empty-set outcome (its own
     // config: pair, `authentication: none`, or deny all).
     let current = iam_state.load();
@@ -2517,6 +2626,7 @@ mod tests {
             &Some(ext.clone()),
             None,
             &remote_path,
+            0,
             "test",
         )
         .await
@@ -3265,5 +3375,268 @@ mod tests {
         assert_eq!(only_the_node_files(dir.path()), files_before);
         assert!(!sync.needs_upload.load(Ordering::SeqCst));
         assert_eq!(bucket_bytes(&sync).await, new_bytes);
+    }
+
+    /// The floor lives in the node-local jobs DB: after the base file and the local
+    /// generation are gone, a pull of an older copy is still refused. (Fake S3.)
+    #[tokio::test]
+    async fn the_floor_outlives_the_base_file_and_refuses_an_old_copy() {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = "k".repeat(40);
+        let db_path = dir.path().join("deltaglider_config.db");
+        let db = Arc::new(Mutex::new(
+            ConfigDb::open_or_create(&db_path, &key).unwrap(),
+        ));
+        let jobs = Arc::new(Mutex::new(
+            crate::config_db::JobsDb::in_memory(&key).unwrap(),
+        ));
+        let cell = crate::coordination::if_match::ProfileCell::unknown();
+        cell.prove(Default::default());
+        let sync = ConfigDbSync::new(
+            &BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            },
+            "b".into(),
+            "k.db".into(),
+            db_path.clone(),
+            crate::config_db::ConfigDbKeys::primary_only(&key),
+        )
+        .await
+        .unwrap()
+        .with_profile_cell(cell)
+        .with_jobs_db(Some(jobs.clone()));
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Disabled));
+        let some_db = Some(db.clone());
+        // Two uploads: the floor follows the uploaded generation.
+        for _ in 0..2 {
+            upload_with_reconcile(&sync, &some_db, &key, &iam, &None, None, "test")
+                .await
+                .unwrap();
+        }
+        let uploaded = db.lock().await.sync_generation().unwrap();
+        assert!(uploaded >= 2, "two uploads take two generations");
+        assert_eq!(
+            jobs.lock().await.sync_floor(&sync.floor_target).unwrap(),
+            uploaded
+        );
+
+        // The node loses its base file and its own generation, but keeps its jobs DB.
+        let _ = std::fs::remove_file(sync_base_path(&db_path));
+        db.lock()
+            .await
+            .conn
+            .execute("UPDATE sync_state SET sync_generation = 0", [])
+            .unwrap();
+        // A writer on the bucket puts back an older copy (generation 1).
+        let old = dir.path().join("old.db");
+        {
+            let old_db = ConfigDb::open_or_create(&old, &key).unwrap();
+            old_db
+                .create_user("ghost", "AKGHOST00001", "s", true, &[])
+                .unwrap();
+            old_db
+                .conn
+                .execute("UPDATE sync_state SET sync_generation = 1", [])
+                .unwrap();
+        }
+        sync.s3_client
+            .put_object()
+            .bucket("b")
+            .key("k.db")
+            .body(ByteStream::from(std::fs::read(&old).unwrap()))
+            .send()
+            .await
+            .unwrap();
+        let applied = pull_and_merge(&sync, &some_db, &key, &iam, &None, None, "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            Some(false),
+            "the old copy is refused as a rollback"
+        );
+        assert!(
+            db.lock()
+                .await
+                .load_users()
+                .unwrap()
+                .iter()
+                .all(|u| u.name != "ghost"),
+            "the old copy's user must not come back"
+        );
+    }
+
+    /// A sync of the fake S3 bucket `bucket` that keeps its floor in `jobs`.
+    async fn fake_sync(
+        endpoint: &str,
+        bucket: &str,
+        db_path: &std::path::Path,
+        key: &str,
+        jobs: &Arc<Mutex<crate::config_db::JobsDb>>,
+    ) -> ConfigDbSync {
+        let cell = crate::coordination::if_match::ProfileCell::unknown();
+        cell.prove(Default::default());
+        ConfigDbSync::new(
+            &BackendConfig::S3 {
+                endpoint: Some(endpoint.to_string()),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: Some("k".into()),
+                secret_access_key: Some("s".into()),
+                allow_local: true,
+                session_token: None,
+            },
+            bucket.into(),
+            "k.db".into(),
+            db_path.to_path_buf(),
+            crate::config_db::ConfigDbKeys::primary_only(key),
+        )
+        .await
+        .unwrap()
+        .with_profile_cell(cell)
+        .with_jobs_db(Some(jobs.clone()))
+    }
+
+    /// Put a copy of the config DB at `generation` (with the user `name`) into the bucket of `sync`.
+    async fn put_copy(
+        sync: &ConfigDbSync,
+        dir: &std::path::Path,
+        key: &str,
+        generation: i64,
+        name: &str,
+    ) {
+        let copy = dir.join(format!("copy-{generation}-{name}.db"));
+        {
+            let db = ConfigDb::open_or_create(&copy, key).unwrap();
+            db.create_user(name, &format!("AK{name}0001"), "s", true, &[])
+                .unwrap();
+            db.conn
+                .execute("UPDATE sync_state SET sync_generation = ?1", [generation])
+                .unwrap();
+        }
+        sync.s3_client
+            .put_object()
+            .bucket(&sync.bucket)
+            .key("k.db")
+            .body(ByteStream::from(std::fs::read(&copy).unwrap()))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    /// The floor belongs to ONE sync target: another bucket has its own floor. (Fake S3.)
+    #[tokio::test]
+    async fn the_floor_belongs_to_one_sync_target() {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = "k".repeat(40);
+        let db_path = dir.path().join("deltaglider_config.db");
+        let db = Arc::new(Mutex::new(
+            ConfigDb::open_or_create(&db_path, &key).unwrap(),
+        ));
+        let jobs = Arc::new(Mutex::new(
+            crate::config_db::JobsDb::in_memory(&key).unwrap(),
+        ));
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Disabled));
+        let some_db = Some(db.clone());
+        let old_target = fake_sync(&endpoint, "b", &db_path, &key, &jobs).await;
+        for _ in 0..3 {
+            upload_with_reconcile(&old_target, &some_db, &key, &iam, &None, None, "test")
+                .await
+                .unwrap();
+        }
+        // The operator points the node at another bucket whose copy is at generation 1.
+        let _ = std::fs::remove_file(sync_base_path(&db_path));
+        let new_target = fake_sync(&endpoint, "b2", &db_path, &key, &jobs).await;
+        put_copy(&new_target, dir.path(), &key, 1, "other").await;
+        let applied = pull_and_merge(&new_target, &some_db, &key, &iam, &None, None, "test")
+            .await
+            .unwrap();
+        assert_eq!(applied, Some(true), "another target has its own floor");
+        // The old target still refuses a copy below its floor.
+        let _ = std::fs::remove_file(sync_base_path(&db_path));
+        put_copy(&old_target, dir.path(), &key, 1, "ghost").await;
+        let applied = pull_and_merge(&old_target, &some_db, &key, &iam, &None, None, "test")
+            .await
+            .unwrap();
+        assert_eq!(applied, Some(false), "its own floor still holds");
+        // The operator's explicit reset drops the floor: the copy is accepted.
+        assert_eq!(old_target.reset_generation_floor().await, Ok(3));
+        let applied = pull_and_merge(&old_target, &some_db, &key, &iam, &None, None, "test")
+            .await
+            .unwrap();
+        assert_eq!(applied, Some(true), "no floor, no base: the copy is taken");
+    }
+
+    /// An upgraded node has a merge base but no floor: the start raises the floor to the base's
+    /// generation, so the floor still holds after the base file is gone. (Fake S3.)
+    #[tokio::test]
+    async fn the_start_seeds_the_floor_from_the_merge_base() {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = "k".repeat(40);
+        let db_path = dir.path().join("deltaglider_config.db");
+        let db = Arc::new(Mutex::new(
+            ConfigDb::open_or_create(&db_path, &key).unwrap(),
+        ));
+        let jobs = Arc::new(Mutex::new(
+            crate::config_db::JobsDb::in_memory(&key).unwrap(),
+        ));
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Disabled));
+        let some_db = Some(db.clone());
+        {
+            let base = ConfigDb::open_or_create(&sync_base_path(&db_path), &key).unwrap();
+            base.conn
+                .execute("UPDATE sync_state SET sync_generation = 5", [])
+                .unwrap();
+        }
+        let sync = fake_sync(&endpoint, "b", &db_path, &key, &jobs).await;
+        assert_eq!(jobs.lock().await.sync_floor(&sync.floor_target).unwrap(), 0);
+        sync.seed_generation_floor(&some_db).await;
+        assert_eq!(jobs.lock().await.sync_floor(&sync.floor_target).unwrap(), 5);
+        // The base file goes, and a writer on the bucket puts back an older copy.
+        std::fs::remove_file(sync_base_path(&db_path)).unwrap();
+        put_copy(&sync, dir.path(), &key, 3, "ghost").await;
+        let applied = pull_and_merge(&sync, &some_db, &key, &iam, &None, None, "test")
+            .await
+            .unwrap();
+        assert_eq!(applied, Some(false), "the seeded floor refuses the copy");
+        // No readable base, no seed: a node without a base keeps the floor it has.
+        sync.seed_generation_floor(&some_db).await;
+        assert_eq!(jobs.lock().await.sync_floor(&sync.floor_target).unwrap(), 5);
+    }
+
+    /// The reset holds the upload lock: an upload or a pull in flight cannot raise the floor
+    /// or write the base right after it.
+    #[tokio::test]
+    async fn the_floor_reset_waits_for_the_upload_lock() {
+        let (endpoint, _fake) = crate::storage::fake_s3::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let key = "k".repeat(40);
+        let db_path = dir.path().join("deltaglider_config.db");
+        let _db = ConfigDb::open_or_create(&db_path, &key).unwrap();
+        let jobs = Arc::new(Mutex::new(
+            crate::config_db::JobsDb::in_memory(&key).unwrap(),
+        ));
+        let sync = fake_sync(&endpoint, "b", &db_path, &key, &jobs).await;
+        sync.raise_generation_floor(3).await;
+        let busy = sync.upload_lock.lock().await;
+        let mut reset = Box::pin(sync.reset_generation_floor());
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(200), &mut reset).await;
+        assert!(
+            waited.is_err(),
+            "the reset ran while an upload held the lock"
+        );
+        assert_eq!(jobs.lock().await.sync_floor(&sync.floor_target).unwrap(), 3);
+        drop(busy);
+        assert_eq!(reset.await, Ok(3));
+        assert_eq!(jobs.lock().await.sync_floor(&sync.floor_target).unwrap(), 0);
     }
 }

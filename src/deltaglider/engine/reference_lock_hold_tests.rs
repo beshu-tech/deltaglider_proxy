@@ -211,14 +211,17 @@ async fn a_reference_write_records_its_body_length() {
             recorded,
             None,
         );
+        let key = engine
+            .lock_object_write("releases", "v1/app.zip", crate::types::WriteOrigin::Client)
+            .await;
         engine
             .with_dest_prefix_lock("releases", "v1", || async {
+                let gate = engine.gate_write(&key)?;
                 Ok::<_, EngineError>(
                     engine
                         .put_reference_raw(
                             &crate::transfer::CommitTicket::for_test(),
-                            "releases",
-                            "v1",
+                            &gate,
                             crate::storage::PutBody::Bytes(bytes::Bytes::copy_from_slice(body)),
                             &meta,
                         )
@@ -250,13 +253,16 @@ async fn fast_path_seed_holds_the_lock() {
         3,
         None,
     );
+    let key = engine
+        .lock_object_write("releases", "v1/app.zip", crate::types::WriteOrigin::Client)
+        .await;
+    let gate = engine.gate_write(&key).unwrap();
     let res: Result<(), EngineError> = engine
         .with_dest_prefix_lock("releases", "v1", || async {
             Ok(engine
                 .put_reference_raw(
                     &crate::transfer::CommitTicket::for_test(),
-                    "releases",
-                    "v1",
+                    &gate,
                     crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
                     &meta,
                 )
@@ -270,8 +276,7 @@ async fn fast_path_seed_holds_the_lock() {
     assert!(engine
         .put_reference_raw(
             &crate::transfer::CommitTicket::for_test(),
-            "releases",
-            "v1",
+            &gate,
             crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
             &meta
         )
@@ -292,10 +297,7 @@ async fn fast_path_seed_holds_the_lock() {
     let err = engine
         .put_delta_raw(
             &crate::transfer::CommitTicket::for_test(),
-            &engine.lock_object_write("releases", "v1/app.zip").await,
-            "releases",
-            "v1",
-            "app.zip",
+            &gate,
             crate::storage::PutBody::Bytes(bytes::Bytes::from_static(b"abc")),
             &delta_meta,
             &super::usage::CounterPrior::Unknown,

@@ -1450,7 +1450,12 @@ pub async fn require_admin_gui_session(
 #[derive(Clone, Debug)]
 pub enum BulkSession {
     /// An admin GUI session: the session is the authorization boundary.
-    AdminGui,
+    /// `who` and `client_ip` name the admin, for a job that outlives the
+    /// request.
+    AdminGui {
+        who: crate::maintenance::delete::AdminWho,
+        client_ip: Option<IpAddr>,
+    },
     /// A non-admin browser session (S3BrowserLift): every key is authorized
     /// with this IAM user's policy, like the S3 API. `client_ip` is the
     /// trusted client address, for `aws:SourceIp` conditions.
@@ -1486,30 +1491,78 @@ pub async fn require_bulk_session(
         return Err(unauthorized());
     }
     let iam = state.iam_state.load();
-    let (session, actor) = if admin_gui_session_ok(&state, &token, client_ip) {
-        let actor = state
-            .sessions
-            .admin_gui_auth_method(&token, client_ip)
-            .map(|m| session_actor_label(&m, &iam))
-            .unwrap_or_else(|| "admin".to_string());
-        (BulkSession::AdminGui, actor)
-    } else {
-        match state.credential_view(&iam).ok().and_then(|view| {
-            non_admin_bulk_session(
-                state.sessions.auth_method(&token, client_ip),
-                view,
-                client_ip,
-            )
-        }) {
-            Some(pair) => pair,
-            None => return Err(admin_session_required()),
-        }
-    };
+    let mut admin_method = None;
+    let (session, actor) =
+        if let Some((session, method)) = admin_bulk_session(&state, &token, client_ip) {
+            let actor = session_actor_label(&method, &iam);
+            admin_method = Some(method);
+            (session, actor)
+        } else {
+            match state.credential_view(&iam).ok().and_then(|view| {
+                non_admin_bulk_session(
+                    state.sessions.auth_method(&token, client_ip),
+                    view,
+                    client_ip,
+                )
+            }) {
+                Some(pair) => pair,
+                None => return Err(admin_session_required()),
+            }
+        };
+    // Its reads of large objects count against its own share, like the S3
+    // API's (the same principal name for the same user).
+    let principal = bulk_principal(&session, admin_method.as_ref(), &iam);
     request.extensions_mut().insert(session);
-    Ok(crate::audit::with_actor(actor, next.run(request))
-        .await
-        .into_response())
+    Ok(crate::audit::with_actor(
+        actor,
+        crate::deltaglider::spool::as_principal(&principal, next.run(request)),
+    )
+    .await
+    .into_response())
 }
+
+/// The admin bulk session of `token` (with its method, for the audit label)
+/// while its principal is still an enabled admin, else `None`.
+fn admin_bulk_session(
+    state: &AdminState,
+    token: &str,
+    client_ip: Option<IpAddr>,
+) -> Option<(BulkSession, AuthMethod)> {
+    if !admin_gui_session_ok(state, token, client_ip) {
+        return None;
+    }
+    let method = state.sessions.admin_gui_auth_method(token, client_ip)?;
+    let who = crate::maintenance::delete::AdminWho::of_session(&method)?;
+    Some((BulkSession::AdminGui { who, client_ip }, method))
+}
+
+/// The principal of the spool shares for a bulk session: the access key id
+/// of an IAM user (so its ZIP downloads and its S3 GETs share one ledger),
+/// `$open` in open access, and a name of its own for the bootstrap admin.
+pub(crate) fn bulk_principal(
+    session: &BulkSession,
+    admin_method: Option<&AuthMethod>,
+    iam: &IamState,
+) -> String {
+    match session {
+        BulkSession::IamUser { access_key_id, .. } => access_key_id.clone(),
+        BulkSession::Open => crate::iam::OPEN_ACCESS_PRINCIPAL.to_string(),
+        BulkSession::AdminGui { .. } => match admin_method {
+            Some(AuthMethod::IamLoginAs { access_key_id }) => access_key_id.clone(),
+            Some(AuthMethod::External { user_id, .. }) => match iam {
+                IamState::Iam(index) => index
+                    .get_by_id(*user_id)
+                    .map(|u| u.access_key_id.clone())
+                    .unwrap_or_else(|| format!("$external:{user_id}")),
+                _ => format!("$external:{user_id}"),
+            },
+            Some(AuthMethod::Bootstrap) | Some(_) | None => BOOTSTRAP_ADMIN_PRINCIPAL.to_string(),
+        },
+    }
+}
+
+/// The spool principal of the bootstrap admin session.
+pub const BOOTSTRAP_ADMIN_PRINCIPAL: &str = "$bootstrap-admin";
 
 /// The bulk session (and audit actor) of a browser session that is not a
 /// live admin session, or `None` (403). A non-admin IAM user acts under its
@@ -1556,7 +1609,10 @@ impl BulkSession {
     pub fn principal(&self) -> crate::maintenance::delete::Principal {
         use crate::maintenance::delete::Principal;
         match self {
-            BulkSession::AdminGui => Principal::Admin,
+            BulkSession::AdminGui { who, client_ip } => Principal::Admin {
+                who: who.clone(),
+                client_ip: *client_ip,
+            },
             BulkSession::Open => Principal::Open,
             BulkSession::IamUser {
                 access_key_id,
@@ -1582,15 +1638,15 @@ pub(crate) fn bucket_view_session(
     client_ip: Option<IpAddr>,
     bucket: &str,
 ) -> Option<BulkSession> {
-    if admin_gui_session_ok(state, token, client_ip) {
-        return Some(BulkSession::AdminGui);
+    if let Some((session, _)) = admin_bulk_session(state, token, client_ip) {
+        return Some(session);
     }
     let iam = state.iam_state.load();
     let iam = state.credential_view(&iam).ok()?;
     let (session, _) =
         non_admin_bulk_session(state.sessions.auth_method(token, client_ip), iam, client_ip)?;
     let may = match &session {
-        BulkSession::Open | BulkSession::AdminGui => true,
+        BulkSession::Open | BulkSession::AdminGui { .. } => true,
         BulkSession::IamUser { access_key_id, .. } => match iam {
             IamState::Iam(index) => index
                 .principal(access_key_id)
@@ -2075,6 +2131,48 @@ mod tests {
             oauth_mint_verdict(&unconfirmed, &iam, &external, ip),
             Ok(true)
         );
+    }
+
+    /// The spool principal of a bulk session is the one the S3 API uses for the
+    /// same user: ZIP downloads and S3 GETs share one ledger.
+    #[test]
+    fn a_bulk_session_pays_as_the_same_principal_as_its_s3_requests() {
+        let iam = IamState::Iam(IamIndex::from_users_and_groups(
+            vec![admin_test_user(4, "AKADMIN", true, true, vec![])],
+            vec![],
+        ));
+        let user = BulkSession::IamUser {
+            access_key_id: "AKPLAIN".into(),
+            user_id: 9,
+            client_ip: None,
+        };
+        assert_eq!(bulk_principal(&user, None, &iam), "AKPLAIN");
+        assert_eq!(
+            bulk_principal(&BulkSession::Open, None, &IamState::Disabled),
+            "$open"
+        );
+        let gui = BulkSession::AdminGui {
+            who: crate::maintenance::delete::AdminWho::Bootstrap,
+            client_ip: None,
+        };
+        let admin = |m: Option<AuthMethod>| bulk_principal(&gui, m.as_ref(), &iam);
+        assert_eq!(
+            admin(Some(AuthMethod::Bootstrap)),
+            BOOTSTRAP_ADMIN_PRINCIPAL
+        );
+        assert_eq!(
+            admin(Some(AuthMethod::IamLoginAs {
+                access_key_id: "AKADMIN".into()
+            })),
+            "AKADMIN"
+        );
+        let external = |id| AuthMethod::External {
+            provider_name: "corp".into(),
+            user_id: id,
+        };
+        assert_eq!(admin(Some(external(4))), "AKADMIN");
+        assert_eq!(admin(Some(external(77))), "$external:77");
+        assert_eq!(admin(None), BOOTSTRAP_ADMIN_PRINCIPAL);
     }
 
     /// auth-5: a non-admin browser session reaches the bulk endpoints under

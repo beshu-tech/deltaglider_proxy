@@ -306,7 +306,9 @@ mod tests {
     async fn the_engine_locks_hold_the_write_window() {
         let (engine, _fake, usage) = counted_s3_engine(None).await;
         assert_eq!(usage.writes_in_window("b"), 0);
-        let object = engine.lock_object_write("b", "run/a.zip").await;
+        let object = engine
+            .lock_object_write("b", "run/a.zip", crate::types::WriteOrigin::Client)
+            .await;
         assert_eq!(usage.writes_in_window("b"), 1, "the object write lock");
         let prefix = engine.acquire_prefix_lock("b", "run").await;
         assert_eq!(usage.writes_in_window("b"), 2, "the deltaspace lock");

@@ -104,6 +104,44 @@ fn collect_matching_groups(
     group_ids
 }
 
+/// THE compile of an `email_regex` pattern: it must match the whole address
+/// (`^(?:pattern)$`), as `email_domain` and `email_glob` do. Validation and
+/// matching both call it.
+pub(crate) fn compile_email_regex(pattern: &str) -> Result<regex_lite::Regex, regex_lite::Error> {
+    // The pattern must compile on its own: `a)|(.*` only compiles once wrapped.
+    regex_lite::Regex::new(pattern)?;
+    regex_lite::Regex::new(&format!("^(?:{pattern})$"))
+}
+
+/// Pure: does whole-address matching change what this pattern matched when it
+/// was searched inside the address? True unless it starts with `^` or `.*`
+/// and ends with an unescaped `$` or `.*`. A heuristic: it may flag a rule
+/// that is fine, never the reverse.
+pub(crate) fn email_regex_behaviour_changed(pattern: &str) -> bool {
+    let starts = pattern.starts_with('^') || pattern.starts_with(".*");
+    let backslashes = pattern
+        .strip_suffix('$')
+        .map_or(0, |p| p.len() - p.trim_end_matches('\\').len());
+    let ends = (pattern.ends_with('$') && backslashes.is_multiple_of(2)) || pattern.ends_with(".*");
+    !(starts && ends)
+}
+
+/// One warning for each stored `email_regex` rule that whole-address matching
+/// changed, so an operator sees which rules to write with `^…$`.
+pub fn warn_email_regex_rules_that_changed(rules: &[GroupMappingRule]) {
+    for rule in rules {
+        if rule.match_type == "email_regex" && email_regex_behaviour_changed(&rule.match_value) {
+            tracing::warn!(
+                "mapping rule {} (email_regex `{}`): the pattern now matches the whole address \
+                 and no longer a part of it. Write it as ^...$ (or start and end it with .*) \
+                 to keep one meaning.",
+                rule.id,
+                rule.match_value
+            );
+        }
+    }
+}
+
 fn matches_rule(rule: &GroupMappingRule, identity: &ExternalIdentityInfo) -> bool {
     match rule.match_type.as_str() {
         "email_exact" => identity
@@ -127,7 +165,7 @@ fn matches_rule(rule: &GroupMappingRule, identity: &ExternalIdentityInfo) -> boo
                 .email
                 .as_deref()
                 .map(|e| {
-                    glob_match(
+                    crate::linear_glob::star_match(
                         &rule.match_value.to_ascii_lowercase(),
                         &e.to_ascii_lowercase(),
                     )
@@ -135,13 +173,12 @@ fn matches_rule(rule: &GroupMappingRule, identity: &ExternalIdentityInfo) -> boo
                 .unwrap_or(false)
         }
         "email_regex" => {
-            // Regex matching — compiled per evaluation. For high-volume use cases
-            // consider caching, but mapping evaluation happens once per login.
+            // Compiled per evaluation: mapping runs once per login.
             identity
                 .email
                 .as_deref()
                 .and_then(|e| {
-                    regex_lite::Regex::new(&rule.match_value)
+                    compile_email_regex(&rule.match_value)
                         .ok()
                         .map(|re| re.is_match(e))
                 })
@@ -169,51 +206,6 @@ fn matches_rule(rule: &GroupMappingRule, identity: &ExternalIdentityInfo) -> boo
             false
         }
     }
-}
-
-/// Simple glob matching: `*` matches any sequence of characters.
-/// Used for email patterns like `*@acme.com` or `*.eng@acme.com`.
-///
-/// Linear-time, allocation-free iterative matcher with a single backtrack
-/// pointer (the classic "remember the last star" algorithm). This runs in
-/// O(pattern.len() + text.len()) and avoids the exponential backtracking that
-/// a naive recursive matcher exhibits on patterns like `*a*b*c`. Operates on
-/// bytes since the glob path always passes ASCII-lowercased inputs.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let text = text.as_bytes();
-
-    let mut pi = 0; // index into pattern
-    let mut ti = 0; // index into text
-                    // Backtrack anchors: position to resume matching after the most recent `*`.
-    let mut star_pi: Option<usize> = None;
-    let mut star_ti = 0;
-
-    while ti < text.len() {
-        if pi < pattern.len() && pattern[pi] == b'*' {
-            // Record the star and tentatively consume zero characters.
-            star_pi = Some(pi);
-            star_ti = ti;
-            pi += 1;
-        } else if pi < pattern.len() && pattern[pi] == text[ti] {
-            pi += 1;
-            ti += 1;
-        } else if let Some(sp) = star_pi {
-            // Mismatch: let the last `*` swallow one more character and retry.
-            pi = sp + 1;
-            star_ti += 1;
-            ti = star_ti;
-        } else {
-            return false;
-        }
-    }
-
-    // Consume any trailing `*`s in the pattern (they match the empty string).
-    while pi < pattern.len() && pattern[pi] == b'*' {
-        pi += 1;
-    }
-
-    pi == pattern.len()
 }
 
 #[cfg(test)]
@@ -586,11 +578,89 @@ mod tests {
 
     #[test]
     fn test_email_regex_anchored_correctly() {
-        let rules = vec![make_rule(1, None, "email_regex", "email", r"^admin@", 10)];
+        let rules = vec![make_rule(1, None, "email_regex", "email", r"admin@.*", 10)];
         let admin = make_identity("admin@co.com", serde_json::json!({}));
         let not_admin = make_identity("notadmin@co.com", serde_json::json!({}));
         assert_eq!(evaluate_mappings(&rules, &admin, 1), vec![10]);
         assert!(evaluate_mappings(&rules, &not_admin, 1).is_empty());
+    }
+
+    /// An `email_regex` pattern matches the whole address, each branch of an
+    /// alternation too: a substring hit is no match.
+    #[test]
+    fn an_email_regex_matches_the_whole_address() {
+        let matches = |pattern: &str, email: &str| {
+            let rules = vec![make_rule(1, None, "email_regex", "email", pattern, 10)];
+            !evaluate_mappings(&rules, &make_identity(email, serde_json::json!({})), 1).is_empty()
+        };
+        let evil = "evil@corp.com.attacker.io";
+        assert!(!matches(r"@corp\.com", evil));
+        assert!(!matches(r"@corp\.com", "alice@corp.com"));
+        assert!(!matches(r"^.*@corp\.com", evil));
+        assert!(matches(r".*@corp\.com", "alice@corp.com"));
+        assert!(!matches(r".*@corp\.com", evil));
+        assert!(matches(r"a@x\.com|b@y\.com", "b@y.com"));
+        assert!(!matches(r"a@x\.com|b@y\.com", "xb@y.com.evil"));
+        assert!(compile_email_regex("(((").is_err());
+    }
+
+    /// A pattern that only compiles once it is wrapped (`a)|(.*` becomes
+    /// `^(?:a)|(.*)$`) is refused, and never matches at run time.
+    #[test]
+    fn a_pattern_that_closes_the_wrapper_is_refused_and_never_matches() {
+        for pattern in ["a)|(.*", "x)|(.+", ".*)|(.*"] {
+            assert!(compile_email_regex(pattern).is_err(), "{pattern}");
+            let rules = vec![make_rule(1, None, "email_regex", "email", pattern, 10)];
+            let who = make_identity("anyone@elsewhere.example", serde_json::json!({}));
+            assert!(evaluate_mappings(&rules, &who, 1).is_empty(), "{pattern}");
+        }
+        assert!(compile_email_regex(r"a@x\.com|b@y\.com").is_ok());
+    }
+
+    #[test]
+    fn whole_address_matching_changes_a_pattern_that_is_not_anchored_at_both_ends() {
+        for same in [
+            r"^a@x\.com$",
+            r".*@x\.com.*",
+            r"^a@x\.com.*",
+            r"^.*@x\.com$",
+            ".*",
+        ] {
+            assert!(!email_regex_behaviour_changed(same), "{same}");
+        }
+        for changed in [
+            r"@x\.com",
+            r"^a@x\.com",
+            r"a@x\.com$",
+            r".*@x\.com",
+            r"a@x\.com.*",
+            r"a@x\.com\$",
+            "corp",
+        ] {
+            assert!(email_regex_behaviour_changed(changed), "{changed}");
+        }
+    }
+
+    #[test]
+    fn one_warning_names_each_rule_whose_behaviour_changed() {
+        let log = crate::test_log_capture::capture("warn");
+        let rules = vec![
+            make_rule(7, None, "email_regex", "email", r"@x\.com", 10),
+            make_rule(8, None, "email_regex", "email", r"^.*@x\.com$", 10),
+            make_rule(9, None, "email_domain", "email", "x.com", 10),
+            make_rule(11, Some(2), "email_regex", "email", "corp", 12),
+        ];
+        warn_email_regex_rules_that_changed(&rules);
+        let text = log.text();
+        assert_eq!(text.matches("email_regex").count(), 2, "{text}");
+        assert!(
+            text.contains("rule 7") && text.contains("rule 11"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("rule 8") && !text.contains("rule 9"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -118,6 +118,8 @@ The proxy checks every condition when you save the rule, and refuses one that it
 | `IpAddress` | CIDR range match | `aws:SourceIp` in `203.0.113.0/24` |
 | `NotIpAddress` | CIDR range non-match | `aws:SourceIp` NOT in `203.0.113.0/24` |
 
+In a resource and in a `StringLike`, `StringNotLike`, `ArnLike` or `ArnNotLike` value, `*` stands for any run of characters (also `/`) and `?` for exactly one character. The proxy matches such a pattern against the text of a request in one pass, so the time of a match grows in proportion to the length of the text and never with the number of `*` in the pattern. A client cannot make a request expensive with a long prefix or key: a policy variable in a resource (`${iam:username}`) is replaced and matched in the same way, and the proxy refuses a key or prefix of more than 1024 bytes before it evaluates any policy (for a user whose policy is not an unconditional administrator rule, in every place where the proxy reads a key, including the keys in a `DeleteObjects` body).
+
 ### Condition keys
 
 | Key | Type | Available on | Value |

@@ -1071,8 +1071,10 @@ admission:
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let body = r.text().await.unwrap();
+    // The LIST shows only the keys a block admits: `*.zip` admits app.zip,
+    // no block admits app.tar.gz.
     assert!(
-        body.contains("builds/app.zip") && body.contains("builds/app.tar.gz"),
+        body.contains("builds/app.zip") && !body.contains("builds/app.tar.gz"),
         "{body}"
     );
 
@@ -1093,4 +1095,1056 @@ admission:
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
+}
+
+// ═══════════════════════════════════════════════════
+// A `path_glob` decides keys: every resource a request touches
+// ═══════════════════════════════════════════════════
+
+fn status_of<T, E: aws_sdk_s3::error::ProvideErrorMetadata>(
+    r: Result<T, aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>>,
+) -> u16 {
+    match r {
+        Ok(_) => 200,
+        Err(e) => e.raw_response().map(|r| r.status().as_u16()).unwrap_or(0),
+    }
+}
+
+async fn put_keys(s3: &aws_sdk_s3::Client, bucket: &str, keys: &[&str]) {
+    for key in keys {
+        s3.put_object()
+            .bucket(bucket)
+            .key(*key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"payload"))
+            .send()
+            .await
+            .unwrap();
+    }
+}
+
+async fn listed(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut req = s3.list_objects_v2().bucket(bucket).prefix(prefix);
+    if let Some(d) = delimiter {
+        req = req.delimiter(d);
+    }
+    let out = req.send().await.unwrap();
+    (
+        out.contents()
+            .iter()
+            .map(|o| o.key().unwrap().to_string())
+            .collect(),
+        out.common_prefixes()
+            .iter()
+            .map(|p| p.prefix().unwrap().to_string())
+            .collect(),
+    )
+}
+
+/// An operator `deny` + `path_glob` refuses the key on the request line AND
+/// the copy source, each DeleteObjects key, the UploadPartCopy source, and
+/// every key and folder that a LIST returns.
+#[tokio::test]
+async fn a_deny_with_a_glob_covers_every_resource_of_a_request() {
+    let server = TestServer::builder().auth("RRK1", "RRS1").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let s3 = server.s3_client().await;
+    put_keys(
+        &s3,
+        &bucket,
+        &[
+            "secret/s1.txt",
+            "secret/s2.txt",
+            "team/ok.txt",
+            "team/bye.txt",
+        ],
+    )
+    .await;
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: no-secret
+      match:
+        bucket: {bucket}
+        path_glob: "secret/**"
+      action: deny
+"#
+        ),
+    )
+    .await;
+
+    // Control: the request line.
+    assert_eq!(
+        status_of(
+            s3.get_object()
+                .bucket(&bucket)
+                .key("secret/s1.txt")
+                .send()
+                .await
+        ),
+        403
+    );
+
+    // The trace says the chain also decides per resource, and that a LIST narrows.
+    let trace = trace_anon(
+        &admin,
+        &endpoint,
+        "GET",
+        &format!("/{bucket}"),
+        "list-type=2",
+    )
+    .await;
+    assert_eq!(trace["per_resource_rules"], true, "{trace}");
+    assert_eq!(trace["listing_filtered"], true, "{trace}");
+    let trace = trace_anon(
+        &admin,
+        &endpoint,
+        "GET",
+        &format!("/{bucket}/team/ok.txt"),
+        "",
+    )
+    .await;
+    assert_eq!(trace["listing_filtered"], false, "{trace}");
+
+    // CopyObject source.
+    let copy = s3
+        .copy_object()
+        .bucket(&bucket)
+        .key("team/copied.txt")
+        .copy_source(format!("{bucket}/secret/s1.txt"))
+        .send()
+        .await;
+    assert_eq!(status_of(copy), 403, "CopyObject source");
+    assert_eq!(
+        status_of(
+            s3.get_object()
+                .bucket(&bucket)
+                .key("team/copied.txt")
+                .send()
+                .await
+        ),
+        404,
+        "nothing was copied"
+    );
+    // An allowed source still copies.
+    let copy = s3
+        .copy_object()
+        .bucket(&bucket)
+        .key("team/copied-ok.txt")
+        .copy_source(format!("{bucket}/team/ok.txt"))
+        .send()
+        .await;
+    assert_eq!(status_of(copy), 200);
+
+    // UploadPartCopy source.
+    let upload = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key("team/mpu.bin")
+        .send()
+        .await
+        .unwrap();
+    let part = s3
+        .upload_part_copy()
+        .bucket(&bucket)
+        .key("team/mpu.bin")
+        .upload_id(upload.upload_id().unwrap())
+        .part_number(1)
+        .copy_source(format!("{bucket}/secret/s1.txt"))
+        .send()
+        .await;
+    assert_eq!(status_of(part), 403, "UploadPartCopy source");
+
+    // DeleteObjects: the denied key is an error, the others go.
+    let ids: Vec<_> = ["secret/s1.txt", "team/bye.txt"]
+        .into_iter()
+        .map(|k| {
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key(k)
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let out = s3
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(ids))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let errors: Vec<_> = out
+        .errors()
+        .iter()
+        .map(|e| (e.key().unwrap(), e.code().unwrap()))
+        .collect();
+    assert_eq!(errors, vec![("secret/s1.txt", "AccessDenied")], "{out:?}");
+    let deleted: Vec<_> = out.deleted().iter().map(|d| d.key().unwrap()).collect();
+    assert_eq!(deleted, vec!["team/bye.txt"], "{out:?}");
+
+    // LIST: a prefix without a slash, no prefix, a delimiter.
+    let (keys, _) = listed(&s3, &bucket, "secret", None).await;
+    assert!(keys.is_empty(), "{keys:?}");
+    let (keys, _) = listed(&s3, &bucket, "", None).await;
+    assert!(keys.iter().all(|k| !k.starts_with("secret/")), "{keys:?}");
+    assert!(keys.contains(&"team/ok.txt".to_string()), "{keys:?}");
+    let (keys, prefixes) = listed(&s3, &bucket, "", Some("/")).await;
+    assert!(
+        keys.is_empty() && prefixes == vec!["team/".to_string()],
+        "{keys:?} {prefixes:?}"
+    );
+    // A delimiter that cuts inside the folder name: `sec` would name `secret/`.
+    let (_, prefixes) = listed(&s3, &bucket, "", Some("c")).await;
+    assert!(
+        prefixes.iter().all(|p| !p.starts_with("sec")),
+        "{prefixes:?}"
+    );
+
+    // Lifting the rule lifts everything: nothing was lost.
+    apply_admission_yaml(&admin, &endpoint, "admission:\n  blocks: []\n").await;
+    assert_eq!(
+        status_of(
+            s3.get_object()
+                .bucket(&bucket)
+                .key("secret/s1.txt")
+                .send()
+                .await
+        ),
+        200
+    );
+    assert_eq!(
+        status_of(
+            s3.get_object()
+                .bucket(&bucket)
+                .key("secret/s2.txt")
+                .send()
+                .await
+        ),
+        200
+    );
+}
+
+/// The deny also meets the key of a browser form POST, which the request
+/// line (`POST /bucket`) does not name.
+#[tokio::test]
+async fn a_deny_with_a_glob_covers_the_form_post_key() {
+    let server = TestServer::builder().open_access().build().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket().to_string();
+    apply_admission_yaml(
+        &admin,
+        &server.endpoint(),
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: no-secret
+      match:
+        bucket: {bucket}
+        path_glob: "secret/**"
+      action: deny
+"#
+        ),
+    )
+    .await;
+    let form = |key: &str| {
+        reqwest::multipart::Form::new()
+            .text("key", key.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"payload".to_vec())
+                    .file_name("f.txt")
+                    .mime_str("text/plain")
+                    .unwrap(),
+            )
+    };
+    let http = reqwest::Client::new();
+    let denied = http
+        .post(format!("{}/{bucket}", server.endpoint()))
+        .multipart(form("secret/x.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let ok = http
+        .post(format!("{}/{bucket}", server.endpoint()))
+        .multipart(form("team/x.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success(), "{}", ok.status());
+    let s3 = server.s3_client().await;
+    apply_admission_yaml(&admin, &server.endpoint(), "admission:\n  blocks: []\n").await;
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("secret/x.txt")
+        .send()
+        .await;
+    assert_eq!(status_of(head), 404, "the denied form POST stored nothing");
+}
+
+/// With `allow-anonymous` + `path_glob: "*.zip"` an anonymous LIST shows
+/// the keys that glob matches, and the folders that hold one.
+#[tokio::test]
+async fn an_anonymous_list_shows_only_the_keys_the_glob_matches() {
+    let server = TestServer::builder().auth("RRK2", "RRS2").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let s3 = server.s3_client().await;
+    put_keys(
+        &s3,
+        &bucket,
+        &[
+            "app.zip",
+            "app.zip.bak",
+            "release.zip.d/internal-roadmap.txt",
+            "d/x.zip",
+            "notes/a.txt",
+        ],
+    )
+    .await;
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: public-zips
+      match:
+        method: [GET, HEAD]
+        bucket: {bucket}
+        path_glob: "*.zip"
+      action: allow-anonymous
+"#
+        ),
+    )
+    .await;
+    let anon = reqwest::Client::new();
+    let list = |query: &str| {
+        let url = format!("{endpoint}/{bucket}?list-type=2&{query}");
+        let anon = anon.clone();
+        async move { anon.get(url).send().await.unwrap() }
+    };
+    let r = list("prefix=app.zip").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<Key>app.zip</Key>"), "{body}");
+    assert!(!body.contains("app.zip.bak"), "{body}");
+
+    let r = list("prefix=release.zip").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = r.text().await.unwrap();
+    assert!(!body.contains("internal-roadmap"), "{body}");
+
+    let r = list("delimiter=%2F").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<Key>app.zip</Key>"), "{body}");
+    assert!(
+        body.contains("<Prefix>d/</Prefix>"),
+        "the folder holds d/x.zip: {body}"
+    );
+    assert!(!body.contains("release.zip.d/"), "{body}");
+    assert!(!body.contains("notes/"), "{body}");
+    assert!(!body.contains("app.zip.bak"), "{body}");
+
+    // A prefix that no matching key can start with: no grant.
+    let r = list("prefix=notes%2F").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(!r.text().await.unwrap().contains("a.txt"));
+
+    // GET of a key the glob does not match stays refused.
+    let r = anon
+        .get(format!("{endpoint}/{bucket}/app.zip.bak"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = anon
+        .get(format!("{endpoint}/{bucket}/app.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+// ═══════════════════════════════════════════════════
+// `method` is the EFFECT on the resource
+// ═══════════════════════════════════════════════════
+
+/// A `method` in a block that decides per resource names what the request does
+/// to that resource: a copy source, a listed key and a download entry are
+/// read (GET; a block that names HEAD matches a read too), a DeleteObjects key
+/// is deleted (DELETE), a form POST key is written (PUT).
+#[tokio::test]
+async fn method_in_a_per_resource_rule_is_the_effect_on_the_resource() {
+    let server = TestServer::builder().auth("EFK1", "EFS1").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let s3 = server.s3_client().await;
+    put_keys(
+        &s3,
+        &bucket,
+        &[
+            "secret/s1.txt",
+            "secret/s2.txt",
+            "team/ok.txt",
+            "team/bye.txt",
+        ],
+    )
+    .await;
+    let admin = admin_http_client(&endpoint).await;
+    let rule = |methods: &str| {
+        format!(
+            r#"
+admission:
+  blocks:
+    - name: no-secret
+      match:
+        bucket: {bucket}
+        path_glob: "secret/**"
+        method: [{methods}]
+      action: deny
+"#
+        )
+    };
+    let copy = |source: &str, dest: &str| {
+        s3.copy_object()
+            .bucket(&bucket)
+            .key(dest.to_string())
+            .copy_source(format!("{bucket}/{source}"))
+            .send()
+    };
+    let part_copy = |source: &str| {
+        let s3 = s3.clone();
+        let bucket = bucket.clone();
+        let source = source.to_string();
+        async move {
+            let upload = s3
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("team/mpu.bin")
+                .send()
+                .await
+                .unwrap();
+            let part = s3
+                .upload_part_copy()
+                .bucket(&bucket)
+                .key("team/mpu.bin")
+                .upload_id(upload.upload_id().unwrap())
+                .part_number(1)
+                .copy_source(format!("{bucket}/{source}"))
+                .send()
+                .await;
+            s3.abort_multipart_upload()
+                .bucket(&bucket)
+                .key("team/mpu.bin")
+                .upload_id(upload.upload_id().unwrap())
+                .send()
+                .await
+                .ok();
+            status_of(part)
+        }
+    };
+    let delete_keys = |keys: &[&str]| {
+        let s3 = s3.clone();
+        let bucket = bucket.clone();
+        let ids: Vec<_> = keys
+            .iter()
+            .map(|k| {
+                aws_sdk_s3::types::ObjectIdentifier::builder()
+                    .key(*k)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        async move {
+            let out = s3
+                .delete_objects()
+                .bucket(&bucket)
+                .delete(
+                    aws_sdk_s3::types::Delete::builder()
+                        .set_objects(Some(ids))
+                        .build()
+                        .unwrap(),
+                )
+                .send()
+                .await
+                .unwrap();
+            out.errors()
+                .iter()
+                .map(|e| e.key().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // GET-only deny ("nobody reads secret/"): a copy source and a part-copy
+    // source are reads, and so are the listed keys.
+    apply_admission_yaml(&admin, &endpoint, &rule("GET")).await;
+    assert_eq!(
+        status_of(
+            s3.get_object()
+                .bucket(&bucket)
+                .key("secret/s1.txt")
+                .send()
+                .await
+        ),
+        403,
+        "request line"
+    );
+    assert_eq!(
+        status_of(copy("secret/s1.txt", "team/c1.txt").await),
+        403,
+        "CopyObject source"
+    );
+    assert_eq!(
+        part_copy("secret/s1.txt").await,
+        403,
+        "UploadPartCopy source"
+    );
+    let (keys, _) = listed(&s3, &bucket, "", None).await;
+    assert!(keys.iter().all(|k| !k.starts_with("secret/")), "{keys:?}");
+    // Controls: a read of an allowed key, a write and a delete of a secret key.
+    assert_eq!(status_of(copy("team/ok.txt", "team/c2.txt").await), 200);
+    assert_eq!(
+        delete_keys(&["secret/s2.txt"]).await,
+        Vec::<String>::new(),
+        "DELETE is not named"
+    );
+    put_keys(&s3, &bucket, &["secret/s2.txt"]).await;
+
+    // HEAD-only deny: a block that names HEAD matches a read of a copy source.
+    apply_admission_yaml(&admin, &endpoint, &rule("HEAD")).await;
+    assert_eq!(
+        status_of(copy("secret/s1.txt", "team/c3.txt").await),
+        403,
+        "HEAD matches a read"
+    );
+    assert_eq!(
+        status_of(
+            s3.get_object()
+                .bucket(&bucket)
+                .key("secret/s1.txt")
+                .send()
+                .await
+        ),
+        403,
+        "GET and HEAD are one read for a rule with a glob"
+    );
+
+    // DELETE-only deny: a DeleteObjects key is a delete.
+    apply_admission_yaml(&admin, &endpoint, &rule("DELETE")).await;
+    assert_eq!(
+        delete_keys(&["secret/s1.txt", "team/bye.txt"]).await,
+        vec!["secret/s1.txt"]
+    );
+    assert_eq!(
+        status_of(copy("secret/s1.txt", "team/c4.txt").await),
+        200,
+        "a read is not a delete"
+    );
+
+    // PUT-only deny: the destination of a copy is a write; a read of the source is not.
+    apply_admission_yaml(&admin, &endpoint, &rule("PUT")).await;
+    assert_eq!(
+        status_of(copy("team/ok.txt", "secret/new.txt").await),
+        403,
+        "copy destination"
+    );
+    assert_eq!(
+        status_of(copy("secret/s1.txt", "team/c5.txt").await),
+        200,
+        "source is a read"
+    );
+}
+
+/// A `method: [PUT]` deny also refuses the key of a browser form POST (a write).
+#[tokio::test]
+async fn a_put_only_deny_covers_the_form_post_key() {
+    let server = TestServer::builder().open_access().build().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket().to_string();
+    let rule = |methods: &str| {
+        format!(
+            r#"
+admission:
+  blocks:
+    - name: no-secret
+      match:
+        bucket: {bucket}
+        path_glob: "secret/**"
+        method: [{methods}]
+      action: deny
+"#
+        )
+    };
+    let form = |key: &str| {
+        reqwest::multipart::Form::new()
+            .text("key", key.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"payload".to_vec())
+                    .file_name("f.txt")
+                    .mime_str("text/plain")
+                    .unwrap(),
+            )
+    };
+    let http = reqwest::Client::new();
+    let post = |key: &'static str| {
+        let http = http.clone();
+        let url = format!("{}/{bucket}", server.endpoint());
+        let form = form(key);
+        async move {
+            http.post(url)
+                .multipart(form)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    apply_admission_yaml(&admin, &server.endpoint(), &rule("PUT")).await;
+    assert_eq!(post("secret/x.txt").await, StatusCode::FORBIDDEN);
+    assert!(post("team/x.txt").await.is_success(), "control");
+    // A GET-only deny does not name a write.
+    apply_admission_yaml(&admin, &server.endpoint(), &rule("GET")).await;
+    assert!(
+        post("secret/y.txt").await.is_success(),
+        "a GET-only deny does not cover a write"
+    );
+}
+
+// ═══════════════════════════════════════════════════
+// Keyless requests meet the blocks that cover every key below their prefix
+// ═══════════════════════════════════════════════════
+
+/// A maintenance `reject` on `db/**` answers a LIST of `db/` with its status,
+/// not with an empty list (a `sync --delete` client would delete its copies).
+#[tokio::test]
+async fn a_reject_on_a_folder_answers_a_list_of_that_folder() {
+    common::expect_server_errors("the maintenance reject answers 503 by design");
+    let server = TestServer::builder().auth("KLK1", "KLS1").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let s3 = server.s3_client().await;
+    put_keys(&s3, &bucket, &["db/a.sql", "db/sub/b.sql", "docs/c.txt"]).await;
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: maintenance
+      match:
+        bucket: {bucket}
+        path_glob: "db/**"
+      action:
+        type: reject
+        status: 503
+        message: back soon
+"#
+        ),
+    )
+    .await;
+    let list = |prefix: &str| s3.list_objects_v2().bucket(&bucket).prefix(prefix).send();
+    for prefix in ["db/", "db/sub/", "db/a"] {
+        assert_eq!(status_of(list(prefix).await), 503, "LIST prefix={prefix}");
+    }
+    // Controls: a prefix outside. A LIST that reaches the folder only
+    // partly still shows its keys: only a `deny` hides a key from a listing,
+    // so a `sync --delete` client never deletes its copies of them.
+    assert_eq!(status_of(list("docs/").await), 200);
+    let want: Vec<String> = ["db/a.sql", "db/sub/b.sql", "docs/c.txt"]
+        .map(String::from)
+        .to_vec();
+    let (keys, _) = listed(&s3, &bucket, "", None).await;
+    assert_eq!(keys, want, "root LIST under a reject: {keys:?}");
+    let (keys, folders) = listed(&s3, &bucket, "", Some("/")).await;
+    assert!(keys.is_empty());
+    assert_eq!(folders, vec!["db/".to_string(), "docs/".to_string()]);
+    // The refused keys answer the rule's status for GET, copy source and delete.
+    let get = s3.get_object().bucket(&bucket).key("db/a.sql").send().await;
+    assert_eq!(status_of(get), 503);
+    let copy = s3
+        .copy_object()
+        .bucket(&bucket)
+        .key("docs/copy.txt")
+        .copy_source(format!("{bucket}/db/a.sql"))
+        .send()
+        .await;
+    assert_eq!(status_of(copy), 503);
+    let del = s3
+        .delete_object()
+        .bucket(&bucket)
+        .key("db/a.sql")
+        .send()
+        .await;
+    assert_eq!(status_of(del), 503);
+    // ListMultipartUploads shows the upload of a key that only a reject refuses.
+    let mp = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key("docs/mp.bin")
+        .send()
+        .await
+        .unwrap();
+    let _ = mp;
+    let uploads = s3
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploads.uploads().len(), 1);
+}
+
+/// Only a `deny` hides a key or a folder from a listing; the same glob as a
+/// `deny` hides the db/ keys from the root LIST.
+#[tokio::test]
+async fn only_a_deny_hides_keys_from_a_listing() {
+    let server = TestServer::builder().auth("KLK4", "KLS4").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let s3 = server.s3_client().await;
+    put_keys(&s3, &bucket, &["db/a.sql", "db/sub/b.sql", "docs/c.txt"]).await;
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: no-db
+      match:
+        bucket: {bucket}
+        path_glob: "db/**"
+      action: deny
+"#
+        ),
+    )
+    .await;
+    let (keys, _) = listed(&s3, &bucket, "", None).await;
+    assert_eq!(keys, vec!["docs/c.txt".to_string()], "{keys:?}");
+    let (_, folders) = listed(&s3, &bucket, "", Some("/")).await;
+    assert_eq!(folders, vec!["docs/".to_string()]);
+}
+
+/// A `continue` on `public/**` ends the walk for a LIST of `public/`, so the
+/// catch-all `deny` below it does not fire; any other LIST meets the deny.
+#[tokio::test]
+async fn a_continue_on_a_folder_ends_the_walk_of_a_list_of_that_folder() {
+    let server = TestServer::builder().auth("KLK2", "KLS2").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let s3 = server.s3_client().await;
+    put_keys(&s3, &bucket, &["public/a.txt", "private/b.txt"]).await;
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: public-ok
+      match:
+        bucket: {bucket}
+        path_glob: "public/**"
+      action: continue
+    - name: catch-all
+      match:
+        bucket: {bucket}
+      action: deny
+"#
+        ),
+    )
+    .await;
+    let list = |prefix: &str| s3.list_objects_v2().bucket(&bucket).prefix(prefix).send();
+    let (keys, _) = listed(&s3, &bucket, "public/", None).await;
+    assert_eq!(keys, vec!["public/a.txt".to_string()]);
+    assert_eq!(status_of(list("private/").await), 403);
+    assert_eq!(
+        status_of(list("").await),
+        403,
+        "a LIST of the whole bucket is not inside the glob"
+    );
+}
+
+/// A `deny` of `**` for a network blocks the bucket-level requests of that
+/// network (CreateBucket, HeadBucket, DeleteObjects, ListMultipartUploads).
+#[tokio::test]
+async fn a_whole_bucket_glob_with_a_source_network_blocks_bucket_level_requests() {
+    let server = TestServer::builder().auth("KLK3", "KLS3").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let fresh = format!("{bucket}-new");
+    let s3 = server.s3_client().await;
+    let admin = admin_http_client(&endpoint).await;
+    let rules = |network: &str| {
+        format!(
+            r#"
+admission:
+  blocks:
+    - name: no-net-existing
+      match:
+        bucket: {bucket}
+        path_glob: "**"
+        source_ip_list: ["{network}"]
+      action: deny
+    - name: no-net-fresh
+      match:
+        bucket: {fresh}
+        path_glob: "**"
+        source_ip_list: ["{network}"]
+      action: deny
+"#
+        )
+    };
+    let delete_one = || {
+        s3.delete_objects()
+            .bucket(&bucket)
+            .delete(
+                aws_sdk_s3::types::Delete::builder()
+                    .objects(
+                        aws_sdk_s3::types::ObjectIdentifier::builder()
+                            .key("k.txt")
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+    };
+    // The network of the client is blocked.
+    apply_admission_yaml(&admin, &endpoint, &rules("127.0.0.0/8")).await;
+    assert_eq!(
+        status_of(s3.create_bucket().bucket(&fresh).send().await),
+        403,
+        "CreateBucket"
+    );
+    assert_eq!(
+        status_of(s3.head_bucket().bucket(&bucket).send().await),
+        403,
+        "HeadBucket"
+    );
+    assert_eq!(status_of(delete_one().await), 403, "DeleteObjects");
+    assert_eq!(
+        status_of(s3.list_multipart_uploads().bucket(&bucket).send().await),
+        403,
+        "ListMultipartUploads"
+    );
+    // Control: another network is not blocked.
+    apply_admission_yaml(&admin, &endpoint, &rules("10.0.0.0/8")).await;
+    assert_eq!(
+        status_of(s3.head_bucket().bucket(&bucket).send().await),
+        200
+    );
+    assert_eq!(status_of(delete_one().await), 200);
+    assert_eq!(
+        status_of(s3.create_bucket().bucket(&fresh).send().await),
+        200
+    );
+}
+
+/// A `deny` with only `method` and a network, and no other block, covers each
+/// DeleteObjects key and the form POST key, as it does once any other block
+/// exists. The request line of both is POST; the effect on the key is DELETE or PUT.
+#[tokio::test]
+async fn a_method_only_deny_covers_deleted_and_posted_keys() {
+    let server = TestServer::builder().open_access().build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let s3 = server.s3_client().await;
+    put_keys(&s3, &bucket, &["a/one.txt", "a/two.txt"]).await;
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        r#"
+admission:
+  blocks:
+    - name: no-mutation
+      match:
+        method: [PUT, DELETE]
+        source_ip_list: ["127.0.0.0/8"]
+      action: deny
+"#,
+    )
+    .await;
+    let ids: Vec<_> = ["a/one.txt", "a/two.txt"]
+        .iter()
+        .map(|k| {
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key(*k)
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let out = s3
+        .delete_objects()
+        .bucket(&bucket)
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(ids))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await;
+    match out {
+        Ok(o) => {
+            assert!(o.deleted().is_empty(), "deleted: {:?}", o.deleted());
+            assert_eq!(o.errors().len(), 2, "{:?}", o.errors());
+        }
+        Err(e) => assert_eq!(status_of::<(), _>(Err(e)), 403),
+    }
+    let http = reqwest::Client::new();
+    let form = reqwest::multipart::Form::new()
+        .text("key", "a/posted.txt")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"payload".to_vec())
+                .file_name("f.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        );
+    let status = http
+        .post(format!("{endpoint}/{bucket}"))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, StatusCode::FORBIDDEN, "form POST key");
+    let get = s3
+        .get_object()
+        .bucket(&bucket)
+        .key("a/one.txt")
+        .send()
+        .await;
+    assert!(get.is_ok(), "reads and the objects stay: {:?}", get.err());
+}
+
+/// GET and HEAD are one read: `deny {path_glob: secret/**, method: [GET]}`
+/// refuses `HEAD secret/x` too (size, ETag, metadata); a HEAD of another key works.
+#[tokio::test]
+async fn a_get_rule_with_a_glob_also_refuses_head() {
+    let server = TestServer::builder().auth("HDK1", "HDS1").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let s3 = server.s3_client().await;
+    put_keys(&s3, &bucket, &["secret/x", "team/x"]).await;
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: no-secret-read
+      match:
+        bucket: {bucket}
+        path_glob: "secret/**"
+        method: [GET]
+      action: deny
+"#
+        ),
+    )
+    .await;
+    let head = |k: &str| s3.head_object().bucket(&bucket).key(k).send();
+    assert_eq!(status_of(head("secret/x").await), 403, "HEAD secret/x");
+    assert_eq!(status_of(head("team/x").await), 200, "HEAD team/x");
+    let get = s3.get_object().bucket(&bucket).key("secret/x").send().await;
+    assert_eq!(status_of(get), 403);
+}
+
+/// The storage facts of a write (storage type, stored size, reference hash)
+/// depend on the other objects of the folder: a compression oracle. A writer
+/// gets them only when no admission rule refuses a key that lies directly in
+/// the folder, as for an IAM user that may not read the whole folder.
+#[tokio::test]
+async fn delta_facts_are_withheld_from_a_folder_with_a_refused_key() {
+    let server = TestServer::builder().auth("DFK1", "DFS1").build().await;
+    let endpoint = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let http = server.http();
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: no-hidden
+      match:
+        bucket: {bucket}
+        path_glob: "secret/hidden*"
+      action: deny
+"#
+        ),
+    )
+    .await;
+    let facts = |r: &reqwest::Response| r.headers().contains_key("x-amz-storage-type");
+    let beside = common::put_object(
+        &http,
+        &endpoint,
+        &bucket,
+        "secret/ok.txt",
+        b"payload".to_vec(),
+        "text/plain",
+    )
+    .await;
+    assert!(beside.status().is_success(), "{}", beside.status());
+    assert!(
+        !facts(&beside),
+        "a refused key lies in the folder: no facts"
+    );
+    let elsewhere = common::put_object(
+        &http,
+        &endpoint,
+        &bucket,
+        "team/ok.txt",
+        b"payload".to_vec(),
+        "text/plain",
+    )
+    .await;
+    assert!(elsewhere.status().is_success());
+    assert!(
+        facts(&elsewhere),
+        "no refused key in the folder: facts kept"
+    );
+    // A sibling folder that no rule reaches keeps them too.
+    let sibling = common::put_object(
+        &http,
+        &endpoint,
+        &bucket,
+        "secret-docs/ok.txt",
+        b"payload".to_vec(),
+        "text/plain",
+    )
+    .await;
+    assert!(facts(&sibling));
 }

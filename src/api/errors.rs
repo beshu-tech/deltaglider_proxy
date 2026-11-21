@@ -18,6 +18,15 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+impl From<&crate::admission::Refusal> for S3Error {
+    fn from(refusal: &crate::admission::Refusal) -> Self {
+        S3Error::Refused {
+            status: refusal.status(),
+            message: refusal.message(),
+        }
+    }
+}
+
 /// The S3 error code of an admission `reject` answer with `status`: the
 /// code S3 uses for that status where there is one, else `Rejected`.
 pub(crate) fn reject_error_code(status: StatusCode) -> &'static str {
@@ -174,6 +183,11 @@ pub enum S3Error {
     #[error("{0}")]
     AccessDeniedReason(String),
 
+    /// A resource that an admission `deny` / `reject` block refuses: the
+    /// block's status (403 for `deny`) and message, as on the request line.
+    #[error("{message}")]
+    Refused { status: u16, message: String },
+
     #[error("SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided.")]
     SignatureDoesNotMatch,
 
@@ -222,6 +236,7 @@ impl S3Error {
             S3Error::NotImplemented(_) => "NotImplemented",
             S3Error::AccessDenied => "AccessDenied",
             S3Error::AccessDeniedReason(_) => "AccessDenied",
+            S3Error::Refused { .. } => reject_error_code(self.status_code()),
             S3Error::SignatureDoesNotMatch => "SignatureDoesNotMatch",
             S3Error::SlowDown(_) => "SlowDown",
             S3Error::RequestTimeTooSkewed => "RequestTimeTooSkewed",
@@ -258,6 +273,9 @@ impl S3Error {
             S3Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             S3Error::AccessDenied => StatusCode::FORBIDDEN,
             S3Error::AccessDeniedReason(_) => StatusCode::FORBIDDEN,
+            S3Error::Refused { status, .. } => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::FORBIDDEN)
+            }
             S3Error::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
             S3Error::SlowDown(_) => StatusCode::SERVICE_UNAVAILABLE,
             S3Error::RequestTimeTooSkewed => StatusCode::FORBIDDEN,
@@ -363,6 +381,22 @@ impl From<S3Error> for s3s::S3Error {
             S3Error::InvalidBucketName(msg) => s3s::s3_error!(InvalidBucketName, "{}", msg),
             S3Error::AccessDenied => s3s::s3_error!(AccessDenied),
             S3Error::AccessDeniedReason(msg) => s3s::s3_error!(AccessDenied, "{}", msg),
+            S3Error::Refused { status, message } => {
+                use s3s::S3ErrorCode as Code;
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+                let code = match status.as_u16() {
+                    400 => Code::InvalidRequest,
+                    403 => Code::AccessDenied,
+                    404 => Code::NoSuchKey,
+                    405 => Code::MethodNotAllowed,
+                    429 | 503 => Code::SlowDown,
+                    501 => Code::NotImplemented,
+                    _ => Code::Custom("Rejected".into()),
+                };
+                let mut err = s3s::S3Error::with_message(code, message);
+                err.set_status_code(status);
+                err
+            }
             S3Error::PreconditionFailed => s3s::s3_error!(PreconditionFailed),
             S3Error::NotImplemented(msg) => s3s::s3_error!(NotImplemented, "{}", msg),
             S3Error::InvalidRange => s3s::s3_error!(InvalidRange),
@@ -966,6 +1000,12 @@ mod tests {
                 "InvalidArgument",
             ),
             (
+                "EngineError::KeyRefused",
+                en(EngineError::KeyRefused("x".into())),
+                400,
+                "InvalidArgument",
+            ),
+            (
                 "EngineError::Overloaded",
                 en(EngineError::Overloaded("x".into())),
                 503,
@@ -1114,6 +1154,10 @@ mod tests {
             S3Error::NotImplemented("x".into()),
             S3Error::AccessDenied,
             S3Error::AccessDeniedReason("x".into()),
+            S3Error::Refused {
+                status: 503,
+                message: "x".into(),
+            },
             S3Error::SignatureDoesNotMatch,
             S3Error::SlowDown("x".into()),
             S3Error::RequestTimeTooSkewed,

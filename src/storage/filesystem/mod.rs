@@ -23,6 +23,7 @@ pub(crate) mod fault;
 mod fsio;
 #[cfg(test)]
 mod list_memory_tests;
+mod ref_walk;
 mod scan;
 mod sweep;
 #[cfg(test)]
@@ -35,20 +36,95 @@ use write::*;
 pub use sweep::{sweep_stale_temp_files, STALE_TEMP_MAX_AGE};
 
 /// Prefix of this backend's own temp files (atomic write-then-rename).
-const INTERNAL_TEMP_PREFIX: &str = ".dg-tmp.";
+const INTERNAL_TEMP_PREFIX: &str = crate::types::TEMP_FILE_PREFIX;
 
 /// File that stores the folder marker `photos/` (review D3): the key's file
 /// name is empty, and a directory cannot also be a file, so the marker lives
 /// inside the directory under this reserved name.
-const DIR_MARKER_FILE: &str = ".dg-folder-marker";
+const DIR_MARKER_FILE: &str = crate::types::FOLDER_MARKER_FILE;
 
 /// The file name part of the key that a data file named `name` stores:
 /// empty for a folder marker, the name itself otherwise.
-fn key_filename(name: &str) -> &str {
-    if name == DIR_MARKER_FILE {
+fn key_filename(name: &str, names: Names) -> &str {
+    if names.is_marker(name) {
         ""
     } else {
         name
+    }
+}
+
+/// How this root names the proxy's own files. On a case-SENSITIVE root only
+/// the exact names are the proxy's; on a case-INSENSITIVE one a case variant
+/// is the same file (`Reference.Bin` opens `reference.bin`), so it is the
+/// proxy's too: a listing hides it and never enters a `.Dg` directory, the
+/// same rule as [`check_path_segments`] (the one rule `types::reserved_name`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Names {
+    case_insensitive: bool,
+}
+
+impl Names {
+    /// The exact-name rule of a case-sensitive root.
+    pub(crate) const EXACT: Self = Self {
+        case_insensitive: false,
+    };
+
+    pub(crate) fn new(case_insensitive: bool) -> Self {
+        Self { case_insensitive }
+    }
+
+    fn is(self, name: &str, exact: &str, kind: crate::types::ReservedName) -> bool {
+        if self.case_insensitive {
+            crate::types::reserved_name(name) == Some(kind)
+        } else {
+            name == exact
+        }
+    }
+
+    /// The proxy's own `.dg` directory.
+    pub(crate) fn is_internal_dir(self, name: &str) -> bool {
+        self.is(
+            name,
+            crate::storage::listing_facts::INTERNAL_DIR,
+            crate::types::ReservedName::InternalDir,
+        )
+    }
+
+    /// This backend's temp file (`.dg-tmp.*`).
+    pub(crate) fn is_temp(self, name: &str) -> bool {
+        if self.case_insensitive {
+            crate::types::reserved_name(name) == Some(crate::types::ReservedName::TempFile)
+        } else {
+            name.starts_with(INTERNAL_TEMP_PREFIX)
+        }
+    }
+
+    fn is_marker(self, name: &str) -> bool {
+        self.is(
+            name,
+            DIR_MARKER_FILE,
+            crate::types::ReservedName::FolderMarker,
+        )
+    }
+
+    fn is_reference(self, name: &str) -> bool {
+        self.is(
+            name,
+            crate::types::REFERENCE_FILE_NAME,
+            crate::types::ReservedName::Baseline,
+        )
+    }
+
+    /// The stem of a stored delta (`a.zip` of `a.zip.delta`).
+    fn delta_stem(self, name: &str) -> Option<&str> {
+        if !self.case_insensitive {
+            return name.strip_suffix(".delta");
+        }
+        let cut = name.len().checked_sub(crate::types::DELTA_SUFFIX.len())?;
+        let (stem, suffix) = (name.get(..cut)?, name.get(cut..)?);
+        suffix
+            .eq_ignore_ascii_case(crate::types::DELTA_SUFFIX)
+            .then_some(stem)
     }
 }
 
@@ -111,20 +187,20 @@ enum StoredName<'a> {
     },
 }
 
-fn stored_name(name: &str) -> StoredName<'_> {
+fn stored_name(name: &str, names: Names) -> StoredName<'_> {
     use super::traits::ObjectVariant;
-    if is_internal_temp_name(name) {
+    if names.is_temp(name) {
         StoredName::Internal
-    } else if name == crate::types::REFERENCE_FILE_NAME {
+    } else if names.is_reference(name) {
         StoredName::Reference
-    } else if let Some(stem) = name.strip_suffix(".delta") {
+    } else if let Some(stem) = names.delta_stem(name) {
         StoredName::Object {
             key_filename: stem,
             variant: ObjectVariant::Delta,
         }
     } else {
         StoredName::Object {
-            key_filename: key_filename(name),
+            key_filename: key_filename(name, names),
             variant: ObjectVariant::Passthrough,
         }
     }
@@ -167,13 +243,13 @@ fn note_held(_n: usize) {}
 /// user object? Every other `.`-name (`.env`, `.gitignore`, `.tmpAb12Cd`) is
 /// a user object: LIST shows it and DeleteBucket must not erase it.
 pub(crate) fn is_internal_temp_name(name: &str) -> bool {
-    name.starts_with(INTERNAL_TEMP_PREFIX)
+    Names::EXACT.is_temp(name)
 }
 
-/// Is `name` the proxy's own `.dg` entry? A walk never reads it: no client
-/// key lives below it, and DeleteBucket removes it.
-pub(crate) fn is_internal_dir_name(name: &str) -> bool {
-    name == crate::storage::listing_facts::INTERNAL_DIR
+/// Is `name` the proxy's own `.dg` entry (`names`: the root's case mode)? A
+/// walk never reads it: no client key lives below it, and DeleteBucket removes it.
+pub(crate) fn is_internal_dir_name(name: &str, names: Names) -> bool {
+    names.is_internal_dir(name)
 }
 
 /// Does a listing prefix name a place below a `.dg` directory? Such a
@@ -187,7 +263,17 @@ fn prefix_is_below_internal_dir(dir_part: &str) -> bool {
 /// the literal key text, so `a/./secret` must not open `a/secret` (and no
 /// such key can be stored distinctly on a filesystem anyway). S3 keeps keys
 /// literal, so only this backend needs the rule.
-fn check_path_segments(prefix: &str, filename: &str) -> Result<(), StorageError> {
+///
+/// The proxy's own names: on a case-SENSITIVE disk only the exact names are
+/// the proxy's (`.dg-folder-marker`, `.dg-tmp.*`), and `Reference.Bin` or
+/// `a/.Dg/x`, which an earlier release stored, are ordinary objects. On a
+/// case-INSENSITIVE disk a case variant IS the proxy's file, so it is refused
+/// by the one rule of key validation (`types::reserved_name`).
+fn check_path_segments(
+    prefix: &str,
+    filename: &str,
+    case_insensitive: bool,
+) -> Result<(), StorageError> {
     let aliases = |segment: &str| segment.is_empty() || segment == "." || segment == "..";
     let bad_prefix = !prefix.is_empty() && prefix.split('/').any(aliases);
     let bad_filename = !filename.is_empty() && (aliases(filename) || filename.contains('/'));
@@ -197,19 +283,77 @@ fn check_path_segments(prefix: &str, filename: &str) -> Result<(), StorageError>
                 .to_string(),
         ));
     }
-    // A user file with the marker name would read back as the folder marker.
-    if filename == DIR_MARKER_FILE {
+    if case_insensitive {
+        if let Some(kind) = crate::types::reserved_name(filename) {
+            return Err(StorageError::InvalidKey(format!(
+                "Key file name '{filename}' is reserved on the filesystem backend: {}",
+                kind.why()
+            )));
+        }
+        // The exact `.dg` has its own handling (a listing of it is empty).
+        if let Some(segment) = prefix.split('/').find(|s| {
+            *s != crate::storage::listing_facts::INTERNAL_DIR
+                && crate::types::reserved_name(s) == Some(crate::types::ReservedName::InternalDir)
+        }) {
+            return Err(StorageError::InvalidKey(format!(
+                "Key folder name '{segment}' is reserved on the filesystem backend: {}",
+                crate::types::ReservedName::InternalDir.why()
+            )));
+        }
+    } else if filename == DIR_MARKER_FILE || is_internal_temp_name(filename) {
+        // A user file with such a name would read back as the marker or be pruned as a temp file.
         return Err(StorageError::InvalidKey(format!(
-            "Key file name '{filename}' is reserved for folder markers on the filesystem backend"
-        )));
-    }
-    // A user file with a temp-file name would be hidden and pruned as one.
-    if is_internal_temp_name(filename) {
-        return Err(StorageError::InvalidKey(format!(
-            "Key file name '{filename}' is reserved for temp files on the filesystem backend"
+            "Key file name '{filename}' is reserved on the filesystem backend"
         )));
     }
     Ok(())
+}
+
+/// Pure: the first folder of `prefix` whose name is a file that the proxy
+/// keeps in its parent folder: a baseline, a delta, a temp file or a folder
+/// marker, in the exact case of a case-sensitive root and in any case of a
+/// case-insensitive one (`names`). Such a folder would sit where that file
+/// goes, or be swept as a temp file.
+fn colliding_folder(prefix: &str, names: Names) -> Option<&str> {
+    prefix.split('/').find(|segment| {
+        names.is_reference(segment)
+            || names.delta_stem(segment).is_some()
+            || names.is_temp(segment)
+            || names.is_marker(segment)
+    })
+}
+
+/// Does the filesystem at `dir` treat names that differ only in ASCII case
+/// as one name? Creates a temp file and looks for it under the other case.
+fn probe_case_insensitive(dir: &Path) -> std::io::Result<bool> {
+    let name = format!(".dg-case-probe-{}", uuid::Uuid::new_v4().simple());
+    let lower = dir.join(&name);
+    std::fs::File::create_new(&lower)?;
+    // fsio-exempt: a start-up probe of a temp file that this function made
+    let aliased = dir.join(name.to_ascii_uppercase()).exists();
+    let _ = std::fs::remove_file(&lower); // fsio-exempt: same probe file
+    Ok(aliased)
+}
+
+/// Pure: a failed probe counts as case-insensitive, the safe side (a case
+/// variant of a reserved name stays refused).
+fn treat_as_case_insensitive(probe: &std::io::Result<bool>) -> bool {
+    probe.as_ref().map_or(true, |insensitive| *insensitive)
+}
+
+/// Pure: the start-up warning for a data directory on a case-insensitive
+/// filesystem (`probe` is its probe result), or `None`. Never fatal: the
+/// proxy refuses reserved names in any case, but `A.zip` and `a.zip` are one
+/// object there while S3 clients see two keys.
+fn case_insensitive_warning(root: &Path, probe: &std::io::Result<bool>) -> Option<String> {
+    matches!(probe, Ok(true)).then(|| {
+        format!(
+            "[storage] the data directory '{}' is on a case-insensitive filesystem: keys that \
+             differ only in case (`A.zip`, `a.zip`) share one file, which S3 clients do not expect. \
+             Use a case-sensitive filesystem for production data.",
+            root.display()
+        )
+    })
 }
 
 /// Filesystem storage backend
@@ -265,6 +409,9 @@ pub(crate) fn synthesise_unmanaged_etag(
 pub struct FilesystemBackend {
     /// Root directory for all data
     root: PathBuf,
+    /// The data directory ignores letter case: a case variant of a reserved
+    /// name is then the proxy's own file ([`check_path_segments`]).
+    case_insensitive: bool,
 }
 
 impl FilesystemBackend {
@@ -283,7 +430,21 @@ impl FilesystemBackend {
         // Validate that the filesystem supports xattrs
         xattr_meta::validate_xattr_support(&root).await?;
 
-        Ok(Self { root })
+        let probe = probe_case_insensitive(&root);
+        if let Some(warning) = case_insensitive_warning(&root, &probe) {
+            tracing::warn!("{warning}");
+        }
+        let case_insensitive = treat_as_case_insensitive(&probe);
+
+        Ok(Self {
+            root,
+            case_insensitive,
+        })
+    }
+
+    /// How this root names the proxy's own files (its case mode).
+    fn names(&self) -> Names {
+        Names::new(self.case_insensitive)
     }
 
     /// Get the bucket directory
@@ -297,7 +458,7 @@ impl FilesystemBackend {
     /// listing join that calls [`check_path_segments`]), so no caller can
     /// reach a file through a key that names another key.
     fn deltaspace_dir(&self, bucket: &str, prefix: &str) -> Result<PathBuf, StorageError> {
-        check_path_segments(prefix, "")?;
+        check_path_segments(prefix, "", self.case_insensitive)?;
         Ok(if prefix.is_empty() {
             self.bucket_dir(bucket).join("deltaspaces")
         } else {
@@ -439,7 +600,7 @@ impl FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<PathBuf, StorageError> {
-        check_path_segments("", filename)?;
+        check_path_segments("", filename, self.case_insensitive)?;
         Ok(self
             .deltaspace_dir(bucket, prefix)?
             .join(format!("{}.delta", filename)))
@@ -453,7 +614,7 @@ impl FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<PathBuf, StorageError> {
-        check_path_segments("", filename)?;
+        check_path_segments("", filename, self.case_insensitive)?;
         if filename.is_empty() {
             if prefix.is_empty() {
                 return Err(StorageError::InvalidKey(
@@ -490,8 +651,9 @@ impl FilesystemBackend {
     async fn fallback_metadata_from_path(
         path: &Path,
         filename: &str,
+        names: Names,
     ) -> Result<FileMetadata, StorageError> {
-        Self::fallback_metadata_from_stat(path, fsio::stat(path).await?, filename)
+        Self::fallback_metadata_from_stat(path, fsio::stat(path).await?, filename, names)
     }
 
     /// [`Self::fallback_metadata_from_path`] from a stat already taken
@@ -500,6 +662,7 @@ impl FilesystemBackend {
         path: &Path,
         stat: Option<std::fs::Metadata>,
         filename: &str,
+        names: Names,
     ) -> Result<FileMetadata, StorageError> {
         use crate::types::StorageInfo;
         use chrono::{DateTime, Utc};
@@ -519,7 +682,7 @@ impl FilesystemBackend {
         let synthetic_etag = synthesise_unmanaged_etag(stat.len(), &modified);
 
         let mut meta = FileMetadata::fallback(
-            key_filename(filename).to_string(),
+            key_filename(filename, names).to_string(),
             stat.len(),
             synthetic_etag,
             modified,
@@ -564,7 +727,12 @@ impl FilesystemBackend {
                 ),
                 Some(json) => (serde_json::from_slice::<FileMetadata>(&json)?, true),
                 None => (
-                    Self::fallback_metadata_from_stat(&path, file.metadata().ok(), &name)?,
+                    Self::fallback_metadata_from_stat(
+                        &path,
+                        file.metadata().ok(),
+                        &name,
+                        Names::EXACT,
+                    )?,
                     false,
                 ),
             };
@@ -587,7 +755,7 @@ impl FilesystemBackend {
                     "Corrupt metadata on {}: {e}; the reference is read without its checksum",
                     path.display()
                 );
-                Self::fallback_metadata_from_stat(path, stat, "reference.bin")
+                Self::fallback_metadata_from_stat(path, stat, "reference.bin", Names::EXACT)
             }
             other => other,
         }
@@ -610,7 +778,12 @@ impl FilesystemBackend {
             }
             fsio::StoredXattr::NoFile => Err(StorageError::NotFound(path.display().to_string())),
             fsio::StoredXattr::Missing => Ok((
-                Self::fallback_metadata_from_stat(&path, fsio::stat_blocking(&path)?, &filename)?,
+                Self::fallback_metadata_from_stat(
+                    &path,
+                    fsio::stat_blocking(&path)?,
+                    &filename,
+                    Names::EXACT,
+                )?,
                 false,
             )),
         })
@@ -628,6 +801,7 @@ impl FilesystemBackend {
     async fn listed_entry(
         path: &Path,
         name: &str,
+        names: Names,
     ) -> Result<Option<(String, FileMetadata)>, StorageError> {
         use super::traits::ObjectVariant;
         use crate::types::StorageInfo;
@@ -636,7 +810,7 @@ impl FilesystemBackend {
         let StoredName::Object {
             key_filename,
             variant,
-        } = stored_name(name)
+        } = stored_name(name, names)
         else {
             return Ok(None);
         };
@@ -754,6 +928,7 @@ impl FilesystemBackend {
     /// which must never erase what it cannot name.
     fn dir_has_visible_data_recursive<'a>(
         current_dir: &'a Path,
+        names: Names,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -765,13 +940,13 @@ impl FilesystemBackend {
                 if path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(is_internal_dir_name)
+                    .is_some_and(|n| is_internal_dir_name(n, names))
                 {
                     continue;
                 }
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
-                    if Self::dir_has_visible_data_recursive(&path).await? {
+                    if Self::dir_has_visible_data_recursive(&path, names).await? {
                         return Ok(true);
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -794,13 +969,14 @@ impl FilesystemBackend {
     /// erased by `remove_dir_all`.
     fn prune_invisible_data_recursive<'a>(
         current_dir: &'a Path,
+        names: Names,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
             if !fsio::exists(current_dir).await? {
                 return Ok(true);
             }
-            if Self::dir_has_visible_data_recursive(current_dir).await? {
+            if Self::dir_has_visible_data_recursive(current_dir, names).await? {
                 return Ok(false);
             }
 
@@ -818,7 +994,7 @@ impl FilesystemBackend {
                 if path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(is_internal_dir_name)
+                    .is_some_and(|n| is_internal_dir_name(n, names))
                 {
                     let removed = if ft.is_dir() {
                         fs::remove_dir_all(&path).await
@@ -833,7 +1009,7 @@ impl FilesystemBackend {
                     continue;
                 }
                 if ft.is_dir() {
-                    if Self::prune_invisible_data_recursive(&path).await? {
+                    if Self::prune_invisible_data_recursive(&path, names).await? {
                         match fs::remove_dir(&path).await {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -910,6 +1086,7 @@ impl FilesystemBackend {
         base_dir: &'a Path,
         current_dir: &'a Path,
         prefixes: &'a mut std::collections::HashSet<String>,
+        names: Names,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -918,12 +1095,16 @@ impl FilesystemBackend {
 
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                if entry.file_name().to_str().is_some_and(is_internal_dir_name) {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| is_internal_dir_name(n, names))
+                {
                     continue;
                 }
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
-                    Self::find_deltaspaces_recursive(base_dir, &path, prefixes).await?;
+                    Self::find_deltaspaces_recursive(base_dir, &path, prefixes, names).await?;
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     // Any data file (reference, delta, or passthrough with original name)
                     // indicates this directory is an active deltaspace.
@@ -950,6 +1131,7 @@ impl FilesystemBackend {
         base_dir: &'a Path,
         current_dir: &'a Path,
         prefixes: &'a mut Vec<String>,
+        names: Names,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -959,11 +1141,16 @@ impl FilesystemBackend {
                 Err(e) => return Err(io_to_storage_error(e)),
             };
             while let Some(entry) = entries.next_entry().await? {
-                if entry.file_name().to_str().is_some_and(is_internal_dir_name) {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| is_internal_dir_name(n, names))
+                {
                     continue;
                 }
                 if entry.file_type().await?.is_dir() {
-                    Self::find_references_recursive(base_dir, &entry.path(), prefixes).await?;
+                    Self::find_references_recursive(base_dir, &entry.path(), prefixes, names)
+                        .await?;
                 } else if entry.file_name() == crate::types::REFERENCE_FILE_NAME {
                     if let Ok(relative) = current_dir.strip_prefix(base_dir) {
                         prefixes.push(relative.to_string_lossy().into_owned());
@@ -981,18 +1168,24 @@ impl FilesystemBackend {
         current_dir: &'a Path,
         results: &'a mut Vec<(String, FileMetadata)>,
         baselines: &'a mut Vec<(String, u64)>,
+        names: Names,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
             let mut entries = fs::read_dir(current_dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                if entry.file_name().to_str().is_some_and(is_internal_dir_name) {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| is_internal_dir_name(n, names))
+                {
                     continue;
                 }
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
-                    Self::bulk_walk_recursive(deltaspaces_dir, &path, results, baselines).await?;
+                    Self::bulk_walk_recursive(deltaspaces_dir, &path, results, baselines, names)
+                        .await?;
                     continue;
                 }
 
@@ -1017,7 +1210,7 @@ impl FilesystemBackend {
                     baselines.push((rel, md.len()));
                     continue;
                 }
-                let Some((key_name, meta)) = Self::listed_entry(&path, &name).await? else {
+                let Some((key_name, meta)) = Self::listed_entry(&path, &name, names).await? else {
                     continue;
                 };
 
@@ -1074,7 +1267,7 @@ impl FilesystemBackend {
         // As `bulk_list_objects_with_baselines`: walk the deepest directory
         // the prefix names completely, keep the keys that start with it.
         let dir_part = prefix.rfind('/').map_or("", |i| &prefix[..i]);
-        check_path_segments(dir_part, "")?;
+        check_path_segments(dir_part, "", self.case_insensitive)?;
         if prefix_is_below_internal_dir(dir_part) {
             return Ok(empty);
         }
@@ -1086,8 +1279,15 @@ impl FilesystemBackend {
         };
         let token = continuation_token.unwrap_or("");
         let max = max_keys as usize;
-        let Some(mut walk) =
-            FlatWalk::open(&walk_root, dir_part.to_string(), prefix, token, None).await?
+        let Some(mut walk) = FlatWalk::open(
+            &walk_root,
+            dir_part.to_string(),
+            prefix,
+            token,
+            None,
+            self.names(),
+        )
+        .await?
         else {
             return Ok(empty);
         };
@@ -1099,7 +1299,8 @@ impl FilesystemBackend {
             let WalkStep::File { key, path, entry } = step else {
                 continue;
             };
-            let Some((_, meta)) = Self::listed_entry(&path, &entry.name).await? else {
+            let Some((_, meta)) = Self::listed_entry(&path, &entry.name, self.names()).await?
+            else {
                 continue; // not an object file, or deleted during the walk
             };
             // The forms of one key (`x`, `x.delta`) are neighbours: the
@@ -1371,6 +1572,14 @@ impl FilesystemBackend {
 }
 
 impl StorageBackend for FilesystemBackend {
+    fn new_key_refusal(&self, _bucket: &str, prefix: &str, _filename: &str) -> Option<String> {
+        let segment = colliding_folder(prefix, Names::new(self.case_insensitive))?;
+        Some(format!(
+            "Key folder name '{segment}' collides with a file that the filesystem backend keeps in \
+             its parent folder, so no key can be stored below it"
+        ))
+    }
+
     async fn flush_pending(&self) -> Result<(), StorageError> {
         tokio::task::spawn_blocking(flush_pending_fsync)
             .await
@@ -1404,7 +1613,7 @@ impl StorageBackend for FilesystemBackend {
         // The writes' known folders: the prune below may remove them.
         write::forget_dirs_under(&bucket_dir);
         if fsio::exists(&deltaspaces_dir).await? {
-            if !Self::prune_invisible_data_recursive(&deltaspaces_dir).await? {
+            if !Self::prune_invisible_data_recursive(&deltaspaces_dir, self.names()).await? {
                 return Err(StorageError::BucketNotEmpty(bucket.to_string()));
             }
             match fs::remove_dir(&deltaspaces_dir).await {
@@ -1942,20 +2151,22 @@ impl StorageBackend for FilesystemBackend {
             if entry.file_type().await?.is_dir() {
                 continue; // a child deltaspace
             }
-            match stored_name(name) {
+            match stored_name(name, self.names()) {
                 StoredName::Internal => {}
                 StoredName::Reference => match xattr_meta::read_metadata(&path).await {
                     Ok(meta) => metadata_list.push(meta),
                     // Listed as a passthrough, so a delete never reclaims a
                     // reference that it cannot describe (fail closed).
-                    Err(_) => match Self::fallback_metadata_from_path(&path, name).await {
-                        Ok(meta) => metadata_list.push(meta),
-                        Err(StorageError::NotFound(_)) => {}
-                        Err(e) => return Err(e),
-                    },
+                    Err(_) => {
+                        match Self::fallback_metadata_from_path(&path, name, self.names()).await {
+                            Ok(meta) => metadata_list.push(meta),
+                            Err(StorageError::NotFound(_)) => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
                 },
                 StoredName::Object { .. } => {
-                    if let Some((_, meta)) = Self::listed_entry(&path, name).await? {
+                    if let Some((_, meta)) = Self::listed_entry(&path, name, self.names()).await? {
                         metadata_list.push(meta);
                     }
                 }
@@ -1989,7 +2200,7 @@ impl StorageBackend for FilesystemBackend {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            match stored_name(name) {
+            match stored_name(name, self.names()) {
                 StoredName::Internal => {}
                 StoredName::Reference => reference = true,
                 StoredName::Object { .. } => return Ok(false),
@@ -2011,7 +2222,13 @@ impl StorageBackend for FilesystemBackend {
         }
 
         let mut prefixes = std::collections::HashSet::new();
-        Self::find_deltaspaces_recursive(&deltaspaces_dir, &deltaspaces_dir, &mut prefixes).await?;
+        Self::find_deltaspaces_recursive(
+            &deltaspaces_dir,
+            &deltaspaces_dir,
+            &mut prefixes,
+            self.names(),
+        )
+        .await?;
 
         Ok(prefixes.into_iter().collect())
     }
@@ -2024,7 +2241,7 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<Vec<String>, StorageError> {
         // A `.`, `..` or empty segment names no directory of this backend:
         // no key is stored under one.
-        if check_path_segments(scope, "").is_err() {
+        if check_path_segments(scope, "", self.case_insensitive).is_err() {
             return Ok(Vec::new());
         }
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
@@ -2034,8 +2251,18 @@ impl StorageBackend for FilesystemBackend {
             return Ok(Vec::new());
         }
         let mut prefixes = Vec::new();
-        Self::find_references_recursive(&deltaspaces_dir, &scope_dir, &mut prefixes).await?;
+        Self::find_references_recursive(&deltaspaces_dir, &scope_dir, &mut prefixes, self.names())
+            .await?;
         Ok(prefixes)
+    }
+
+    async fn list_reference_prefix_stream(
+        &self,
+        bucket: &str,
+        scope: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<String, StorageError>>, StorageError>
+    {
+        ref_walk::stream(self, bucket, scope).await
     }
 
     async fn put_directory_marker(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
@@ -2171,7 +2398,7 @@ impl StorageBackend for FilesystemBackend {
         let dir_part = prefix.rfind('/').map_or("", |i| &prefix[..i]);
         // A `.`/empty segment would walk another directory and report its
         // keys under the alias.
-        check_path_segments(dir_part, "")?;
+        check_path_segments(dir_part, "", self.case_insensitive)?;
         if prefix_is_below_internal_dir(dir_part) {
             return Ok(BulkListing::default());
         }
@@ -2187,8 +2414,14 @@ impl StorageBackend for FilesystemBackend {
 
         let mut results: Vec<(String, FileMetadata)> = Vec::new();
         let mut baselines: Vec<(String, u64)> = Vec::new();
-        Self::bulk_walk_recursive(&deltaspaces_dir, &walk_root, &mut results, &mut baselines)
-            .await?;
+        Self::bulk_walk_recursive(
+            &deltaspaces_dir,
+            &walk_root,
+            &mut results,
+            &mut baselines,
+            self.names(),
+        )
+        .await?;
         note_held(results.len());
         // One prefix rule for objects and baselines alike.
         results.retain(|(key, _)| key.starts_with(prefix));
@@ -2257,7 +2490,7 @@ impl StorageBackend for FilesystemBackend {
 
         // A `.`/empty segment would read another directory and list its keys
         // under the alias text, past a policy on the real prefix.
-        check_path_segments(dir_part, "")?;
+        check_path_segments(dir_part, "", self.case_insensitive)?;
         let read_dir_path = if dir_part.is_empty() {
             deltaspaces_dir.clone()
         } else {
@@ -2281,7 +2514,7 @@ impl StorageBackend for FilesystemBackend {
         let token = continuation_token.unwrap_or("");
         let keep = |dir_key: &str, e: &WalkEntry| level_keep(name_filter, token, dir_key, e);
         let Some(mut level) =
-            SortedDir::open(&read_dir_path, dir_part.to_string(), &keep, 0).await?
+            SortedDir::open(&read_dir_path, dir_part.to_string(), &keep, 0, self.names()).await?
         else {
             return Ok(Some(no_keys()));
         };
@@ -2331,7 +2564,8 @@ impl StorageBackend for FilesystemBackend {
             let Some(e) = entry else { break };
             // A folder (`dir/name/`).
             let cp = format!("{}/", join_key(dir_part, &e.key_name));
-            if Self::dir_has_visible_data_recursive(&level.path.join(&e.name)).await? {
+            if Self::dir_has_visible_data_recursive(&level.path.join(&e.name), self.names()).await?
+            {
                 cp_entries.push(cp);
                 if obj_entries.len() + cp_entries.len() >= want {
                     break;
@@ -2351,7 +2585,7 @@ impl StorageBackend for FilesystemBackend {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            let Some((_, meta)) = Self::listed_entry(&path, filename).await? else {
+            let Some((_, meta)) = Self::listed_entry(&path, filename, self.names()).await? else {
                 continue; // deleted during the listing
             };
             final_objects.push((key, meta));
@@ -2405,7 +2639,7 @@ impl FilesystemBackend {
         continuation_token: Option<&str>,
     ) -> Result<DelegatedListResult, StorageError> {
         let dir_part = prefix.rfind('/').map_or("", |i| &prefix[..i]);
-        check_path_segments(dir_part, "")?;
+        check_path_segments(dir_part, "", self.case_insensitive)?;
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
         let walk_root = if dir_part.is_empty() {
             deltaspaces_dir
@@ -2425,6 +2659,7 @@ impl FilesystemBackend {
                 prefix,
                 token,
                 Some(delimiter),
+                self.names(),
             )
             .await?
         };
@@ -2436,7 +2671,9 @@ impl FilesystemBackend {
                 let cp = match step {
                     WalkStep::Collapsed(cp) => cp,
                     WalkStep::File { key, path, entry } => {
-                        let Some((_, meta)) = Self::listed_entry(&path, &entry.name).await? else {
+                        let Some((_, meta)) =
+                            Self::listed_entry(&path, &entry.name, self.names()).await?
+                        else {
                             continue; // not an object file, or deleted during the walk
                         };
                         // `x` and `x.delta` are neighbours: the newest wins.
@@ -2475,6 +2712,223 @@ impl FilesystemBackend {
 /// sorted walk that stops after the page. It walked the whole subtree and
 /// read the metadata of every file for every page: paging through N keys
 /// read N²/1000 metadata entries.
+#[cfg(test)]
+mod reserved_name_tests {
+    use super::*;
+
+    /// On a case-insensitive disk a case variant of a reserved name IS the
+    /// proxy's file: refused for every request.
+    #[test]
+    fn a_case_insensitive_root_refuses_reserved_names_in_any_case() {
+        for name in [
+            "REFERENCE.BIN",
+            "Reference.bin",
+            ".DG-FOLDER-MARKER",
+            ".dg-folder-marker",
+            ".DG-TMP.x",
+            ".dg-tmp.x",
+            "a.DELTA",
+            // KELVIN SIGN folds to `k` on APFS.
+            ".dg-folder-mar\u{212A}er",
+        ] {
+            assert!(check_path_segments("", name, true).is_err(), "{name}");
+        }
+        assert!(check_path_segments("a/.DG/b", "", true).is_err());
+        // The exact `.dg` has its own handling: key validation refuses it, a listing of it is empty.
+        assert!(check_path_segments("a/.dg", "", true).is_ok());
+        // A reserved folder name in the middle keeps reads and deletes working.
+        assert!(check_path_segments("a/reference.bin/b", "x.txt", true).is_ok());
+        assert!(check_path_segments("a/x.zip.delta", "y", true).is_ok());
+        assert!(check_path_segments("a/.dgx/b", "x.txt", true).is_ok());
+    }
+
+    /// On a case-sensitive disk only the exact names are the proxy's: a case
+    /// variant that an earlier release stored is an ordinary object.
+    #[test]
+    fn a_case_sensitive_root_keeps_the_exact_name_rule() {
+        for name in [".dg-folder-marker", ".dg-tmp.x", ".dg-tmp."] {
+            assert!(check_path_segments("", name, false).is_err(), "{name}");
+        }
+        for name in [
+            "REFERENCE.BIN",
+            "Reference.Bin",
+            "rates.DELTA",
+            ".DG-FOLDER-MARKER",
+            ".Dg-Tmp.x",
+            ".dg-folder-mar\u{212A}er",
+        ] {
+            assert!(check_path_segments("", name, false).is_ok(), "{name}");
+        }
+        assert!(check_path_segments("a/.Dg/b", "x", false).is_ok());
+        assert!(check_path_segments("a/.DG/b", "", false).is_ok());
+        // Alias segments are refused on every disk.
+        for insensitive in [false, true] {
+            assert!(check_path_segments("a/./b", "", insensitive).is_err());
+            assert!(check_path_segments("", "..", insensitive).is_err());
+        }
+    }
+
+    /// The trait method has a default (`None`), so the compiler does not make
+    /// a wrapper forward it: every backend that wraps or routes does it here.
+    #[test]
+    fn wrappers_forward_the_new_key_refusal() {
+        for (name, src) in [
+            ("routing", include_str!("../routing.rs")),
+            ("encrypting", include_str!("../encrypting/mod.rs")),
+            ("fault", include_str!("fault.rs")),
+            ("filesystem", include_str!("mod.rs")),
+        ] {
+            assert!(src.contains("fn new_key_refusal("), "{name}");
+        }
+    }
+
+    /// A new key may not create a folder named like a file of the proxy in
+    /// its parent: exact names on a case-sensitive root, any case on a
+    /// case-insensitive one.
+    #[test]
+    fn a_new_key_may_not_create_a_folder_that_collides_with_a_proxy_file() {
+        let exact = Names::new(false);
+        let folded = Names::new(true);
+        for folder in [
+            "reference.bin",
+            "b.delta",
+            ".dg-tmp.x",
+            ".dg-tmp.",
+            ".dg-folder-marker",
+        ] {
+            for prefix in [
+                folder.to_string(),
+                format!("a/{folder}"),
+                format!("{folder}/z"),
+                format!("a/{folder}/z"),
+            ] {
+                assert_eq!(
+                    colliding_folder(&prefix, exact),
+                    Some(folder),
+                    "exact {prefix}"
+                );
+                assert_eq!(
+                    colliding_folder(&prefix, folded),
+                    Some(folder),
+                    "folded {prefix}"
+                );
+            }
+        }
+        // A case variant is an ordinary folder on a case-sensitive root only.
+        for folder in ["Reference.Bin", "b.DELTA", ".DG-TMP.x", ".Dg-Folder-Marker"] {
+            assert_eq!(colliding_folder(&format!("a/{folder}"), exact), None);
+            assert_eq!(
+                colliding_folder(&format!("a/{folder}"), folded),
+                Some(folder)
+            );
+        }
+        for ordinary in [
+            "",
+            "a",
+            "a/b",
+            "my-reference.bin",
+            "x.deltas",
+            ".dg-tmp",
+            "a/.dgx",
+        ] {
+            assert_eq!(colliding_folder(ordinary, exact), None, "{ordinary}");
+            assert_eq!(colliding_folder(ordinary, folded), None, "{ordinary}");
+        }
+    }
+
+    /// The listing follows the root's case mode. On a case-insensitive root a
+    /// case variant of an internal name is the proxy's own file: no listing
+    /// shows it and none enters a `.Dg` directory, so a LIST never shows a key
+    /// that GET refuses. On a case-sensitive root the same names are ordinary keys.
+    #[tokio::test]
+    async fn the_listing_follows_the_case_mode_of_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let space = tmp.path().join("bucket/deltaspaces");
+        for (dir, name) in [
+            ("", "ok.txt"),
+            ("", "Reference.Bin"),
+            ("", ".DG-TMP.z"),
+            (".Dg", "x"),
+            ("a/.DG", "y"),
+            ("a", "fine.txt"),
+        ] {
+            std::fs::create_dir_all(space.join(dir)).unwrap();
+            std::fs::write(space.join(dir).join(name), b"data").unwrap();
+        }
+        for (insensitive, expected) in [
+            (
+                false,
+                vec![
+                    ".DG-TMP.z",
+                    ".Dg/x",
+                    "Reference.Bin",
+                    "a/.DG/y",
+                    "a/fine.txt",
+                    "ok.txt",
+                ],
+            ),
+            (true, vec!["a/fine.txt", "ok.txt"]),
+        ] {
+            backend.case_insensitive = insensitive;
+            let flat = backend
+                .list_objects_delegated("bucket", "", None, 100, None)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut keys: Vec<String> = flat.objects.into_iter().map(|(k, _)| k).collect();
+            keys.sort();
+            assert_eq!(keys, expected, "insensitive={insensitive}");
+            let folders = backend
+                .list_objects_delegated("bucket", "", Some("/"), 100, None)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut names: Vec<String> = folders.common_prefixes;
+            names.sort();
+            let want_folders: Vec<&str> = if insensitive {
+                vec!["a/"]
+            } else {
+                vec![".Dg/", "a/"]
+            };
+            assert_eq!(names, want_folders, "folders, insensitive={insensitive}");
+            // A listing of the variant directory enters nothing on a case-insensitive root.
+            let inside = backend
+                .list_objects_delegated("bucket", "a/.DG/", None, 100, None)
+                .await;
+            let inside = inside.ok().flatten().map_or(0, |r| r.objects.len());
+            assert_eq!(inside, usize::from(!insensitive), "a/.DG/");
+        }
+    }
+
+    #[test]
+    fn a_failed_probe_counts_as_case_insensitive() {
+        assert!(treat_as_case_insensitive(&Ok(true)));
+        assert!(!treat_as_case_insensitive(&Ok(false)));
+        assert!(treat_as_case_insensitive(&Err(std::io::Error::other("x"))));
+    }
+
+    #[test]
+    fn a_case_insensitive_data_directory_is_a_warning_never_an_error() {
+        let root = Path::new("/data/hetzner-fsn1");
+        let warning = case_insensitive_warning(root, &Ok(true)).expect("a warning");
+        assert!(warning.contains("/data/hetzner-fsn1") && warning.contains("case-insensitive"));
+        assert_eq!(case_insensitive_warning(root, &Ok(false)), None);
+        let err: std::io::Result<bool> = Err(std::io::Error::other("read-only"));
+        assert_eq!(case_insensitive_warning(root, &err), None);
+    }
+
+    #[test]
+    fn the_probe_leaves_no_file_and_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        probe_case_insensitive(tmp.path()).expect("the probe answers");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+        assert!(probe_case_insensitive(&tmp.path().join("missing")).is_err());
+    }
+}
+
 #[cfg(test)]
 mod paged_listing_tests {
     use super::*;

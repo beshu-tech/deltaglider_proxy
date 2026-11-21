@@ -154,14 +154,16 @@ async fn a_marker_key_with_a_body_is_refused() {
             engine
                 .store("b", "photos/", b"data", None, Default::default())
                 .await,
-            Err(EngineError::InvalidArgument(_))
+            Err(EngineError::KeyRefused(_))
         ));
         let relay = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(relay.path(), b"data").unwrap();
         assert!(matches!(
             engine
                 .store_passthrough_relayed_parts_with_multipart_etag(
-                    &engine.lock_object_write("b", "photos/").await,
+                    &engine
+                        .lock_object_write("b", "photos/", crate::types::WriteOrigin::Client)
+                        .await,
                     "b",
                     "photos/",
                     &[crate::deltaglider::RelayPart::of_file(relay.path())],
@@ -171,7 +173,7 @@ async fn a_marker_key_with_a_body_is_refused() {
                     "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
                 )
                 .await,
-            Err(EngineError::InvalidArgument(_))
+            Err(EngineError::KeyRefused(_))
         ));
         assert!(keys(&engine, "", None).await.is_empty());
     }
@@ -189,7 +191,7 @@ async fn review3_a_marker_put_passes_the_ingest_gate() {
                 .await
                 .err();
             assert!(
-                matches!(err, Some(EngineError::InvalidArgument(_))),
+                matches!(err, Some(EngineError::KeyRefused(_))),
                 "PUT {key} (empty body) must be refused like a data PUT, got {err:?}"
             );
         }
@@ -235,7 +237,9 @@ async fn every_multipart_store_path_notes_its_commit() {
             let relay = tempfile::NamedTempFile::new().unwrap();
             std::fs::write(relay.path(), b"multipart body").unwrap();
             let parts = [crate::deltaglider::RelayPart::of_file(relay.path())];
-            let lock = engine.lock_object_write("b", key).await;
+            let lock = engine
+                .lock_object_write("b", key, crate::types::WriteOrigin::Client)
+                .await;
             let flag = lock.commit_flag();
             let mpe = "\"0123456789abcdef0123456789abcdef-1\"".to_string();
             let stored = async {
@@ -289,7 +293,9 @@ async fn a_store_in_a_spawned_task_sets_the_commit_flag() {
         let relay = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(relay.path(), b"multipart body").unwrap();
         let path = relay.path().to_path_buf();
-        let lock = engine.lock_object_write("b", "img/s.jpg").await;
+        let lock = engine
+            .lock_object_write("b", "img/s.jpg", crate::types::WriteOrigin::Client)
+            .await;
         let flag = lock.commit_flag();
         assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
         let task_engine = engine.clone();

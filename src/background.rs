@@ -205,7 +205,11 @@ where
         loop {
             let started = tokio::time::Instant::now();
             // The factory call runs inside `catch_unwind` too.
-            let run = std::panic::AssertUnwindSafe(async { factory().await })
+            // Every supervised loop is background work: its reads pay no share.
+            let run =
+                std::panic::AssertUnwindSafe(crate::deltaglider::spool::as_background(async {
+                    factory().await
+                }))
                 .catch_unwind()
                 .await;
             let Err(payload) = run else { return };

@@ -256,22 +256,30 @@ pub fn resolved_identity_is_verified(
 /// after the inner layers ran: success is a signature s3s verified, failure
 /// is a 403 that never reached that point.
 #[derive(Clone, Default)]
-pub struct AuthOutcome(Arc<AtomicU8>, Arc<std::sync::atomic::AtomicBool>);
+pub struct AuthOutcome(
+    Arc<AtomicU8>,
+    Arc<std::sync::atomic::AtomicBool>,
+    /// The request's wait place in its peer bucket (none when the bucket is
+    /// full); verifying the signature gives it back.
+    Arc<std::sync::Mutex<Option<rate_limiter::UnprovenTicket>>>,
+);
 
-// 0 (the `Default`) is pending: nothing verified or denied yet.
+// 0 (the `Default`) is pending: nothing verified yet.
 const OUTCOME_VERIFIED: u8 = 1;
-const OUTCOME_AUTHZ_DENIED: u8 = 2;
 
 impl AuthOutcome {
     /// s3s verified the signature of the resolved identity.
     pub fn mark_verified(&self) {
         self.0.store(OUTCOME_VERIFIED, Ordering::Release);
+        drop(self.release_ticket());
     }
 
-    /// IAM authorization refused the resolved identity before s3s ran. Not
-    /// a credential failure: the signature was never checked.
-    pub fn mark_authz_denied(&self) {
-        self.0.store(OUTCOME_AUTHZ_DENIED, Ordering::Release);
+    fn hold_ticket(&self, ticket: rate_limiter::UnprovenTicket) {
+        *self.2.lock().unwrap_or_else(|e| e.into_inner()) = Some(ticket);
+    }
+
+    fn release_ticket(&self) -> Option<rate_limiter::UnprovenTicket> {
+        self.2.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// s3s verified a signature.
@@ -301,7 +309,7 @@ pub enum LimiterVerdict {
     /// A 403 before verification: bad signature, expired or skewed
     /// request, or an identity s3s did not verify.
     Failure,
-    /// Nothing learned about the credential (authz denial, gate 503, ...).
+    /// Nothing learned about the credential (gate 503, ...).
     Neither,
 }
 
@@ -318,7 +326,6 @@ pub fn limiter_verdict(
     match outcome.state() {
         OUTCOME_VERIFIED if presigned => LimiterVerdict::Neither,
         OUTCOME_VERIFIED => LimiterVerdict::Success,
-        OUTCOME_AUTHZ_DENIED => LimiterVerdict::Neither,
         _ if status == axum::http::StatusCode::FORBIDDEN => LimiterVerdict::Failure,
         _ => LimiterVerdict::Neither,
     }
@@ -564,6 +571,13 @@ pub(crate) fn build_anonymous_user(
     )
 }
 
+/// Request-extension marker: the access key id of this request has no
+/// principal (unknown or disabled). s3s fails its signature against a secret
+/// nobody has; the access hook refuses the request even if s3s verified it
+/// (a signature of another identity, in a second place of the request).
+#[derive(Debug, Clone, Copy)]
+pub struct UnresolvedCredential;
+
 /// Request-extension marker: this request was authenticated through a
 /// presigned URL (query-string SigV4), i.e. by the link holder, not by a
 /// caller who holds the signer's credentials.
@@ -615,6 +629,8 @@ impl SigV4Params {
             }
         };
 
+        refuse_unsigned_amz_headers(&parsed.signed_headers, request)?;
+
         let payload_hash = request
             .headers()
             .get("x-amz-content-sha256")
@@ -641,6 +657,8 @@ impl SigV4Params {
         let signature = param("X-Amz-Signature");
         let amz_date = param("X-Amz-Date");
         let expires = param("X-Amz-Expires");
+
+        refuse_unsigned_amz_headers(&param("X-Amz-SignedHeaders"), request)?;
 
         if credential.is_empty() || signature.is_empty() {
             debug!("SigV4 presigned: missing credential or signature");
@@ -714,6 +732,60 @@ impl SigV4Params {
     }
 }
 
+/// The `x-amz-*` headers that stay unsigned although they are allowed:
+/// CloudFront adds `x-amz-cf-id` to every request it forwards, and it has no
+/// S3 meaning.
+const UNSIGNED_AMZ_EXEMPT: [&str; 1] = ["x-amz-cf-id"];
+
+/// Refuse a request with an `x-amz-*` header that its signed-header list
+/// (`X-Amz-SignedHeaders`, or `SignedHeaders=` of the `Authorization`
+/// header) does not name: 403 AccessDenied, as AWS does. THE rule of
+/// presigned and header auth; it does not depend on which key signed.
+#[allow(clippy::result_large_err)]
+fn refuse_unsigned_amz_headers(
+    signed_headers: &str,
+    request: &Request<Body>,
+) -> Result<(), Response> {
+    let unsigned =
+        unsigned_amz_headers(signed_headers, request.headers().keys().map(|k| k.as_str()));
+    if unsigned.is_empty() {
+        return Ok(());
+    }
+    warn!("SigV4: headers not listed in the signed headers: {unsigned:?}");
+    Err(S3Error::AccessDeniedReason(format!(
+        "There were headers present in the request which were not signed: {}",
+        unsigned.join(", ")
+    ))
+    .into_response())
+}
+
+/// The `x-amz-*` headers of a request that its signed-header list does not
+/// name. A presigned link signs `host` only, so any `x-amz-*` header is the
+/// link holder's own (`x-amz-copy-source` turns a PUT into a CopyObject,
+/// `x-amz-meta-*` sets unsigned metadata); on header auth, such a header was
+/// added by someone else than the signer. AWS refuses both. Other headers
+/// (`Content-Type`, ...) may stay unsigned, as on AWS.
+fn unsigned_amz_headers<'a>(
+    signed_headers: &str,
+    names: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let signed: Vec<String> = signed_headers
+        .split(';')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .collect();
+    let mut out: Vec<String> = names
+        .map(str::to_ascii_lowercase)
+        .filter(|n| {
+            n.starts_with("x-amz-")
+                && !signed.contains(n)
+                && !UNSIGNED_AMZ_EXEMPT.contains(&n.as_str())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// AWS caps presigned URL expiry at 7 days (604,800 seconds).
 const MAX_PRESIGNED_EXPIRY: i64 = 604_800;
 
@@ -738,6 +810,26 @@ fn parse_presigned_expires(expires: &str) -> Result<i64, String> {
         ));
     }
     Ok(secs)
+}
+
+/// Whether a request carries SigV2 credentials: the query parameters
+/// `AWSAccessKeyId` / `Signature`, or an `Authorization: AWS <key>:<sig>`
+/// header. The proxy supports SigV4 only; s3s would verify a SigV2 query
+/// while this middleware reads the SigV4 header, so it is refused first.
+fn carries_sigv2_credentials(headers: &axum::http::HeaderMap, query: &str) -> bool {
+    let in_query = RequestTarget::parse("/", Some(query)).is_ok_and(|t| {
+        t.query.iter().any(|(k, _)| {
+            k.eq_ignore_ascii_case("AWSAccessKeyId") || k.eq_ignore_ascii_case("Signature")
+        })
+    });
+    in_query
+        || headers
+            .get_all(axum::http::header::AUTHORIZATION)
+            .iter()
+            .any(|v| {
+                let b = v.as_bytes();
+                b.len() >= 4 && b[..4].eq_ignore_ascii_case(b"AWS ")
+            })
 }
 
 /// Check whether the query string contains presigned URL parameters.
@@ -785,6 +877,21 @@ pub async fn sigv4_auth_middleware(
         || crate::config::RuntimeTuning::default().replay_window(),
         |w| w.0,
     );
+
+    // SigV2 is not supported, in any auth mode and on any path.
+    if carries_sigv2_credentials(request.headers(), request.uri().query().unwrap_or("")) {
+        warn!("SigV2 credentials refused: only AWS Signature Version 4 is supported");
+        if let Some(m) = &metrics {
+            m.auth_failures_total
+                .with_label_values(&["sigv2_unsupported"])
+                .inc();
+        }
+        return Err(S3Error::InvalidArgument(
+            "AWS Signature Version 2 is not supported; sign requests with AWS Signature Version 4"
+                .into(),
+        )
+        .into_response());
+    }
 
     // Extract client IP for rate limiting/session security.
     let peer_ip = request
@@ -848,31 +955,30 @@ pub async fn sigv4_auth_middleware(
             }
         }
     };
-    // The lockout answer for a key that is locked out at this address.
-    let lockout_refusal = {
+    // How long (address, key id) stays locked out. It decides nothing alone:
+    // the lockout answers a request only once its signature failed.
+    let lockout_left = {
         let rate_limiter = rate_limiter.clone();
-        move |access_key: &str| -> Option<Response> {
+        move |access_key: &str| -> Option<Duration> {
             let (rl, ip) = (rate_limiter.as_ref()?, client_ip.as_ref()?);
-            let left = rl.key_lockout_remaining(ip, access_key)?;
-            warn!(
-                "SECURITY | event=brute_force_blocked | ip={} | key={} | trust_proxy={} | attempts={} | action=blocked",
-                ip,
-                crate::rate_limiter::account_log_label(access_key, true),
-                crate::rate_limiter::trust_proxy_headers(),
-                rl.key_failure_count(ip, access_key)
-            );
-            // S3 clients understand SlowDown; the message and Retry-After
-            // say how long the lockout lasts.
-            let (secs, message) = crate::rate_limiter::lockout_message(left);
-            let mut resp = S3Error::SlowDown(format!(
-                "Rate limited due to repeated auth failures. {message}"
-            ))
-            .into_response();
-            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
-                resp.headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, v);
+            rl.key_lockout_remaining(ip, access_key)
+        }
+    };
+    // The answer of a locked-out (address, key id) to a request whose
+    // signature failed.
+    let lockout_answer = {
+        let rate_limiter = rate_limiter.clone();
+        move |access_key: &str, left: Duration| -> Response {
+            if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
+                warn!(
+                    "SECURITY | event=brute_force_blocked | ip={} | key={} | trust_proxy={} | attempts={} | action=blocked",
+                    ip,
+                    crate::rate_limiter::account_log_label(access_key, true),
+                    crate::rate_limiter::trust_proxy_headers(),
+                    rl.key_failure_count(ip, access_key)
+                );
             }
-            Some(resp)
+            lockout_response(left)
         }
     };
 
@@ -1021,8 +1127,10 @@ pub async fn sigv4_auth_middleware(
     )
     .is_some()
     {
-        if let Some(refusal) = lockout_refusal(crate::rate_limiter::FORM_POST_KEY) {
-            return Err(refusal);
+        // The form handler checks the signature: it answers the lockout
+        // only for a form whose signature fails (`LockedOut`).
+        if let Some(left) = lockout_left(crate::rate_limiter::FORM_POST_KEY) {
+            request.extensions_mut().insert(LockedOut(left));
         }
         debug!("SigV4: deferring POST form policy auth to object handler");
         return Ok(next.run(request).await);
@@ -1037,10 +1145,13 @@ pub async fn sigv4_auth_middleware(
             log_auth_failure("missing_header");
         })?
     };
-    if let Some(refusal) = lockout_refusal(&params.access_key) {
-        return Err(refusal);
-    }
-    let access_key = params.access_key.clone();
+    // The lockout depends on the key id as SENT, before any lookup: it is
+    // the same for a key id that exists and one that does not.
+    let locked_for = lockout_left(&params.access_key);
+    // Why the key id has no principal (unknown or disabled), if so. Such a
+    // request still goes to s3s, which fails its signature like a wrong
+    // secret; the answer never tells which key ids exist.
+    let mut unresolved: Option<&'static str> = None;
 
     // Look up the user's secret key and build the authenticated identity.
     // `auth_config` is already narrowed to Bootstrap | Iam by the gate match
@@ -1072,13 +1183,14 @@ pub async fn sigv4_auth_middleware(
                 params.access_key.as_bytes(),
                 auth.access_key_id.as_bytes(),
             );
-            if !matches {
+            if matches {
+                // Legacy user gets full access via wildcard permissions
+                Some(AuthenticatedUser::bootstrap_shared(&auth.access_key_id))
+            } else {
                 debug!("SigV4: access key mismatch (legacy mode)");
-                log_auth_failure("invalid_access_key");
-                return Err(S3Error::AccessDenied.into_response());
+                unresolved = Some("invalid_access_key");
+                None
             }
-            // Legacy user gets full access via wildcard permissions
-            Some(AuthenticatedUser::bootstrap_shared(&auth.access_key_id))
         }
         AuthGateDecision::Iam(index) => {
             // The users of the IAM database are judged only once the
@@ -1092,26 +1204,28 @@ pub async fn sigv4_auth_middleware(
             {
                 return Err(iam_unconfirmed_response());
             }
-            let user = match index.get(&params.access_key) {
-                Some(u) => u,
+            match index.get(&params.access_key) {
                 None => {
                     debug!(
                         "SigV4: {}",
                         crate::security::unknown_access_key_label(&params.access_key)
                     );
-                    log_auth_failure("invalid_access_key");
-                    return Err(S3Error::AccessDenied.into_response());
+                    unresolved = Some("invalid_access_key");
+                    None
                 }
-            };
-            if !user.enabled {
-                debug!("SigV4: user '{}' is disabled", user.name);
-                log_auth_failure("user_disabled");
-                return Err(S3Error::AccessDenied.into_response());
+                Some(user) if !user.enabled => {
+                    debug!("SigV4: user '{}' is disabled", user.name);
+                    unresolved = Some("user_disabled");
+                    None
+                }
+                // The index's shared principal: an `Arc` clone, no copy.
+                Some(_) => index.principal(&params.access_key).cloned(),
             }
-            // The index's shared principal: an `Arc` clone, no copy.
-            index.principal(&params.access_key).cloned()
         }
     };
+    if unresolved.is_some() {
+        request.extensions_mut().insert(UnresolvedCredential);
+    }
 
     // Identity resolved (a known, enabled access key). s3s verifies the
     // signature downstream; a forged one is rejected there before any handler.
@@ -1127,6 +1241,15 @@ pub async fn sigv4_auth_middleware(
             fresh
         }
     };
+
+    // A wait place of this peer bucket, held until s3s verifies the signature.
+    // A full bucket gives none: that request is still checked and served as
+    // usual, but if its signature fails it is answered at once, with no wait.
+    if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
+        if let Some(ticket) = rl.try_open_unproven(ip) {
+            outcome.hold_ticket(ticket);
+        }
+    }
 
     // Replay attack detection: reject a duplicate signature of a MUTATING
     // request within DGP_REPLAY_WINDOW_SECS (the default and its reason:
@@ -1211,7 +1334,9 @@ pub async fn sigv4_auth_middleware(
         .extensions_mut()
         .insert(SignedPayloadHash(params.payload_hash.clone()));
 
-    let response = next.run(request).await;
+    let mut response = next.run(request).await;
+    // A verified request gave its place back; any other keeps it through its delay.
+    let mut ticket = outcome.release_ticket();
     // Only a request that succeeded keeps its signature in the replay cache.
     // An SDK retries a 503 (gate SlowDown, backend outage) within the same
     // signing second with a byte-identical signature; refusing that retry
@@ -1219,6 +1344,17 @@ pub async fn sigv4_auth_middleware(
     // held while the request runs, so a concurrent duplicate still fails.
     if let Some((cache, sig, claim)) = replay_claim {
         settle_replay_claim(&cache, &sig, &claim, response.status());
+    }
+    // A lockout answers only a request whose signature s3s did not verify.
+    if let Some(left) = lockout_refusal(locked_for, outcome.is_verified()) {
+        // The longest delay: a guess during a lockout is never cheaper than before it.
+        let mut answer = lockout_answer(&params.access_key, left);
+        wait_in_place(
+            &mut answer,
+            rate_limiter::MAX_PROGRESSIVE_DELAY,
+            ticket.take(),
+        );
+        return Ok(answer);
     }
     match limiter_verdict(&outcome, response.status(), is_presigned) {
         LimiterVerdict::Success => {
@@ -1230,14 +1366,18 @@ pub async fn sigv4_auth_middleware(
             }
         }
         LimiterVerdict::Failure => {
-            record_auth_failure("signature_rejected", &access_key);
+            record_auth_failure(
+                unresolved.unwrap_or("signature_rejected"),
+                &params.access_key,
+            );
             // Progressive delay on the REFUSED response only: a verified
             // request from a shared address is never slowed by another
-            // client's failures.
+            // client's failures. The wait runs outside the request slots
+            // (`RefusalDelay`).
             if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-                let delay = rl.key_progressive_delay(ip, &access_key);
+                let delay = rl.key_progressive_delay(ip, &params.access_key);
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    wait_in_place(&mut response, delay, ticket.take());
                 }
             }
         }
@@ -1246,10 +1386,78 @@ pub async fn sigv4_auth_middleware(
     Ok(response)
 }
 
+/// A refusal that waits before it is sent. The request slots give their
+/// permits back and then wait (`s3_router::request_slots`), so a failed
+/// signature that waits holds no slot; it holds its wait place of its peer
+/// bucket until the wait ends.
+#[derive(Clone)]
+pub(crate) struct RefusalDelay(Arc<DelayHold>);
+
+struct DelayHold {
+    delay: Duration,
+    _place: rate_limiter::UnprovenTicket,
+}
+
+/// Make `response` wait `delay` in a place of its peer bucket. A request with
+/// no place (the bucket was full) waits not at all: the sleeping refusals of
+/// one address never pass the cap, and a verified request is never refused.
+fn wait_in_place(
+    response: &mut Response,
+    delay: Duration,
+    place: Option<rate_limiter::UnprovenTicket>,
+) {
+    if let Some(place) = place {
+        response
+            .extensions_mut()
+            .insert(RefusalDelay(Arc::new(DelayHold {
+                delay,
+                _place: place,
+            })));
+    }
+}
+
+impl RefusalDelay {
+    pub(crate) async fn wait(&self) {
+        tokio::time::sleep(self.0.delay).await;
+    }
+}
+
+/// Request extension of a browser form POST: its (address, form key) is
+/// locked out for this long. The form handler answers it (`lockout_response`)
+/// only when the form's signature fails.
+#[derive(Debug, Clone, Copy)]
+pub struct LockedOut(pub Duration);
+
+/// THE lockout answer: `503 SlowDown` with `Retry-After`, which S3 clients
+/// understand. Sent only to a request whose signature did not verify.
+pub(crate) fn lockout_response(left: Duration) -> Response {
+    let (secs, message) = crate::rate_limiter::lockout_message(left);
+    let mut resp = S3Error::SlowDown(format!(
+        "Rate limited due to repeated auth failures. {message}"
+    ))
+    .into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, v);
+    }
+    resp
+}
+
+/// Pure: the lockout that answers a request, given whether its signature
+/// verified. A request whose signature verifies is never refused.
+pub(crate) fn lockout_refusal(
+    locked: Option<Duration>,
+    signature_verified: bool,
+) -> Option<Duration> {
+    locked.filter(|_| !signature_verified)
+}
+
 /// Parsed components of an AWS SigV4 Authorization header.
 struct ParsedAuthHeader {
     access_key: String,
     signature: String,
+    /// The `SignedHeaders=` list, as sent.
+    signed_headers: String,
 }
 
 /// Parse the Authorization header for the fields this middleware still needs:
@@ -1268,6 +1476,7 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
 
     let mut credential = None;
     let mut signature = None;
+    let mut signed_headers = None;
 
     for part in parts.split(',') {
         let part = part.trim();
@@ -1275,11 +1484,14 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
             credential = Some(val.trim().to_string());
         } else if let Some(val) = part.strip_prefix("Signature=") {
             signature = Some(val.trim().to_string());
+        } else if let Some(val) = part.strip_prefix("SignedHeaders=") {
+            signed_headers = Some(val.trim().to_string());
         }
     }
 
     let credential = credential?;
     let signature = signature?;
+    let signed_headers = signed_headers.unwrap_or_default();
 
     // Parse credential: AKID/date/region/service/aws4_request; validate scope
     // shape so a garbled header is a clean 400 rather than a downstream surprise.
@@ -1292,6 +1504,7 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
     Some(ParsedAuthHeader {
         access_key: access_key.to_string(),
         signature,
+        signed_headers,
     })
 }
 
@@ -1363,8 +1576,9 @@ mod tests {
     }
 
     /// Only an s3s-verified signature resets the limiter; a 403 before
-    /// verification is a failure; an authz denial or other status teaches
-    /// nothing about the credential (S19).
+    /// verification is a failure; another status teaches nothing about the
+    /// credential (S19). An authorization denial is answered after
+    /// verification, so it is a verified request.
     #[test]
     fn limiter_verdict_truth_table() {
         use axum::http::StatusCode;
@@ -1392,12 +1606,6 @@ mod tests {
             limiter_verdict(&verified, StatusCode::FORBIDDEN, false),
             LimiterVerdict::Success
         );
-        let denied = AuthOutcome::default();
-        denied.mark_authz_denied();
-        assert_eq!(
-            limiter_verdict(&denied, StatusCode::FORBIDDEN, false),
-            LimiterVerdict::Neither
-        );
         // A verified presigned link resets nothing; a forged one still counts.
         assert_eq!(
             limiter_verdict(&verified, StatusCode::OK, true),
@@ -1420,8 +1628,6 @@ mod tests {
     #[test]
     fn auth_outcome_is_verified_through_a_clone() {
         let outcome = AuthOutcome::default();
-        assert!(!outcome.is_verified());
-        outcome.clone().mark_authz_denied();
         assert!(!outcome.is_verified());
         outcome.clone().mark_verified();
         assert!(outcome.is_verified());
@@ -2117,6 +2323,288 @@ mod per_key_lockout_tests {
         );
     }
 
+    /// Stands in for s3s: a request that says `x-test-signature: good` has a
+    /// verified signature, any other does not.
+    async fn s3s_by_header(req: Request<Body>) -> StatusCode {
+        if req
+            .headers()
+            .get("x-test-signature")
+            .is_some_and(|v| v == "good")
+        {
+            if let Some(outcome) = req.extensions().get::<AuthOutcome>() {
+                outcome.mark_verified();
+            }
+            StatusCode::OK
+        } else {
+            StatusCode::FORBIDDEN
+        }
+    }
+
+    fn sent(access_key: &str, peer: std::net::SocketAddr, good: bool) -> Request<Body> {
+        let mut req = signed(access_key, peer);
+        req.headers_mut().insert(
+            "x-test-signature",
+            axum::http::HeaderValue::from_static(if good { "good" } else { "bad" }),
+        );
+        req
+    }
+
+    /// Anyone at a shared address can send bad signatures for a key id (the
+    /// id is public: every share link carries it). The lockout answers only
+    /// a request whose signature fails; one that verifies is served, and
+    /// neither it nor the failing ones around it are delayed for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_lockout_never_refuses_or_delays_a_request_whose_signature_verifies() {
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
+            IamIndex::from_users(vec![user(1, "alice", ALICE)]),
+        )));
+        let limiter = RateLimiter::new(30, Duration::from_secs(300), Duration::from_secs(600));
+        let app = axum::Router::new()
+            .fallback(s3s_by_header)
+            .layer(axum::middleware::from_fn(sigv4_auth_middleware))
+            .layer(axum::Extension(iam))
+            .layer(axum::Extension(
+                crate::coordination::CoordinationStatus::default(),
+            ))
+            .layer(axum::Extension(limiter));
+        let peer: std::net::SocketAddr = "10.0.1.5:40000".parse().unwrap();
+        let timed = |req: Request<Body>| {
+            let app = app.clone();
+            async move {
+                let started = tokio::time::Instant::now();
+                let resp = app.oneshot(req).await.unwrap();
+                (resp, started.elapsed())
+            }
+        };
+        // A burst of bad signatures: refused with 403, delayed from the 11th.
+        for n in 0..30 {
+            let (resp, took) = timed(sent(ALICE, peer, false)).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "bad signature {n}");
+            // The wait is `RefusalDelay`: the request slots wait it, not this layer.
+            assert_eq!(took, Duration::ZERO, "no wait in the layer {n}");
+            assert_eq!(
+                refusal_delay_of(&resp) > Duration::ZERO,
+                n >= 10,
+                "delay of bad signature {n}"
+            );
+        }
+        // Locked out: a failing request gets 503 + Retry-After, after the longest delay.
+        let (resp, _) = timed(sent(ALICE, peer, false)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        assert_eq!(
+            refusal_delay_of(&resp),
+            crate::rate_limiter::MAX_PROGRESSIVE_DELAY,
+            "a locked-out failure waits the longest delay"
+        );
+        // The same key id with a verified signature is served, undelayed.
+        let (resp, took) = timed(sent(ALICE, peer, true)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a verified request was refused"
+        );
+        assert_eq!(took, Duration::ZERO, "a verified request was delayed");
+        assert_eq!(refusal_delay_of(&resp), Duration::ZERO);
+        // And the lockout still holds for the next failing request.
+        let (resp, _) = timed(sent(ALICE, peer, false)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // An id that does not exist is answered the same way.
+        for n in 0..31 {
+            let (resp, _) = timed(sent("AKNOSUCHID000000000", peer, false)).await;
+            let want = if n < 30 {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            assert_eq!(resp.status(), want, "unknown id, bad signature {n}");
+        }
+    }
+
+    /// With every wait place of one address taken by failures that sleep, a
+    /// request of that address is never refused before its signature check:
+    /// a verified one is served at once, a failed one gets its own answer at
+    /// once (no wait, no place held), and the places never exceed the cap.
+    /// `max_attempts` 200 = the answer is 403; 12 = it is the lockout 503.
+    async fn full_wait_places_refuse_nothing_unchecked(max_attempts: u32, failed: StatusCode) {
+        use crate::rate_limiter::MAX_UNPROVEN_PER_PEER;
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
+            IamIndex::from_users(vec![user(1, "alice", ALICE)]),
+        )));
+        let limiter = RateLimiter::new(
+            max_attempts,
+            Duration::from_secs(300),
+            Duration::from_secs(600),
+        );
+        let app = axum::Router::new()
+            .fallback(s3s_by_header)
+            .layer(axum::middleware::from_fn(sigv4_auth_middleware))
+            .layer(axum::Extension(iam))
+            .layer(axum::Extension(
+                crate::coordination::CoordinationStatus::default(),
+            ))
+            .layer(axum::Extension(limiter.clone()));
+        let peer: std::net::SocketAddr = "10.0.1.5:40000".parse().unwrap();
+        let ip = peer.ip();
+        let timed = |req: Request<Body>| {
+            let app = app.clone();
+            async move {
+                let started = tokio::time::Instant::now();
+                let resp = app.oneshot(req).await.unwrap();
+                (resp, started.elapsed())
+            }
+        };
+        // The first 10 failures wait for nothing; the next ones sleep and hold a place.
+        for _ in 0..10 {
+            let (resp, _) = timed(sent(ALICE, peer, false)).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+        let mut sleeping = Vec::new();
+        while limiter.unproven_open(&ip) < MAX_UNPROVEN_PER_PEER {
+            let (resp, _) = timed(sent(ALICE, peer, false)).await;
+            assert!(refusal_delay_of(&resp) > Duration::ZERO, "it sleeps");
+            sleeping.push(resp);
+        }
+        assert_eq!(sleeping.len(), MAX_UNPROVEN_PER_PEER);
+
+        // (a) a verified request is served, undelayed.
+        let (resp, took) = timed(sent(ALICE, peer, true)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "a verified request");
+        assert_eq!(
+            (took, refusal_delay_of(&resp)),
+            (Duration::ZERO, Duration::ZERO)
+        );
+        // (b) a failed one gets its own answer at once and holds nothing.
+        let (resp, took) = timed(sent(ALICE, peer, false)).await;
+        assert_eq!(resp.status(), failed, "a failed overflow request");
+        assert_eq!(
+            (took, refusal_delay_of(&resp)),
+            (Duration::ZERO, Duration::ZERO)
+        );
+        // (c) the places never pass the cap.
+        assert_eq!(limiter.unproven_open(&ip), MAX_UNPROVEN_PER_PEER);
+        // (d) another address has its own places.
+        let other: std::net::SocketAddr = "10.0.1.6:40000".parse().unwrap();
+        let (resp, _) = timed(sent(ALICE, other, true)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut last = None;
+        for _ in 0..11 {
+            last = Some(timed(sent(ALICE, other, false)).await.0);
+        }
+        let last = last.unwrap();
+        assert!(refusal_delay_of(&last) > Duration::ZERO, "own place");
+        assert_eq!(limiter.unproven_open(&other.ip()), 1);
+        // A place that frees is reused by the next request that must wait.
+        drop(sleeping.pop());
+        assert_eq!(limiter.unproven_open(&ip), MAX_UNPROVEN_PER_PEER - 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_wait_places_answer_a_wrong_signature_at_once_and_serve_a_right_one() {
+        full_wait_places_refuse_nothing_unchecked(200, StatusCode::FORBIDDEN).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_wait_places_answer_a_locked_out_failure_at_once_and_serve_a_right_one() {
+        // 12 failures lock the pair; every failure after the 10th sleeps.
+        full_wait_places_refuse_nothing_unchecked(12, StatusCode::SERVICE_UNAVAILABLE).await;
+    }
+
+    fn refusal_delay_of(resp: &axum::response::Response) -> Duration {
+        resp.extensions()
+            .get::<RefusalDelay>()
+            .map_or(Duration::ZERO, |d| d.0.delay)
+    }
+
+    /// Pure: the lockout answers a request only when its signature did not verify.
+    #[test]
+    fn lockout_refusal_truth_table() {
+        let left = Some(Duration::from_secs(5));
+        assert_eq!(lockout_refusal(left, false), left);
+        assert_eq!(lockout_refusal(left, true), None);
+        assert_eq!(lockout_refusal(None, false), None);
+        assert_eq!(lockout_refusal(None, true), None);
+    }
+
+    /// Source guard: a request whose signature verifies is never refused or
+    /// delayed by the limiter, with no exception. No answer that the limiter
+    /// decides comes before the inner service ran (so before s3s checked the
+    /// signature): in the SigV4 middleware the lockout answer and the delay
+    /// come after its last `next.run`; in the form-POST interceptor, after the
+    /// form handler. Nothing else sends them. The one pre-check use of the
+    /// limiter, a wait place (`try_open_unproven`), gives or withholds a
+    /// place and answers nothing; only this file takes one.
+    #[test]
+    fn a_verified_request_is_never_refused_or_delayed_by_the_limiter() {
+        let mut offenders = Vec::new();
+        let (mut run_line, mut handler_line) = (0, usize::MAX);
+        for src in crate::source_scan::ast::src() {
+            match src.rel.as_str() {
+                "src/api/auth.rs" => {
+                    run_line = src
+                        .prod
+                        .calls_named("run")
+                        .map(|c| c.line)
+                        .max()
+                        .unwrap_or(0);
+                    // No answer before `next.run` depends on the limiter.
+                    for name in ["lockout_answer", "key_progressive_delay"] {
+                        for c in src.prod.calls_named(name) {
+                            if c.line < run_line {
+                                offenders.push(format!(
+                                    "{}:{}: {name}(..) before next.run",
+                                    src.rel, c.line
+                                ));
+                            }
+                        }
+                    }
+                }
+                "src/api/s3_router.rs" => {
+                    handler_line = src
+                        .prod
+                        .calls_named("handle_form_post_upload")
+                        .map(|c| c.line)
+                        .min()
+                        .unwrap_or(usize::MAX);
+                    for c in src.prod.calls_named("try_open_unproven") {
+                        offenders.push(format!(
+                            "{}:{}: a wait place outside auth.rs",
+                            src.rel, c.line
+                        ));
+                    }
+                    for c in src.prod.calls_named("lockout_response") {
+                        if c.line < handler_line {
+                            offenders.push(format!(
+                                "{}:{}: lockout_response(..) before the form handler",
+                                src.rel, c.line
+                            ));
+                        }
+                    }
+                }
+                rel => {
+                    for name in [
+                        "lockout_response",
+                        "lockout_answer",
+                        "key_progressive_delay",
+                        "try_open_unproven",
+                    ] {
+                        for c in src.prod.calls_named(name) {
+                            offenders.push(format!(
+                                "{rel}:{}: {name}(..) outside the two surfaces",
+                                c.line
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            run_line > 0 && handler_line < usize::MAX,
+            "the guard found its anchors"
+        );
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
     /// Source guard: the S3 surfaces (the SigV4 middleware, the form-POST
     /// interceptor) count and check failures per (IP, access key), never
     /// per address alone: behind a reverse proxy one address is every
@@ -2146,5 +2634,118 @@ mod per_key_lockout_tests {
             "use the per-key limiter methods (record_key_failure, key_lockout_remaining, ...):\n{}",
             offenders.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod presigned_unsigned_header_tests {
+    use super::{carries_sigv2_credentials, parse_auth_header, unsigned_amz_headers};
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn headers(auth: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for a in auth {
+            h.append("authorization", HeaderValue::from_str(a).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn sigv2_credentials_are_found_in_every_shape() {
+        let none = HeaderMap::new();
+        assert!(carries_sigv2_credentials(
+            &none,
+            "AWSAccessKeyId=AK&Signature=x&Expires=1"
+        ));
+        assert!(carries_sigv2_credentials(&none, "Signature=x"));
+        assert!(carries_sigv2_credentials(&none, "awsaccesskeyid=AK"));
+        assert!(carries_sigv2_credentials(&none, "AWS%41ccessKeyId=AK"));
+        assert!(carries_sigv2_credentials(&headers(&["AWS AK:c2ln"]), ""));
+        assert!(carries_sigv2_credentials(&headers(&["aws AK:c2ln"]), ""));
+        // A junk SigV4 header beside a SigV2 query, or a second header.
+        assert!(carries_sigv2_credentials(
+            &headers(&["AWS4-HMAC-SHA256 Credential=AK/x"]),
+            "AWSAccessKeyId=AK&Signature=x&Expires=1"
+        ));
+        assert!(carries_sigv2_credentials(
+            &headers(&["AWS4-HMAC-SHA256 Credential=AK/x", "AWS AK:c2ln"]),
+            ""
+        ));
+    }
+
+    #[test]
+    fn sigv4_and_plain_requests_are_not_sigv2() {
+        let none = HeaderMap::new();
+        assert!(!carries_sigv2_credentials(&none, ""));
+        assert!(!carries_sigv2_credentials(&none, "list-type=2&prefix=a"));
+        assert!(!carries_sigv2_credentials(
+            &none,
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=ab&X-Amz-Credential=AK"
+        ));
+        assert!(!carries_sigv2_credentials(
+            &headers(&["AWS4-HMAC-SHA256 Credential=AK/x, SignedHeaders=host, Signature=ab"]),
+            ""
+        ));
+    }
+
+    #[test]
+    fn the_cloudfront_request_id_may_stay_unsigned() {
+        assert!(offenders("host", &["x-amz-cf-id"]).is_empty());
+        assert!(offenders("host", &["X-Amz-Cf-Id"]).is_empty());
+        // Only that one: another header of the same prefix is refused.
+        assert_eq!(
+            offenders("host", &["x-amz-cf-id", "x-amz-cf-pop"]),
+            ["x-amz-cf-pop"]
+        );
+    }
+
+    #[test]
+    fn header_auth_reads_its_signed_header_list() {
+        let parsed = parse_auth_header(
+            "AWS4-HMAC-SHA256 Credential=AK/20260101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ab",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.signed_headers,
+            "host;x-amz-content-sha256;x-amz-date"
+        );
+    }
+
+    fn offenders(signed: &str, headers: &[&str]) -> Vec<String> {
+        unsigned_amz_headers(signed, headers.iter().copied())
+    }
+
+    #[test]
+    fn an_amz_header_outside_the_signed_list_is_refused() {
+        assert_eq!(
+            offenders("host", &["host", "x-amz-copy-source"]),
+            ["x-amz-copy-source"]
+        );
+        assert_eq!(
+            offenders(
+                "host",
+                &["X-Amz-Meta-Owner", "x-amz-meta-owner", "x-amz-acl"]
+            ),
+            ["x-amz-acl", "x-amz-meta-owner"]
+        );
+        assert_eq!(offenders("", &["x-amz-copy-source"]), ["x-amz-copy-source"]);
+    }
+
+    #[test]
+    fn signed_amz_headers_and_other_unsigned_headers_pass() {
+        assert!(offenders("host;x-amz-meta-a", &["host", "x-amz-meta-a"]).is_empty());
+        assert!(offenders("host; X-Amz-Meta-A", &["x-amz-meta-a"]).is_empty());
+        assert!(offenders(
+            "host",
+            &[
+                "host",
+                "content-type",
+                "content-length",
+                "user-agent",
+                "range"
+            ]
+        )
+        .is_empty());
     }
 }

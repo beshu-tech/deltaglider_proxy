@@ -838,6 +838,13 @@ mod readiness_tests {
         ),
         (
             "src/api/errors.rs",
+            "429 | 503 => Code::SlowDown",
+            1,
+            Reach::Plumbing,
+            "the s3s code of a resource that an admission `reject` rule refuses",
+        ),
+        (
+            "src/api/errors.rs",
             "if status == StatusCode::SERVICE_UNAVAILABLE",
             1,
             Reach::Plumbing,
@@ -1234,9 +1241,9 @@ mod readiness_tests {
         (
             "src/multipart.rs",
             "S3Error::SlowDown(",
-            2,
+            3,
             Reach::PerRequest,
-            "a multipart request met a cap or a full spool budget",
+            "a multipart request met a cap, its principal's share or a full spool budget",
         ),
         (
             "src/maintenance/gate.rs",

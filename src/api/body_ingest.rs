@@ -55,6 +55,9 @@ fn s3s_decoded_aws_chunked(headers: &axum::http::HeaderMap, has_credentials: boo
 /// headers (length, aws-chunked framing, `x-amz-checksum-*`) and the
 /// trailers s3s took off a body it decoded. Taken before `req.input` moves.
 pub(crate) struct BodyContext {
+    /// The principal of the request ([`crate::iam::principal_id`]): who pays
+    /// for the bytes of an UploadPart.
+    principal: String,
     headers: axum::http::HeaderMap,
     /// The body still carries aws-chunked framing (s3s did not decode it).
     still_chunked: bool,
@@ -73,6 +76,9 @@ impl BodyContext {
     pub(crate) fn of<T>(req: &s3s::S3Request<T>) -> Self {
         let has_credentials = req.credentials.is_some();
         Self {
+            principal: crate::iam::principal_id(
+                crate::iam::request_principal(&req.extensions).map(|u| u.as_ref()),
+            ),
             headers: req.headers.clone(),
             still_chunked: !s3s_decoded_aws_chunked(&req.headers, has_credentials),
             s3s_trailers: req.trailing_headers.clone(),
@@ -273,6 +279,7 @@ pub(crate) async fn ingest_part_body(
     let engine = state.engine.load_full();
     let body = ClientBody::precheck(&engine, body, ctx, limit, content_md5)?;
     let admission = state.multipart.admit_part(
+        &ctx.principal,
         part.upload_id,
         part.bucket,
         part.key,

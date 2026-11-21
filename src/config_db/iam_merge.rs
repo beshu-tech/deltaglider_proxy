@@ -196,6 +196,15 @@ pub(crate) fn copy_order(remote_gen: i64, base_gen: i64) -> CopyOrder {
     }
 }
 
+/// Pure: the generation below which a copy is a rollback: the base, raised by the
+/// floor (last confirmed copy). Never the local counter: failed uploads raise it.
+pub(crate) fn rollback_limit(base_gen: Option<i64>, floor: i64) -> (i64, &'static str) {
+    match base_gen {
+        Some(b) if b >= floor => (b, "the last synced copy"),
+        _ => (floor, "the last copy this node accepted or uploaded"),
+    }
+}
+
 /// Pure: whether a merge base can order the copies. A generation of 0 is
 /// "never uploaded": without one the merge is a union with no deletes.
 pub(crate) fn usable_base(remote_gen: i64, base_gen: i64) -> bool {
@@ -346,6 +355,8 @@ pub struct MergeReport {
     pub base_used: bool,
     /// False when the merge result equals the local IAM (nothing written).
     pub changed: bool,
+    /// The sync generation of the copy that this merge accepted.
+    pub remote_generation: i64,
 }
 
 fn read_rows(conn: &Connection, schema: &str, table: &str) -> Result<Vec<Row>, ConfigDbError> {
@@ -531,6 +542,7 @@ fn merge_table(
                     let (resolution, side) = side(l, r);
                     let (mut e, conflict) = merge_columns(b, l, r, side);
                     keep_newest_login(&mut e, Some(l), Some(r), spec.table);
+                    provider_secret_follows_destination(spec.table, &mut e, [b, l, r]);
                     if !conflict {
                         out.insert(key.clone(), (e, side));
                         continue;
@@ -565,6 +577,37 @@ fn merge_table(
         }
     }
     out
+}
+
+/// Pure: the destination rule (`auth_providers::Destination`) for a merged provider
+/// row: its secret stays only when a version that held it had the merged destination.
+fn provider_secret_follows_destination(table: &str, merged: &mut Entity, sides: [&Entity; 3]) {
+    if table != "auth_providers" {
+        return;
+    }
+    let destination = |row: &Row| {
+        let text = |c: &str| match row.get(c) {
+            Some(Value::Text(t)) => Some(t.as_str()),
+            _ => None,
+        };
+        let extra = text("extra_config").and_then(|t| serde_json::from_str(t).ok());
+        super::auth_providers::Destination::new(
+            text("provider_type").unwrap_or(""),
+            text("issuer_url"),
+            extra.as_ref(),
+        )
+    };
+    let secret = merged.row.get("client_secret").cloned();
+    if matches!(secret, None | Some(Value::Null)) {
+        return;
+    }
+    let merged_destination = destination(&merged.row);
+    let kept = sides.iter().any(|s| {
+        s.row.get("client_secret") == secret.as_ref() && destination(&s.row) == merged_destination
+    });
+    if !kept {
+        merged.row.insert("client_secret".into(), Value::Null);
+    }
 }
 
 /// Pure: whether the local version of a row changed on both sides is the
@@ -1172,11 +1215,13 @@ impl ConfigDb {
     /// Node-local tables (jobs, leases, outbox, cursors, parity) are never
     /// read or written (B3): their rows live in the jobs DB, and a copy from
     /// an older peer that still carries them is ignored. `session_revocations` merges as a monotonic MAX-upsert.
+    /// `floor`: the last generation this node confirmed (`rollback_limit`; `0`: none).
     pub fn merge_iam_from(
         &self,
         remote_path: &Path,
         base_path: Option<&Path>,
         passphrase: &str,
+        floor: i64,
     ) -> Result<MergeReport, ConfigDbError> {
         self.attach("remote", remote_path, passphrase)?;
         let result = (|| -> Result<MergeReport, ConfigDbError> {
@@ -1198,16 +1243,14 @@ impl ConfigDb {
             let base_read = base_path
                 .and_then(|p| self.read_base(p, passphrase))
                 .filter(|(_, base_gen)| usable_base(remote_gen, *base_gen));
-            if let Some((_, base_gen)) = &base_read {
-                if copy_order(remote_gen, *base_gen) == CopyOrder::RolledBack {
-                    return Err(ConfigDbError::RollbackRefused {
-                        detail: format!(
-                            "peer config DB is sync generation {remote_gen}, older than \
-                             the last synced copy ({base_gen}) (a copy put back into the \
-                             sync bucket?)"
-                        ),
-                    });
-                }
+            let (limit, what) = rollback_limit(base_read.as_ref().map(|(_, g)| *g), floor);
+            if copy_order(remote_gen, limit) == CopyOrder::RolledBack {
+                return Err(ConfigDbError::RollbackRefused {
+                    detail: format!(
+                        "peer config DB is sync generation {remote_gen}, older than \
+                         {what} ({limit}) (a copy put back into the sync bucket?)"
+                    ),
+                });
             }
             let base = base_read.map(|(b, _)| b);
 
@@ -1223,6 +1266,7 @@ impl ConfigDb {
                 let out = merge_snapshots(base.as_ref(), &local, &remote);
                 let mut report = MergeReport {
                     conflicts: out.conflicts,
+                    remote_generation: remote_gen,
                     base_used: base.is_some(),
                     ..Default::default()
                 };
@@ -1301,6 +1345,12 @@ impl ConfigDb {
     /// The `sync_generation` of this DB (`0` before its first upload).
     pub fn sync_generation(&self) -> Result<i64, ConfigDbError> {
         read_generation(&self.conn, "main")
+    }
+
+    /// The `sync_generation` of the merge base at `path`; `None`: no usable base.
+    pub fn base_generation(&self, path: &Path, passphrase: &str) -> Option<i64> {
+        self.read_base(path, passphrase)
+            .map(|(_, generation)| generation)
     }
 
     /// The merge base and its `sync_generation`, or `None` when it is
@@ -1431,7 +1481,7 @@ mod tests {
             remote.delete_user(user_id(&remote, "u2")).unwrap();
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert_eq!(names(&local), vec!["u3"]);
         assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
@@ -1458,7 +1508,7 @@ mod tests {
                 .unwrap();
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
         assert_eq!(names(&local), vec!["l-new", "r-new", "u1", "u2", "u3"]);
@@ -1506,7 +1556,7 @@ mod tests {
             }
             drop(remote);
             let report = local
-                .merge_iam_from(&t.remote, Some(&t.base), PASS)
+                .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
                 .unwrap();
             let want = if remote_last { "remote/*" } else { "local/*" };
             let u1 = local.get_user_by_id(user_id(&local, "u1")).unwrap();
@@ -1534,7 +1584,7 @@ mod tests {
                 .unwrap();
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert_eq!(names(&local), vec!["u2", "u3"]);
         assert_eq!(report.conflicts.len(), 1);
@@ -1583,7 +1633,7 @@ mod tests {
         assert_eq!(alice.id, bob_id, "the test needs both nodes to pick one id");
 
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert_eq!(user_id(&local, "bob"), bob_id, "the remote keeps its id");
         let alice_now = user_id(&local, "alice");
@@ -1617,7 +1667,7 @@ mod tests {
             remote.add_user_to_group(g, user_id(&remote, "u2")).unwrap();
         }
         local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         let mut members = local.get_group_members(g).unwrap();
         members.sort();
@@ -1635,14 +1685,14 @@ mod tests {
             let remote = open(&t.remote);
             remote.delete_user(user_id(&remote, "u3")).unwrap();
         }
-        let report = local.merge_iam_from(&t.remote, None, PASS).unwrap();
+        let report = local.merge_iam_from(&t.remote, None, PASS, 0).unwrap();
         assert!(!report.base_used);
         // The local create survives; the unsynced remote delete comes back.
         assert_eq!(names(&local), vec!["l-new", "u1", "u2", "u3"]);
         // An unreadable base behaves the same.
         std::fs::write(&t.base, b"not a database").unwrap();
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert!(!report.base_used);
     }
@@ -1652,7 +1702,7 @@ mod tests {
         let t = trio(seed_three);
         let local = open(&t.local);
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert!(!report.changed);
         assert!(report.stale_user_ids.is_empty());
@@ -1684,7 +1734,7 @@ mod tests {
                 .unwrap();
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         let u1 = local.get_user_by_id(user_id(&local, "u1")).unwrap();
         assert_eq!(u1.permissions[0].resources, vec!["remote/*"]);
@@ -1766,6 +1816,55 @@ mod tests {
 
     use super::super::auth_providers::{CreateMappingRuleRequest, UpdateMappingRuleRequest};
 
+    fn provider_row(issuer: &str, secret: Option<&str>) -> Entity {
+        let text = |s: &str| Value::Text(s.to_string());
+        Entity {
+            id: Some(1),
+            mtime: 1,
+            row: [
+                ("provider_type".to_string(), text("oidc")),
+                ("issuer_url".to_string(), text(issuer)),
+                (
+                    "client_secret".to_string(),
+                    secret.map_or(Value::Null, text),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_merged_provider_secret_never_follows_a_new_destination() {
+        let base = provider_row("https://a.example", Some("s0"));
+        // One node moved the issuer (its secret was cleared); the other
+        // rotated the secret on the old issuer.
+        let local = provider_row("https://b.example", None);
+        let remote = provider_row("https://a.example", Some("s1"));
+        let (mut merged, _) = merge_columns(&base, &local, &remote, Side::Remote);
+        assert_eq!(
+            merged.row["issuer_url"],
+            Value::Text("https://b.example".into())
+        );
+        assert_eq!(merged.row["client_secret"], Value::Text("s1".into()));
+        provider_secret_follows_destination(
+            "auth_providers",
+            &mut merged,
+            [&base, &local, &remote],
+        );
+        assert_eq!(merged.row["client_secret"], Value::Null);
+        // The control: the secret rotated on the node that kept the issuer.
+        let local = provider_row("https://a.example", Some("s0"));
+        let (mut merged, _) = merge_columns(&base, &local, &remote, Side::Remote);
+        provider_secret_follows_destination(
+            "auth_providers",
+            &mut merged,
+            [&base, &local, &remote],
+        );
+        assert_eq!(merged.row["client_secret"], Value::Text("s1".into()));
+    }
+
     fn seed_rule(db: &ConfigDb) {
         let g = db.create_group("eng", "", &[]).unwrap();
         db.create_group_mapping_rule(&CreateMappingRuleRequest {
@@ -1809,7 +1908,7 @@ mod tests {
         let local = open(&t.local);
         set_rule_value(&local, "local.example");
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
         assert_eq!(rule_values(&local), vec!["local.example"]);
@@ -1826,7 +1925,7 @@ mod tests {
             set_rule_value(&remote, "remote.example");
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert_eq!(
             rule_values(&local),
@@ -1947,7 +2046,7 @@ mod tests {
         set_gen(&t.remote, 6);
         let local = open(&t.local);
         local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .expect("a descendant copy is merged whatever its clock");
         assert_eq!(names(&local), vec!["u1", "u2", "u3", "u4"]);
         assert!(local.get_user_by_id(user_id(&local, "u1")).unwrap().enabled);
@@ -1967,17 +2066,63 @@ mod tests {
         set_gen(&t.remote, 4);
         let local = open(&t.local);
         let err = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .expect_err("an older generation is a rollback");
         assert!(err.to_string().contains("generation 4"), "{err}");
         assert_eq!(names(&local), vec!["u1", "u2", "u3"]);
+    }
+
+    /// The floor needs no file next to the DB: with no base and local generation 0,
+    /// a copy below it is refused and one at it is merged.
+    #[test]
+    fn the_floor_refuses_an_old_copy_when_base_and_local_generation_are_gone() {
+        let t = trio(seed_three);
+        set_gen(&t.local, 0);
+        open(&t.remote)
+            .create_user("u4", "AKU4000000001", "s4", true, &[])
+            .unwrap();
+        set_gen(&t.remote, 4);
+        let local = open(&t.local);
+        let err = local
+            .merge_iam_from(&t.remote, None, PASS, 7)
+            .expect_err("4 is below the floor 7");
+        assert!(err.to_string().contains("accepted or uploaded"), "{err}");
+        assert_eq!(names(&local), vec!["u1", "u2", "u3"]);
+        set_gen(&t.remote, 7);
+        let report = local
+            .merge_iam_from(&t.remote, None, PASS, 7)
+            .expect("a copy at the floor is accepted");
+        assert_eq!(report.remote_generation, 7);
+        assert_eq!(names(&local), vec!["u1", "u2", "u3", "u4"]);
+    }
+
+    /// The floor also holds when a base exists.
+    #[test]
+    fn the_floor_applies_with_a_base_too() {
+        let t = trio(seed_three);
+        set_gen(&t.base, 2);
+        set_gen(&t.local, 2);
+        set_gen(&t.remote, 5);
+        let local = open(&t.local);
+        local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 9)
+            .expect_err("5 is above the base but below the floor 9");
+    }
+
+    #[test]
+    fn the_rollback_limit_takes_the_highest_confirmed_evidence() {
+        assert_eq!(rollback_limit(Some(5), 0).0, 5);
+        assert_eq!(rollback_limit(None, 7).0, 7, "no base: the floor");
+        assert_eq!(rollback_limit(Some(5), 12).0, 12);
+        assert_eq!(rollback_limit(Some(8), 3).0, 8);
+        assert_eq!(rollback_limit(None, 0).0, 0, "a new node has no limit");
     }
 
     /// A base or a copy without a generation cannot order the copies: the
     /// merge is a union, so a delete on the other side never propagates.
     #[test]
     fn a_missing_generation_merges_as_a_union_with_no_deletes() {
-        for (base_gen, remote_gen) in [(0, 3), (5, 0), (0, 0)] {
+        for (base_gen, remote_gen) in [(0, 3), (0, 0)] {
             let t = trio(seed_three);
             set_gen(&t.base, base_gen);
             set_gen(&t.local, base_gen);
@@ -1988,7 +2133,7 @@ mod tests {
             set_gen(&t.remote, remote_gen);
             let local = open(&t.local);
             let report = local
-                .merge_iam_from(&t.remote, Some(&t.base), PASS)
+                .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
                 .unwrap_or_else(|e| panic!("gens ({base_gen}, {remote_gen}): {e}"));
             assert!(!report.base_used, "gens ({base_gen}, {remote_gen})");
             assert_eq!(
@@ -2145,7 +2290,7 @@ mod review3_tests {
                 .unwrap();
         }
         local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         let ix = local.find_external_identity(p, "sub-x").unwrap();
         let iy = local.find_external_identity(p, "sub-y").unwrap();
@@ -2208,7 +2353,7 @@ mod review3_tests {
                 .unwrap();
         }
         local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         let u1 = local
             .load_users()
@@ -2257,7 +2402,7 @@ mod review3_tests {
                 .unwrap();
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         let ext = local.find_external_identity(p, "sub-b").unwrap();
         assert!(
@@ -2302,7 +2447,7 @@ mod review3_tests {
                 .unwrap();
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert_eq!(names(&local), vec!["u1", "u2"], "a user was deleted");
         let users = local.load_users().unwrap();
@@ -2348,7 +2493,7 @@ mod review3_tests {
                 .unwrap();
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
         assert_eq!(names(&local), vec!["robert"]);
@@ -2377,7 +2522,7 @@ mod review3_tests {
                 .unwrap();
         }
         let report = local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert_eq!(names(&local), vec!["robert"]);
         assert_eq!(report.conflicts.len(), 1, "{:?}", report.conflicts);
@@ -2410,7 +2555,7 @@ mod review3_tests {
                 .unwrap();
         }
         local
-            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .merge_iam_from(&t.remote, Some(&t.base), PASS, 0)
             .unwrap();
         assert!(
             names(&local).contains(&"l-new".to_string()),
@@ -2467,7 +2612,7 @@ mod review3_tests {
             login(&t2.remote, remote_at, r#"{"iat":"r"}"#);
             let local = open(&t2.local);
             let report = local
-                .merge_iam_from(&t2.remote, Some(&t2.base), PASS)
+                .merge_iam_from(&t2.remote, Some(&t2.base), PASS, 0)
                 .unwrap();
             assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
             let (at, claims) = read(&local);

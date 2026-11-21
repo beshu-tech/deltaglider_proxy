@@ -310,10 +310,19 @@ async fn request_slots(
         permits.push(permit);
         backend_name = Some(backend);
     }
-    let response = match backend_name {
+    let mut response = match backend_name {
         Some(backend) => crate::deltaglider::spool::scoped(&backend, next.run(request)).await,
         None => next.run(request).await,
     };
+    // A refusal that waits (a failed signature) waits without a slot.
+    if let Some(hold) = response
+        .extensions_mut()
+        .remove::<crate::api::auth::RefusalDelay>()
+    {
+        drop(permits);
+        hold.wait().await;
+        return response;
+    }
     if response.extensions().get::<LateBody>().is_none() {
         return response;
     }
@@ -523,7 +532,9 @@ where
         request: axum::http::Request<axum::body::Body>,
         next: axum::middleware::Next,
     ) -> axum::response::Response {
-        use crate::api::handlers::form_post::{form_post_bucket, handle_form_post_upload};
+        use crate::api::handlers::form_post::{
+            form_post_bucket, handle_form_post_upload, is_multipart_post,
+        };
         use axum::response::IntoResponse;
 
         // THE form-POST predicate, shared with the SigV4 deferral: `POST
@@ -532,6 +543,16 @@ where
         // (`?delete`, CreateMultipartUpload, `//bucket`) goes to s3s.
         let Some(bucket) = form_post_bucket(request.method(), request.uri(), request.headers())
         else {
+            // Any other multipart/form-data POST would reach s3s, which
+            // buffers its file in memory before it refuses it.
+            if is_multipart_post(request.method(), request.headers()) {
+                return crate::api::S3Error::InvalidRequest(
+                    "A multipart/form-data POST is served only as a browser form upload: \
+                     POST /<bucket> with no query string and no Authorization header"
+                        .into(),
+                )
+                .into_response();
+            }
             return next.run(request).await;
         };
 
@@ -541,13 +562,9 @@ where
             .get::<crate::iam::SharedIamState>()
             .cloned();
 
-        // Pull the rate limiter + client IP so a failed form-POST signature
-        // feeds the brute-force lockout, under the form-POST key of the
-        // address (`rate_limiter::FORM_POST_KEY`; the SigV4 middleware checks
-        // that lockout before it defers form-POSTs to this handler). WITHOUT
-        // this the form-POST endpoint would be the one auth surface with no
-        // rate limiting. Extracted here (before the body is consumed) because
-        // `into_parts` moves the extensions.
+        // A failed form-POST signature feeds the brute-force lockout, under
+        // the form-POST key of the address (`rate_limiter::FORM_POST_KEY`).
+        // Taken before `into_parts` moves the extensions.
         let rate_limiter = request
             .extensions()
             .get::<crate::rate_limiter::RateLimiter>()
@@ -600,6 +617,14 @@ where
                     }
                 }
                 if matches!(s3_err, crate::api::S3Error::SignatureDoesNotMatch) {
+                    // A locked-out address answers a failed signature only.
+                    if let Some(left) = parts
+                        .extensions
+                        .get::<crate::api::auth::LockedOut>()
+                        .map(|l| l.0)
+                    {
+                        return crate::api::auth::lockout_response(left);
+                    }
                     if let (Some(rl), Some(ip)) = (&rate_limiter, &peer_ip) {
                         let ip = crate::rate_limiter::extract_client_ip_with_peer(
                             &parts.headers,
@@ -627,6 +652,18 @@ where
     // the `/` path slot — `.route("/", head(...))` returns 405 for
     // GET `/` (ListBuckets) because axum matches path first, then
     // checks method without falling through to the s3s fallback.
+    /// Run the rest of the request for its principal, so that the spool counts
+    /// its reads against the principal's share (`DGP_SPOOL_READ_SHARE_PERCENT`).
+    async fn principal_spool_scope(
+        request: axum::http::Request<axum::body::Body>,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        let principal = crate::iam::principal_id(
+            crate::iam::request_principal(request.extensions()).map(|u| u.as_ref()),
+        );
+        crate::deltaglider::spool::as_principal(&principal, next.run(request)).await
+    }
+
     async fn intercept_head_root(
         request: axum::http::Request<axum::body::Body>,
         next: axum::middleware::Next,
@@ -664,8 +701,14 @@ where
         .layer(middleware::from_fn(
             crate::maintenance::gate::maintenance_gate_middleware,
         ))
+        // After SigV4 set the principal: its READ spool reservations count against its share.
+        .layer(middleware::from_fn(principal_spool_scope))
         .layer(middleware::from_fn(sigv4_auth_middleware))
         .layer(middleware::from_fn(crate::admission::admission_middleware))
+        // Before admission and authorization see the text: an over-long key or prefix.
+        .layer(middleware::from_fn(
+            crate::api::input_limits::input_limits_middleware,
+        ))
         // Outside admission and SigV4: reads the body of a refused signed request.
         .layer(middleware::from_fn(crate::api::drain::drain_after_refusal))
         .layer(axum::Extension(iam_state.clone()))

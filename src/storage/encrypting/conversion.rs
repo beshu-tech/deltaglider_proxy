@@ -615,6 +615,12 @@ pub enum ConversionOp {
     /// the close of an apply that makes the bucket stop encrypting, sent
     /// to the engine that encrypted it (`run: None`: any run).
     CloseAsBuilt { run: Option<RunId> },
+    /// Does the node's own record say that this proxy encrypted the bucket? The boot
+    /// opens no window of its own for such a bucket.
+    Encrypts,
+    /// The proxy saw proof that it encrypts the bucket (`why`): write the
+    /// record. Answered with `Encrypts(Ok(true))`.
+    NoteEncrypts { why: &'static str },
 }
 
 /// The stored marker of a bucket, as this proxy reads it.
@@ -639,6 +645,9 @@ pub enum ConversionReply {
     Status(MarkerState),
     Opened(OpenOutcome),
     Changed(ByIdentity),
+    /// The answer to [`ConversionOp::Encrypts`]: the record's answer, or
+    /// why it could not answer (read it as "unknown", never as "no").
+    Encrypts(Result<bool, String>),
 }
 
 // ── Metrics ──

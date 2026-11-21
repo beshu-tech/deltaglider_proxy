@@ -101,7 +101,10 @@ async fn put_as(
         Path::Buffered => match multipart_etag {
             None => h.engine.store(bucket, key, data, ct, user_meta()).await,
             Some(e) => {
-                let lock = h.engine.lock_object_write(bucket, key).await;
+                let lock = h
+                    .engine
+                    .lock_object_write(bucket, key, crate::types::WriteOrigin::Client)
+                    .await;
                 h.engine
                     .store_with_multipart_etag(
                         &lock,
@@ -120,7 +123,9 @@ async fn put_as(
             tokio::fs::write(spool.path(), data).await.unwrap();
             h.engine
                 .store_spooled_delta(
-                    &h.engine.lock_object_write(bucket, key).await,
+                    &h.engine
+                        .lock_object_write(bucket, key, crate::types::WriteOrigin::Client)
+                        .await,
                     bucket,
                     key,
                     &spool,
@@ -647,7 +652,10 @@ async fn relayed_parts_of_a_delta_candidate_are_stored_as_a_delta() {
         parts.push(RelayPart::of_file(&path));
     }
     let mpe = "\"0123456789abcdef0123456789abcdef-3\"".to_string();
-    let lock = h.engine.lock_object_write("b", "rel/b.zip").await;
+    let lock = h
+        .engine
+        .lock_object_write("b", "rel/b.zip", crate::types::WriteOrigin::Client)
+        .await;
     let stored = h
         .engine
         .store_relayed_parts_delta_with_multipart_etag(
@@ -687,7 +695,10 @@ async fn relayed_parts_stored_whole_say_why() {
         ("img/a.jpg", true, "not-delta-eligible"),
         ("rel/over.zip", false, "multipart-over-delta-cap"),
     ] {
-        let lock = h.engine.lock_object_write("b", key).await;
+        let lock = h
+            .engine
+            .lock_object_write("b", key, crate::types::WriteOrigin::Client)
+            .await;
         let size = body.len() as u64;
         let ct = Some("application/zip".to_string());
         if via_delta_store {
@@ -756,7 +767,9 @@ async fn a_join_the_spool_cannot_hold_is_stored_whole() {
     let dir = tempfile::tempdir().unwrap();
     let parts = relay(&dir, &body, 1 << 20);
     let mpe = "\"0123456789abcdef0123456789abcdef-3\"".to_string();
-    let lock = engine.lock_object_write("b", "rel/b.zip").await;
+    let lock = engine
+        .lock_object_write("b", "rel/b.zip", crate::types::WriteOrigin::Client)
+        .await;
     let noted = lock.commit_flag();
     let stored = async {
         engine
@@ -805,7 +818,10 @@ async fn a_tampered_relay_part_fails_the_store_and_nothing_is_stored() {
         swapped[0] ^= 0xFF;
         std::fs::write(&parts[1].path, &swapped).unwrap();
         let mpe = "\"0123456789abcdef0123456789abcdef-3\"".to_string();
-        let lock = h.engine.lock_object_write("b", key).await;
+        let lock = h
+            .engine
+            .lock_object_write("b", key, crate::types::WriteOrigin::Client)
+            .await;
         let size = body.len() as u64;
         let err = if delta {
             h.engine

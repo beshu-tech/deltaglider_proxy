@@ -1265,6 +1265,7 @@ dependencies = [
  "proptest",
  "rand 0.8.7",
  "rcgen",
+ "regex-automata",
  "regex-lite",
  "reqwest",
  "ring",

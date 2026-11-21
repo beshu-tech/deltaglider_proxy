@@ -216,6 +216,8 @@ pub struct ExplicitLimits {
     pub per_upload: Option<u64>,
     /// `DGP_MAX_TOTAL_MULTIPART_BYTES`.
     pub total_multipart: Option<u64>,
+    /// `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT`; `None` = the default.
+    pub multipart_principal_share_percent: Option<u8>,
     pub max_object_size: BytesOrAuto,
     /// A configured backend is an S3 backend. An object above one PUT
     /// request (5 GiB, [`S3_SINGLE_PUT_MAX_BYTES`]) is stored as a backend
@@ -341,7 +343,8 @@ pub enum ObjectSizeBound {
     Explicit,
     /// The per-upload limit of the spool.
     PerUpload,
-    /// The total of all open multipart uploads.
+    /// What one principal can hold of the total of all open multipart
+    /// uploads (the larger of its share and the rest, 75 % by default).
     TotalMultipart,
     /// The largest object of S3: 5 TiB.
     S3ObjectMax,
@@ -357,7 +360,9 @@ impl ObjectSizeBound {
         match self {
             Self::Explicit => "set by max_object_size",
             Self::PerUpload => "auto: the per-upload limit",
-            Self::TotalMultipart => "auto: the total multipart limit",
+            Self::TotalMultipart => {
+                "auto: what one principal can hold of the total multipart limit"
+            }
             Self::S3ObjectMax => "auto: 5 TiB, the largest object that S3 stores",
             Self::S3ObjectMaxEncrypted => {
                 "auto: the largest object whose encrypted form fits the 5 TiB of one S3 object"
@@ -447,7 +452,8 @@ pub fn default_total_multipart(spool_budget: u64) -> u64 {
 /// - a percent: that share of the same space, whole MiB, at least 1 GiB.
 ///
 /// The per-upload limit and the total of the multipart uploads are half of
-/// the budget; `max_object_size: auto` is the per-upload limit.
+/// the budget; `max_object_size: auto` is the lower of the per-upload limit
+/// and what one principal can hold of the total (75 % with the default share).
 pub fn derive_limits(
     facts: DiskFacts,
     explicit: ExplicitLimits,
@@ -522,8 +528,16 @@ pub fn derive_limits(
     // limit a PutObject). `None`: no multipart bound.
     let multipart_bound = {
         let per = (per_upload != 0).then_some((per_upload, ObjectSizeBound::PerUpload));
-        let total =
-            (total_multipart != 0).then_some((total_multipart, ObjectSizeBound::TotalMultipart));
+        // One upload belongs to one principal: it reaches what one principal
+        // alone can hold of the total, not the whole total.
+        let reach = crate::multipart::byte_shares(
+            total_multipart,
+            explicit
+                .multipart_principal_share_percent
+                .unwrap_or(crate::config::tuning::DEFAULT_MULTIPART_PRINCIPAL_SHARE_PERCENT),
+        )
+        .lone_reach();
+        let total = (total_multipart != 0).then_some((reach, ObjectSizeBound::TotalMultipart));
         match (per, total) {
             (Some(p), Some(t)) => Some(if t.0 < p.0 { t } else { p }),
             (p, t) => p.or(t),
@@ -683,7 +697,8 @@ impl LimitWarning {
             } => {
                 let (setting, fix) = match bound {
                     ObjectSizeBound::TotalMultipart => (
-                        "DGP_MAX_TOTAL_MULTIPART_BYTES",
+                        "DGP_MAX_TOTAL_MULTIPART_BYTES, as far as one principal can reach: \
+                         the larger of its DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT and the rest",
                         "Raise DGP_MAX_TOTAL_MULTIPART_BYTES (or DGP_SPOOL_MAX_BYTES)",
                     ),
                     _ => (
@@ -1139,6 +1154,17 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// What one principal reaches of a multipart total with the default share.
+    fn reach(total: u64) -> u64 {
+        total / 4 * 3
+    }
+
+    /// An auto `max_object_size` with the defaults: what one principal
+    /// reaches of the default multipart total (37.5 % of the budget).
+    fn reserve(budget: u64) -> u64 {
+        reach(default_total_multipart(budget))
+    }
+
     fn facts(free: u64) -> DiskFacts {
         DiskFacts {
             free,
@@ -1191,7 +1217,7 @@ mod tests {
         assert_eq!(l.spool_budget, 30 * GIB);
         assert_eq!(l.per_upload, 15 * GIB);
         assert_eq!(l.total_multipart, 15 * GIB);
-        assert_eq!(l.max_object_size, 15 * GIB);
+        assert_eq!(l.max_object_size, reserve(30 * GIB));
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(l.spool_source, Source::Auto);
 
@@ -1256,7 +1282,7 @@ mod tests {
         let (l, _) = derive_limits(facts(100 * GIB), ex);
         assert_eq!(l.spool_budget, 512 * MIB);
         assert_eq!(l.per_upload, 256 * MIB);
-        assert_eq!(l.max_object_size, 256 * MIB);
+        assert_eq!(l.max_object_size, reserve(512 * MIB));
 
         // Explicit per-upload, total and max_object_size win.
         let ex = ExplicitLimits {
@@ -1282,7 +1308,7 @@ mod tests {
         };
         let (l, _) = derive_limits(facts(60 * GIB), ex);
         assert_eq!(l.per_upload, 0);
-        assert_eq!(l.max_object_size, 15 * GIB);
+        assert_eq!(l.max_object_size, reserve(30 * GIB));
     }
 
     #[test]
@@ -1337,7 +1363,7 @@ mod tests {
         assert_eq!(w.len(), 1, "{w:?}");
         let m = w[0].message(dir);
         assert!(
-            m.contains("DGP_MAX_TOTAL_MULTIPART_BYTES") && m.contains("5 GiB"),
+            m.contains("DGP_MAX_TOTAL_MULTIPART_BYTES") && m.contains("3.8 GiB"),
             "{m}"
         );
         // Explicit against explicit: the per-upload limit is the lower one.
@@ -1356,10 +1382,16 @@ mod tests {
         // Exactly the limit is fine, and a zero (no cap) is no limit.
         let ex = ExplicitLimits {
             spool: SpoolSetting::Bytes(10 * GIB),
-            max_object_size: BytesOrAuto::Bytes(5 * GIB),
+            max_object_size: BytesOrAuto::Bytes(reach(5 * GIB)),
             ..auto()
         };
         assert!(derive_limits(facts(100 * GIB), ex).1.is_empty());
+        // One byte more than one principal reaches of the 5 GiB total warns.
+        let over = ExplicitLimits {
+            max_object_size: BytesOrAuto::Bytes(reach(5 * GIB) + 1),
+            ..ex
+        };
+        assert_eq!(derive_limits(facts(100 * GIB), over).1.len(), 1);
         let ex = ExplicitLimits {
             spool: SpoolSetting::Bytes(10 * GIB),
             per_upload: Some(0),
@@ -1407,27 +1439,27 @@ mod tests {
         };
         // 5 GiB is no cap: the spool decides.
         let (l, _) = derive_limits(facts(60 * GIB), s3);
-        assert_eq!(l.max_object_size, 15 * GIB);
-        assert_eq!(l.max_object_size_bound, ObjectSizeBound::PerUpload);
+        assert_eq!(l.max_object_size, reserve(30 * GIB));
+        assert_eq!(l.max_object_size_bound, ObjectSizeBound::TotalMultipart);
         // A spool above S3's object maximum is capped at it.
         let (l, _) = derive_limits(facts(40 * S3_OBJECT_MAX_BYTES), s3);
         assert_eq!(l.max_object_size, S3_OBJECT_MAX_BYTES);
         assert_eq!(l.max_object_size_bound, ObjectSizeBound::S3ObjectMax);
         let (l, _) = derive_limits(facts(40 * S3_OBJECT_MAX_BYTES), auto());
-        assert_eq!(l.max_object_size, 10 * S3_OBJECT_MAX_BYTES);
+        assert_eq!(l.max_object_size, reserve(20 * S3_OBJECT_MAX_BYTES));
         let (l, _) = derive_limits(facts(60 * GIB), auto());
-        assert_eq!(l.max_object_size, 15 * GIB);
-        assert_eq!(l.max_object_size_bound, ObjectSizeBound::PerUpload);
+        assert_eq!(l.max_object_size, reserve(30 * GIB));
+        assert_eq!(l.max_object_size_bound, ObjectSizeBound::TotalMultipart);
         // Below 5 GiB the budget decides, S3 or not.
         let (l, _) = derive_limits(facts(4 * GIB), s3);
-        assert_eq!(l.max_object_size, GIB);
+        assert_eq!(l.max_object_size, reserve(2 * GIB));
         // An explicit total below the per-upload limit.
         let ex = ExplicitLimits {
             total_multipart: Some(2 * GIB),
             ..auto()
         };
         let (l, _) = derive_limits(facts(60 * GIB), ex);
-        assert_eq!(l.max_object_size, 2 * GIB);
+        assert_eq!(l.max_object_size, reach(2 * GIB));
         assert_eq!(l.max_object_size_bound, ObjectSizeBound::TotalMultipart);
         // An explicit per-upload limit below the total.
         let ex = ExplicitLimits {
@@ -1443,7 +1475,7 @@ mod tests {
         };
         assert_eq!(
             derive_limits(facts(60 * GIB), ex).0.max_object_size,
-            15 * GIB
+            default_per_upload(30 * GIB)
         );
         // The delta ceiling is a third of the budget.
         assert_eq!(
@@ -1504,7 +1536,7 @@ mod tests {
         );
         // A spool below it decides, as for a plain bucket.
         let (l, _) = derive_limits(facts(60 * GIB), ex);
-        assert_eq!(l.max_object_size, 15 * GIB);
+        assert_eq!(l.max_object_size, reserve(30 * GIB));
         // Without S3, or without encryption, the plain bound applies.
         let ex = ExplicitLimits {
             s3_proxy_encrypted: true,
@@ -1512,7 +1544,7 @@ mod tests {
         };
         assert_eq!(
             derive_limits(facts(60 * GIB), ex).0.max_object_size,
-            15 * GIB
+            reserve(30 * GIB)
         );
         let ex = ExplicitLimits {
             s3_backend: true,
@@ -1520,7 +1552,7 @@ mod tests {
         };
         assert_eq!(
             derive_limits(facts(60 * GIB), ex).0.max_object_size,
-            15 * GIB
+            reserve(30 * GIB)
         );
         // An explicit value is unchanged.
         let ex = ExplicitLimits {
@@ -1729,7 +1761,7 @@ mod tests {
             let (l, w) = derive_limits(f, ex);
             assert!(w.is_empty(), "{tmp}: {w:?}");
             assert_eq!(l.spool_budget, tmp / 4 * 3);
-            assert_eq!(l.max_object_size, l.spool_budget / 2);
+            assert_eq!(l.max_object_size, reserve(l.spool_budget));
         }
     }
 
@@ -1752,7 +1784,7 @@ mod tests {
         assert!(c.tuning.limits.is_none());
 
         c.resolve_limits_from(Some(boot.clone()), &env);
-        assert_eq!(c.max_object_size_bytes(), 15 * GIB);
+        assert_eq!(c.max_object_size_bytes(), reserve(30 * GIB));
         let budget = c.tuning.limits.as_ref().unwrap().effective.spool_budget;
         assert_eq!(budget, 30 * GIB);
 
@@ -1769,7 +1801,7 @@ mod tests {
         c.resolve_limits_from(Some(boot), &|n: &str| {
             (n == "DGP_MAX_OBJECT_SIZE").then(|| "auto".to_string())
         });
-        assert_eq!(c.max_object_size_bytes(), 15 * GIB);
+        assert_eq!(c.max_object_size_bytes(), reserve(30 * GIB));
         assert_eq!(
             c.tuning.limits.as_ref().unwrap().env_set,
             vec!["DGP_MAX_OBJECT_SIZE"]
@@ -1807,7 +1839,7 @@ mod tests {
             "spool budget 23 GiB",
             "50% of 46 GiB free on /tmp/dgp-spool",
             "per-upload limit 11.5 GiB",
-            "max_object_size auto = 11.5 GiB",
+            "max_object_size auto = 8.6 GiB",
         ] {
             assert!(line.contains(needle), "{needle} in {line}");
         }
@@ -1854,6 +1886,7 @@ mod tests {
                         spool,
                         per_upload,
                         total_multipart,
+                        multipart_principal_share_percent: None,
                         max_object_size,
                         s3_backend,
                         s3_proxy_encrypted: false,
@@ -1886,7 +1919,10 @@ mod tests {
             prop_assert!(l.per_upload <= l.spool_budget / 2);
             prop_assert!(l.total_multipart <= l.spool_budget / 2);
             prop_assert!(l.max_object_size <= l.spool_budget / 2);
-            prop_assert_eq!(l.max_object_size, l.per_upload);
+            prop_assert_eq!(
+                l.max_object_size,
+                l.per_upload.min(reach(l.total_multipart))
+            );
             // The shared-device share is never above the plain share.
             let mut g = f;
             g.shares_device_with_data = false;
@@ -1912,7 +1948,10 @@ mod tests {
         fn the_multipart_limit_warning_is_exact(f in arb_facts(), ex in arb_explicit()) {
             let (l, w) = derive_limits(f, ex);
             let has = w.iter().any(|x| matches!(x, LimitWarning::ObjectSizeAboveMultipartLimit { .. }));
-            let lowest = [l.per_upload, l.total_multipart].into_iter().filter(|n| *n != 0).min();
+            let lowest = [l.per_upload, reach(l.total_multipart)]
+                .into_iter()
+                .filter(|n| *n != 0)
+                .min();
             let expect = matches!(ex.max_object_size, BytesOrAuto::Bytes(_))
                 && lowest.is_some_and(|m| l.max_object_size > m);
             prop_assert_eq!(has, expect);

@@ -94,6 +94,387 @@ pub async fn scoped_in<F: std::future::Future>(scope: Option<Arc<str>>, fut: F) 
     }
 }
 
+/// Who pays for the reads of a task ([`as_principal`], [`as_background`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payer {
+    /// A client: its reads count against its share of the budget.
+    Principal(Arc<str>),
+    /// A background job (replication, lifecycle, maintenance, the CLI): not
+    /// a client, so no share. Only those roots enter this scope.
+    Background,
+}
+
+tokio::task_local! {
+    /// The payer that the task runs for.
+    static SPOOL_PAYER: Payer;
+}
+
+/// Run `fut` for `principal`: the response streams it opens on a spool file,
+/// and the fills that make them, count against that principal's share of the
+/// budget (`SpoolDir::charge_stream`, `SpoolDir::charge_fill`). The S3 router
+/// and the bulk session middleware run every request in the scope of its
+/// principal (the anonymous principal counts as one, and so does open
+/// access).
+pub async fn as_principal<F: std::future::Future>(principal: &str, fut: F) -> F::Output {
+    SPOOL_PAYER
+        .scope(Payer::Principal(Arc::from(principal)), fut)
+        .await
+}
+
+/// Run `fut` as a background job: its reads are not charged to any share.
+/// ONLY the roots of background work enter this scope. A read outside every
+/// scope is refused (`SpoolDir::charge_stream`), so a new door that forgets
+/// its scope fails loudly instead of reading for free.
+pub async fn as_background<F: std::future::Future>(fut: F) -> F::Output {
+    SPOOL_PAYER.scope(Payer::Background, fut).await
+}
+
+/// The payer that the caller runs for, if any. A task that outlives its
+/// request (`tokio::spawn`, a response body) does not inherit it: capture it
+/// here and run the task through [`as_payer`].
+pub fn current_payer() -> Option<Payer> {
+    SPOOL_PAYER.try_with(Payer::clone).ok()
+}
+
+/// [`as_principal`] / [`as_background`] for a payer captured with
+/// [`current_payer`] (`None`: no scope, as before).
+pub async fn as_payer<F: std::future::Future>(payer: Option<Payer>, fut: F) -> F::Output {
+    match payer {
+        Some(payer) => SPOOL_PAYER.scope(payer, fut).await,
+        None => fut.await,
+    }
+}
+
+/// What a spawned task needs to read like its parent: the payer and the
+/// backend scope ([`scoped`]).
+#[derive(Debug, Clone, Default)]
+pub struct SpoolContext {
+    payer: Option<Payer>,
+    backend: Option<Arc<str>>,
+}
+
+/// The context of the caller, for a task that it spawns.
+pub fn capture_context() -> SpoolContext {
+    SpoolContext {
+        payer: current_payer(),
+        backend: current_scope(),
+    }
+}
+
+/// Run `fut` in a captured context.
+pub async fn in_context<F: std::future::Future>(ctx: SpoolContext, fut: F) -> F::Output {
+    scoped_in(ctx.backend, as_payer(ctx.payer, fut)).await
+}
+
+/// The error of a read that no scope covers (release builds; debug builds
+/// panic first).
+fn unscoped_read_error() -> std::io::Error {
+    std::io::Error::other(
+        "a large read ran outside every spool scope (no principal, not a background job)",
+    )
+}
+
+/// THE rule of who pays for a read: the payer of the task, `Ok(None)` for a
+/// background job. No scope at all is a bug of the caller: a panic in debug
+/// builds, a refusal in release builds.
+fn read_payer() -> std::io::Result<Option<Arc<str>>> {
+    match current_payer() {
+        Some(Payer::Principal(p)) => Ok(Some(p)),
+        Some(Payer::Background) => Ok(None),
+        None => {
+            if cfg!(debug_assertions) {
+                panic!("a large read ran outside every spool scope: enter as_principal or as_background");
+            }
+            tracing::error!("a large read ran outside every spool scope: refused");
+            Err(unscoped_read_error())
+        }
+    }
+}
+
+/// What each principal's live response streams hold of the spool, in MiB. A
+/// charge exists only while a stream reads a spool file: a file that waits in
+/// the range-spool cache is evictable and charges nobody.
+struct ReadLedger {
+    /// All reads together may hold this much (MiB), clause C aside.
+    cap_mib: usize,
+    shares: crate::budget_share::Shares,
+    state: parking_lot::Mutex<LedgerState>,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    /// The disk space of all live reads: each spool file counts ONCE, however
+    /// many principals stream it (the cap is about disk space).
+    total: usize,
+    by_principal: std::collections::HashMap<Arc<str>, Held>,
+    /// The files that are streamed now: their size and how many principals
+    /// stream each. `total` counts a file while it is here.
+    files: std::collections::HashMap<std::path::PathBuf, (usize, usize)>,
+}
+
+impl LedgerState {
+    /// Is `file` streamed by some principal now? Its size, if so.
+    fn on_disk(&self, file: &Path) -> Option<usize> {
+        self.files.get(file).map(|(mib, _)| *mib)
+    }
+
+    /// `principal` opens a stream on `file` of `mib`. The principal's own
+    /// count includes the file once, however many streams it opens on it; the
+    /// total includes it once, however many principals stream it.
+    fn add_stream(&mut self, principal: &Arc<str>, file: &Path, mib: usize) {
+        let refs = self
+            .by_principal
+            .entry(principal.clone())
+            .or_default()
+            .files
+            .entry(file.to_path_buf())
+            .or_insert(0);
+        *refs += 1;
+        if *refs > 1 {
+            return;
+        }
+        let entry = self.files.entry(file.to_path_buf()).or_insert((mib, 0));
+        let mib = entry.0;
+        entry.1 += 1;
+        if entry.1 == 1 {
+            self.total += mib;
+        }
+        self.by_principal
+            .get_mut(principal)
+            .expect("just inserted")
+            .mib += mib;
+    }
+
+    /// A stream of `principal` on `file` ended.
+    fn remove_stream(&mut self, principal: &Arc<str>, file: &Path) {
+        let Some(held) = self.by_principal.get_mut(principal) else {
+            return;
+        };
+        let Some(refs) = held.files.get_mut(file) else {
+            return;
+        };
+        *refs -= 1;
+        if *refs > 0 {
+            return;
+        }
+        held.files.remove(file);
+        let Some((mib, holders)) = self.files.get_mut(file) else {
+            return;
+        };
+        let freed = *mib;
+        *holders -= 1;
+        if *holders == 0 {
+            self.files.remove(file);
+            self.total -= freed;
+        }
+        held.mib -= freed;
+        if held.mib == 0 {
+            self.by_principal.remove(principal);
+        }
+    }
+}
+
+/// One principal's holdings: the files its live streams read. Streams of one
+/// principal on one file charge it once (the file is on disk once).
+#[derive(Default)]
+struct Held {
+    /// What the live streams and the pending fills hold together.
+    mib: usize,
+    /// Of `mib`: the reservations of fills that run now ([`FillCharge`]).
+    pending: usize,
+    /// The streams of this principal on each file.
+    files: std::collections::HashMap<std::path::PathBuf, usize>,
+}
+
+/// RAII: a principal's PENDING charge for a fill that runs now (the output
+/// and delta reservation of a large delta decode, or the file of a
+/// reference object). It counts like a stream from the moment the fill is
+/// admitted, so a flood of fills is refused before any of them reserves or
+/// decodes. `FillCharge::into_stream` replaces it by the stream charge of
+/// the finished file: one charge, never two. Dropping it (a failed or
+/// cancelled fill) releases it.
+#[must_use = "the charge ends when this is dropped"]
+pub struct FillCharge {
+    ledger: Arc<ReadLedger>,
+    principal: Arc<str>,
+    mib: usize,
+    /// The fill was admitted by clause C only (one huge read on an idle
+    /// ledger): what it adds to itself ([`Self::extend`]) is admitted too.
+    clause_c: bool,
+}
+
+/// RAII: a principal's charge for one live response stream of a spool file,
+/// released when the stream drops.
+#[must_use = "the charge ends when this is dropped"]
+pub struct StreamCharge {
+    ledger: Arc<ReadLedger>,
+    principal: Arc<str>,
+    file: std::path::PathBuf,
+}
+
+impl ReadLedger {
+    /// Pure: is a read of `mib` admitted for a principal that holds `own`
+    /// when all hold `total`? `new_in_total` is what the read adds to the
+    /// total: `mib`, or 0 for a file that another principal streams already
+    /// (no new disk space). The shares work inside the read cap, so reads in
+    /// total stay within it; one read on an idle ledger (clause C) may pass it.
+    fn admits(&self, own: usize, total: usize, mib: usize, new_in_total: usize) -> bool {
+        (own == 0 && total == 0) || self.admits_by_rule(own, total, mib, new_in_total)
+    }
+
+    /// [`Self::admits`] without clause C: the clauses A and B, inside the cap.
+    fn admits_by_rule(&self, own: usize, total: usize, mib: usize, new_in_total: usize) -> bool {
+        let total_after = total.saturating_add(new_in_total);
+        total_after <= self.cap_mib
+            && (own.saturating_add(mib) as u64 <= self.shares.own_cap()
+                || total_after as u64 <= self.shares.shared_cap())
+    }
+
+    /// Charge `principal` for a stream of `file` that holds `mib`.
+    /// `None`: refused ([`crate::budget_share`] clauses A, B, C).
+    fn try_charge(
+        self: &Arc<Self>,
+        principal: Arc<str>,
+        file: &Path,
+        mib: usize,
+    ) -> Option<StreamCharge> {
+        let mut state = self.state.lock();
+        let (own, known) = state
+            .by_principal
+            .get(&principal)
+            .map_or((0, false), |h| (h.mib, h.files.contains_key(file)));
+        // A principal already reading this file pays nothing more for it.
+        if !known {
+            // A file on disk already has its size, and adds nothing to the total.
+            let on_disk = state.on_disk(file);
+            if !self.admits(
+                own,
+                state.total,
+                on_disk.unwrap_or(mib),
+                if on_disk.is_some() { 0 } else { mib },
+            ) {
+                return None;
+            }
+        }
+        state.add_stream(&principal, file, mib);
+        Some(StreamCharge {
+            ledger: self.clone(),
+            principal,
+            file: file.to_path_buf(),
+        })
+    }
+}
+
+impl ReadLedger {
+    /// Charge `principal` `mib` for a fill that is about to reserve it.
+    /// `None`: refused, by the same rule as a stream.
+    fn try_pending(self: &Arc<Self>, principal: Arc<str>, mib: usize) -> Option<FillCharge> {
+        let mut state = self.state.lock();
+        let own = state.by_principal.get(&principal).map_or(0, |h| h.mib);
+        let clause_c = !self.admits_by_rule(own, state.total, mib, mib);
+        if clause_c && !self.admits(own, state.total, mib, mib) {
+            return None;
+        }
+        let held = state.by_principal.entry(principal.clone()).or_default();
+        held.mib += mib;
+        held.pending += mib;
+        state.total += mib;
+        Some(FillCharge {
+            ledger: self.clone(),
+            principal,
+            mib,
+            clause_c,
+        })
+    }
+
+    /// Give back `mib` of a pending charge (the caller holds the lock).
+    fn release_pending(state: &mut LedgerState, principal: &Arc<str>, mib: usize) {
+        let Some(held) = state.by_principal.get_mut(principal) else {
+            return;
+        };
+        held.pending -= mib;
+        held.mib -= mib;
+        if held.mib == 0 {
+            state.by_principal.remove(principal);
+        }
+        state.total -= mib;
+    }
+}
+
+impl FillCharge {
+    /// A second charge of the same principal for another part of the same
+    /// fill (the reference copy, whose size is known only after the fill
+    /// was admitted). The same rule admits it, and a fill that clause C
+    /// admitted may grow beyond the cap, as the one huge read may.
+    /// `None`: refused.
+    pub(crate) fn extend(&self, mib: usize) -> Option<FillCharge> {
+        let mut state = self.ledger.state.lock();
+        let own = state.by_principal.get(&self.principal).map_or(0, |h| h.mib);
+        if !self.clause_c && !self.ledger.admits_by_rule(own, state.total, mib, mib) {
+            return None;
+        }
+        let held = state
+            .by_principal
+            .entry(self.principal.clone())
+            .or_default();
+        held.mib += mib;
+        held.pending += mib;
+        state.total += mib;
+        Some(FillCharge {
+            ledger: self.ledger.clone(),
+            principal: self.principal.clone(),
+            mib,
+            clause_c: self.clause_c,
+        })
+    }
+
+    /// The fill is done: in one step, release this charge and charge the
+    /// principal for the stream of `file` (`mib`, at most what this charge
+    /// held, so no admission is asked again).
+    pub(crate) fn into_stream(mut self, file: &Path, mib: usize) -> StreamCharge {
+        let mut state = self.ledger.state.lock();
+        let pending = std::mem::take(&mut self.mib);
+        // The stream first, so the principal's entry is never dropped between.
+        state.add_stream(&self.principal, file, mib);
+        Self::drop_pending(&mut state, &self.principal, pending);
+        StreamCharge {
+            ledger: self.ledger.clone(),
+            principal: self.principal.clone(),
+            file: file.to_path_buf(),
+        }
+    }
+
+    fn drop_pending(state: &mut LedgerState, principal: &Arc<str>, mib: usize) {
+        ReadLedger::release_pending(state, principal, mib);
+    }
+}
+
+impl Drop for FillCharge {
+    fn drop(&mut self) {
+        if self.mib > 0 {
+            let mut state = self.ledger.state.lock();
+            ReadLedger::release_pending(&mut state, &self.principal, self.mib);
+        }
+    }
+}
+
+impl Drop for StreamCharge {
+    fn drop(&mut self) {
+        let mut state = self.ledger.state.lock();
+        state.remove_stream(&self.principal, &self.file);
+    }
+}
+
+/// The refusal of a read that the share rule does not admit.
+fn refused_read_error() -> std::io::Error {
+    std::io::Error::new(
+        CONTENDED,
+        "this principal's downloads already hold its share of the spool budget \
+         and the other principals use the rest (DGP_SPOOL_READ_SHARE_PERCENT, \
+         DGP_SPOOL_READ_MAX_PERCENT); retry shortly",
+    )
+}
+
 /// A byte-budget-gated pool of temp spool bytes.
 #[derive(Clone)]
 pub struct SpoolDir {
@@ -108,6 +489,11 @@ pub struct SpoolDir {
     share_mib: usize,
     /// The share budgets, one per backend scope.
     shares: Arc<parking_lot::Mutex<std::collections::HashMap<Arc<str>, Arc<Budget>>>>,
+    /// What each principal's live response streams hold ([`as_principal`]).
+    reads: Arc<ReadLedger>,
+    /// `DGP_SPOOL_READ_SHARE_PERCENT` and `DGP_SPOOL_READ_MAX_PERCENT`, which
+    /// make `reads`.
+    read_percents: (u8, u8),
     /// Holders of optional spool files (the range-read reconstruction
     /// cache) that give budget back when an acquire finds it short.
     evictors: Arc<parking_lot::Mutex<Vec<std::sync::Weak<dyn SpoolEvictor>>>>,
@@ -179,6 +565,14 @@ impl SpoolDir {
             "DGP_BACKEND_SHARE_PERCENT",
             crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,
         );
+        let read_share: u8 = crate::config::env_parse_with_default(
+            "DGP_SPOOL_READ_SHARE_PERCENT",
+            crate::config::tuning::DEFAULT_SPOOL_READ_SHARE_PERCENT,
+        );
+        let read_max: u8 = crate::config::env_parse_with_default(
+            "DGP_SPOOL_READ_MAX_PERCENT",
+            crate::config::tuning::DEFAULT_SPOOL_READ_MAX_PERCENT,
+        );
         Self::build(
             dir,
             setting,
@@ -187,6 +581,10 @@ impl SpoolDir {
             data_roots,
             &crate::config::process_env,
         )
+        .map(|pool| {
+            pool.with_read_share(read_share.clamp(1, 100))
+                .with_read_max(read_max.clamp(1, 100))
+        })
     }
 
     /// [`Self::from_env`] with its inputs given: create and sweep the
@@ -296,6 +694,15 @@ impl SpoolDir {
                 crate::config::tuning::DEFAULT_BACKEND_SHARE_PERCENT,
             ),
             shares: Default::default(),
+            reads: new_read_ledger(
+                max_mib,
+                crate::config::tuning::DEFAULT_SPOOL_READ_SHARE_PERCENT,
+                crate::config::tuning::DEFAULT_SPOOL_READ_MAX_PERCENT,
+            ),
+            read_percents: (
+                crate::config::tuning::DEFAULT_SPOOL_READ_SHARE_PERCENT,
+                crate::config::tuning::DEFAULT_SPOOL_READ_MAX_PERCENT,
+            ),
             evictors: Default::default(),
             gate: Default::default(),
         })
@@ -351,6 +758,87 @@ impl SpoolDir {
     pub fn with_backend_share(mut self, percent: u8) -> Self {
         self.share_mib = backend_share_mib(self.budget.max, percent);
         self
+    }
+
+    /// Let the live response streams of one principal ([`as_principal`],
+    /// `Self::charge_stream`) hold `percent` of the budget on their own, and
+    /// more while all streams together hold at most the rest
+    /// ([`crate::budget_share`]). One user's large GETs held the whole budget,
+    /// and every other tenant's large write waited for it. 100 turns it off.
+    pub fn with_read_share(mut self, percent: u8) -> Self {
+        self.read_percents.0 = percent;
+        self.reads = new_read_ledger(self.budget.max, percent, self.read_percents.1);
+        self
+    }
+
+    /// Let all live response streams together hold at most `percent` of the
+    /// budget (clause C aside), so writes always keep the rest. The shares
+    /// of the principals work inside this cap. 100 turns the cap off.
+    pub fn with_read_max(mut self, percent: u8) -> Self {
+        self.read_percents.1 = percent;
+        self.reads = new_read_ledger(self.budget.max, self.read_percents.0, percent);
+        self
+    }
+
+    /// Charge the principal of the current scope ([`as_principal`]) for a
+    /// live response stream of `file`, for as long as the returned charge
+    /// lives. `Ok(None)`: a background job, or shares and read cap off.
+    /// A caller in no scope at all panics (debug) or is refused (release).
+    /// [`CONTENDED`] when the stream is refused: the principal holds its
+    /// share and the other principals use more than the rest.
+    pub(crate) fn charge_stream(&self, file: &Spool) -> std::io::Result<Option<StreamCharge>> {
+        let Some(principal) = read_payer()? else {
+            return Ok(None);
+        };
+        if self.read_percents == (100, 100) {
+            return Ok(None);
+        }
+        self.reads
+            .try_charge(principal, file.path(), file.reserved_mib())
+            .map(Some)
+            .ok_or_else(refused_read_error)
+    }
+
+    /// Charge the principal of the current scope for a fill that will reserve
+    /// `mib` of spool (a large delta decode, a reference object): asked BEFORE
+    /// the fill reserves, downloads or decodes anything. `Ok(None)`: no
+    /// principal or no charge. [`CONTENDED`] when the principal is over its
+    /// reach.
+    pub(crate) fn charge_fill(&self, mib: usize) -> std::io::Result<Option<FillCharge>> {
+        let Some(principal) = read_payer()? else {
+            return Ok(None);
+        };
+        if self.read_percents == (100, 100) {
+            return Ok(None);
+        }
+        self.reads
+            .try_pending(principal, mib)
+            .map(Some)
+            .ok_or_else(refused_read_error)
+    }
+
+    /// [`FillCharge::extend`] of the fill that `parent` charges: `Ok(None)`
+    /// when the fill is not charged (no principal, or no read charge).
+    pub(crate) fn extend_fill(
+        &self,
+        parent: Option<&FillCharge>,
+        mib: usize,
+    ) -> std::io::Result<Option<FillCharge>> {
+        match parent {
+            None => Ok(None),
+            Some(fill) => fill.extend(mib).map(Some).ok_or_else(refused_read_error),
+        }
+    }
+
+    /// What `principal`'s live streams hold now, in MiB, and what all
+    /// principals hold. For the tests.
+    #[cfg(test)]
+    pub(crate) fn read_held(&self, principal: &str) -> (usize, usize) {
+        let state = self.reads.state.lock();
+        (
+            state.by_principal.get(principal).map_or(0, |h| h.mib),
+            state.total,
+        )
     }
 
     /// The share budget of the current backend scope; `None` outside a
@@ -478,7 +966,7 @@ impl SpoolDir {
     async fn reserve_within(&self, bytes: u64, held_mib: usize) -> std::io::Result<BudgetPermit> {
         if held_mib == 0 {
             let want = self.want_mib(bytes, 0);
-            // The backend's share first: a request over its backend's share
+            // The backend's share: a request over its backend's share
             // waits for that backend's own spool, and never queues for the
             // whole budget ahead of the other backends' requests.
             let share = match self.scope_share() {
@@ -866,49 +1354,81 @@ impl Spool {
 /// held spool, a held reservation, or the parts of an upload, never from a
 /// bare number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeldSpool(usize);
+pub struct HeldSpool {
+    mib: usize,
+    /// The bytes that the response stream sends: all of them (`u64::MAX`) or
+    /// the length of a range, which is less than the file the stream holds.
+    send_bytes: u64,
+}
 
 impl HeldSpool {
     /// The op holds nothing: a new write.
-    pub const NOTHING: HeldSpool = HeldSpool(0);
+    pub const NOTHING: HeldSpool = HeldSpool::mib_of(0);
+
+    const fn mib_of(mib: usize) -> Self {
+        Self {
+            mib,
+            send_bytes: u64::MAX,
+        }
+    }
 
     pub(crate) fn of(spool: &Spool) -> Self {
-        Self(spool.reserved_mib())
+        Self::mib_of(spool.reserved_mib())
     }
 
     pub fn of_reservation(r: &SpoolReservation) -> Self {
-        Self(r.reserved_mib())
+        Self::mib_of(r.reserved_mib())
     }
 
     /// The budget of every item the op holds (the relay parts of an upload).
     pub fn of_all<'a>(held: impl IntoIterator<Item = &'a SpoolReservation>) -> Self {
-        Self(held.into_iter().map(SpoolReservation::reserved_mib).sum())
+        Self::mib_of(held.into_iter().map(SpoolReservation::reserved_mib).sum())
     }
 
     /// The budget the relay parts of an upload hold (one reservation each,
     /// whole MiB per part); an upload with no parts holds nothing.
     pub(crate) fn of_relay_parts(sizes: impl IntoIterator<Item = u64>) -> Self {
-        Self(sizes.into_iter().map(mib_ceil).sum())
+        Self::mib_of(sizes.into_iter().map(mib_ceil).sum())
     }
 
+    /// This hold, for a stream that sends `bytes` of the file (a range).
+    pub(crate) fn sending(self, bytes: u64) -> Self {
+        Self {
+            send_bytes: bytes,
+            ..self
+        }
+    }
+
+    /// The bytes the stream sends; `u64::MAX` when it sends the whole hold.
+    pub fn send_bytes(self) -> u64 {
+        self.send_bytes
+    }
+
+    #[cfg(test)]
     /// The budget of a stream that holds a spool file of `bytes`, rounded up
     /// to whole MiB; no bytes is `NOTHING`.
     pub(crate) fn of_stream_bytes(bytes: u64) -> Self {
-        Self(mib_ceil(bytes))
+        Self::mib_of(mib_ceil(bytes))
     }
 
     /// This budget, at least 1 MiB (a stream holds a file even when empty).
     pub(crate) fn at_least_one_mib(self) -> Self {
-        Self(self.0.max(1))
+        Self {
+            mib: self.mib.max(1),
+            ..self
+        }
     }
 
     /// This and `other` together.
     pub(crate) fn plus(self, other: HeldSpool) -> Self {
-        Self(self.0 + other.0)
+        Self {
+            mib: self.mib + other.mib,
+            send_bytes: self.send_bytes.max(other.send_bytes),
+        }
     }
 
     pub fn mib(self) -> usize {
-        self.0
+        self.mib
     }
 }
 
@@ -933,6 +1453,17 @@ pub enum SpoolFillError<E> {
     /// The stream is longer than `cap`: the source changed after its size
     /// was read.
     Overrun { cap: u64, written: u64 },
+}
+
+/// The ledger of a budget of `max_mib` with each principal's read share at
+/// `percent`.
+fn new_read_ledger(max_mib: usize, percent: u8, max_percent: u8) -> Arc<ReadLedger> {
+    let cap_mib = (max_mib.saturating_mul(usize::from(max_percent.clamp(1, 100))) / 100).max(1);
+    Arc::new(ReadLedger {
+        cap_mib,
+        shares: crate::budget_share::Shares::new(cap_mib as u64, percent, 1),
+        state: Default::default(),
+    })
 }
 
 /// Pure: one backend's share of a `max_mib` budget at `percent` (at least
@@ -2039,5 +2570,584 @@ mod budget_model_tests {
         ) {
             run(max, ops);
         }
+    }
+}
+#[cfg(test)]
+mod read_share_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::path::PathBuf;
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn ledger(cap_mib: usize, percent: u8) -> Arc<ReadLedger> {
+        new_read_ledger(cap_mib, percent, 100)
+    }
+
+    fn file(i: usize) -> PathBuf {
+        PathBuf::from(format!("/spool/file-{i}"))
+    }
+
+    fn name(p: usize) -> Arc<str> {
+        ["dana", "ci-uploader", "backup-bot", "$anonymous"][p].into()
+    }
+
+    /// What `principal` holds, in MiB (each file it streams once).
+    fn read_held_of(l: &ReadLedger, principal: &Arc<str>) -> usize {
+        l.state
+            .lock()
+            .by_principal
+            .get(principal)
+            .map_or(0, |h| h.mib)
+    }
+
+    #[test]
+    fn one_principal_alone_reaches_three_quarters_and_the_others_keep_their_share() {
+        let l = ledger(100, 25);
+        let mut mallory = Vec::new();
+        for i in 0..5 {
+            mallory.push(l.try_charge(name(0), &file(i), 15).expect("within 75"));
+        }
+        assert!(l.try_charge(name(0), &file(5), 1).is_none(), "76 > 75");
+        // Every other principal still has its own 25.
+        let bot = l.try_charge(name(2), &file(10), 25).expect("its own share");
+        assert!(
+            l.try_charge(name(2), &file(11), 1).is_none(),
+            "past 25 and the rest"
+        );
+        // The abuser gives back a file: the budget is full while the bot holds
+        // its share, and the abuser may take one again when the bot is gone.
+        drop(mallory.pop());
+        assert!(
+            l.try_charge(name(0), &file(5), 15).is_none(),
+            "all use is 85"
+        );
+        drop(bot);
+        assert!(l.try_charge(name(0), &file(5), 15).is_some());
+    }
+
+    #[test]
+    fn a_single_read_larger_than_the_rest_runs_on_an_idle_budget() {
+        let l = ledger(100, 25);
+        let big = l.try_charge(name(0), &file(0), 90).expect("clause C");
+        // Nothing else of the same principal; another principal has its share.
+        assert!(l.try_charge(name(0), &file(1), 1).is_none());
+        let _other = l.try_charge(name(1), &file(2), 5).expect("its own share");
+        drop(big);
+        // A second big read needs the budget idle again.
+        let _again = l.try_charge(name(0), &file(0), 90);
+        assert!(
+            l.try_charge(name(1), &file(3), 90).is_none(),
+            "others hold space"
+        );
+    }
+
+    /// Streams of one principal on one file charge it once: the file is on
+    /// disk once (a parallel downloader reads one file with many ranges).
+    #[test]
+    fn streams_of_one_principal_on_one_file_charge_once() {
+        let l = ledger(100, 25);
+        let a = l.try_charge(name(0), &file(0), 70).unwrap();
+        let b = l
+            .try_charge(name(0), &file(0), 70)
+            .expect("same file, no new charge");
+        assert_eq!(l.state.lock().total, 70);
+        // Another principal reading the same file counts it for itself, but
+        // the file is on disk once: the total does not move.
+        let c = l.try_charge(name(1), &file(0), 70).unwrap();
+        assert_eq!(l.state.lock().total, 70);
+        assert_eq!(l.state.lock().by_principal[&name(1)].mib, 70);
+        drop(a);
+        assert_eq!(l.state.lock().total, 70, "one stream of dana is still open");
+        drop(b);
+        assert_eq!(
+            l.state.lock().total,
+            70,
+            "the other principal still reads it"
+        );
+        drop(c);
+        let state = l.state.lock();
+        assert_eq!(state.total, 0);
+        assert!(state.by_principal.is_empty(), "no entry stays at 0");
+    }
+
+    /// Two principals read one large file at the same time: the cap is about
+    /// disk space, and the file is on disk once.
+    #[test]
+    fn two_principals_can_read_one_large_file_at_once() {
+        // Budget 100 MiB, read cap 75, own share 18, rest 56.
+        let l = new_read_ledger(100, 25, 75);
+        let a = l.try_charge(name(0), &file(0), 50).expect("alone");
+        let b = l
+            .try_charge(name(1), &file(0), 50)
+            .expect("the file is on disk already: no new space");
+        assert_eq!(l.state.lock().total, 50);
+        // Each principal's own count still has the file (clause A).
+        assert_eq!(read_held_of(&l, &name(0)), 50);
+        assert_eq!(read_held_of(&l, &name(1)), 50);
+        // A different file still needs room: 50 + 50 > 75.
+        assert!(l.try_charge(name(2), &file(1), 50).is_none());
+        drop(a);
+        assert_eq!(l.state.lock().total, 50, "the second reader keeps it");
+        drop(b);
+        assert_eq!(l.state.lock().total, 0);
+        assert!(l.state.lock().by_principal.is_empty());
+    }
+
+    /// Reads in total stop at the read cap: two principals together never
+    /// pass it, and the rest of the budget stays for writes.
+    #[test]
+    fn reads_in_total_stop_at_the_read_cap() {
+        // Budget 100 MiB, reads capped at 75, each principal's share 25 % of that.
+        let l = new_read_ledger(100, 25, 75);
+        assert_eq!(l.cap_mib, 75);
+        let a = l
+            .try_charge(name(0), &file(0), 56)
+            .expect("alone: the larger of A and B");
+        assert!(
+            l.try_charge(name(0), &file(1), 1).is_none(),
+            "past its reach"
+        );
+        let b = l.try_charge(name(1), &file(2), 18).expect("its own share");
+        assert!(
+            l.try_charge(name(1), &file(3), 2).is_none(),
+            "total would pass 75"
+        );
+        assert_eq!(l.state.lock().total, 74);
+        drop((a, b));
+    }
+
+    #[test]
+    fn clause_c_passes_the_read_cap_only_on_an_idle_ledger() {
+        let l = new_read_ledger(100, 25, 75);
+        let big = l
+            .try_charge(name(0), &file(0), 90)
+            .expect("one big read, idle ledger");
+        assert!(
+            l.try_charge(name(1), &file(1), 1).is_none(),
+            "nobody joins it"
+        );
+        drop(big);
+        let small = l.try_charge(name(1), &file(1), 5).unwrap();
+        assert!(l.try_charge(name(0), &file(0), 90).is_none(), "not idle");
+        drop(small);
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Charge(usize, usize, usize),
+        Drop(usize),
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (0usize..3, 0usize..6, 1usize..30).prop_map(|(p, f, n)| Op::Charge(p, f, n)),
+            any::<usize>().prop_map(Op::Drop),
+        ]
+    }
+
+    proptest! {
+        /// Model: the ledger admits what `Shares::admits` says (a file already
+        /// read by the principal is free), its books equal the live charges,
+        /// and nothing is left when every charge is gone.
+        #[test]
+        fn the_ledger_follows_the_share_rule(
+            cap in 10usize..200, percent in 1u8..=99,
+            ops in proptest::collection::vec(op(), 0..80),
+        ) {
+            let l = ledger(cap, percent);
+            let shares = l.shares;
+            // (principal, file, mib, charge); the size of a file is the first one seen.
+            let mut live: Vec<(usize, usize, usize, StreamCharge)> = Vec::new();
+            let mut sizes: std::collections::HashMap<usize, usize> = Default::default();
+            for op in ops {
+                match op {
+                    Op::Charge(p, f, n) => {
+                        let known = live.iter().any(|(q, g, _, _)| *q == p && *g == f);
+                        let on_disk = live.iter().any(|(_, g, _, _)| *g == f);
+                        let own: usize = sizes_held(&live, p);
+                        let total: usize = live_total(&live);
+                        let mib = *sizes.entry(f).or_insert(n);
+                        let expect = known || l.admits(own, total, mib, if on_disk { 0 } else { mib });
+                        let _ = shares;
+                        let got = l.try_charge(name(p), &file(f), mib);
+                        prop_assert_eq!(got.is_some(), expect);
+                        if let Some(c) = got { live.push((p, f, mib, c)); }
+                    }
+                    Op::Drop(i) if !live.is_empty() => {
+                        let i = i % live.len();
+                        let (p, f, _, c) = live.swap_remove(i);
+                        drop(c);
+                        let _ = p;
+                        if !live.iter().any(|(_, g, _, _)| *g == f) {
+                            sizes.remove(&f);
+                        }
+                    }
+                    Op::Drop(_) => {}
+                }
+                prop_assert_eq!(l.state.lock().total, live_total(&live));
+                for p in 0..3 {
+                    let held = l.state.lock().by_principal.get(&name(p)).map_or(0, |h| h.mib);
+                    prop_assert_eq!(held, sizes_held(&live, p));
+                }
+            }
+            live.clear();
+            let state = l.state.lock();
+            prop_assert_eq!(state.total, 0);
+            prop_assert!(state.by_principal.is_empty());
+        }
+    }
+
+    proptest! {
+        /// N principals streaming one file charge the total once, and
+        /// releasing in any order returns the total to zero exactly once.
+        #[test]
+        fn many_principals_on_one_file_charge_the_total_once(
+            mib in 1usize..60,
+            readers in proptest::collection::vec((0usize..4, any::<u8>()), 1..12),
+            release in proptest::collection::vec(any::<usize>(), 0..12),
+        ) {
+            let l = new_read_ledger(1000, 25, 100);
+            let mut live: Vec<(usize, StreamCharge)> = Vec::new();
+            for (p, _) in &readers {
+                if let Some(c) = l.try_charge(name(*p), &file(0), mib) { live.push((*p, c)); }
+            }
+            prop_assert!(!live.is_empty());
+            prop_assert_eq!(l.state.lock().total, mib);
+            for p in 0..4 {
+                let reads = live.iter().any(|(q, _)| *q == p);
+                prop_assert_eq!(read_held_of(&l, &name(p)), if reads { mib } else { 0 });
+            }
+            for r in release {
+                if live.is_empty() { break; }
+                let (p, c) = live.swap_remove(r % live.len());
+                drop(c);
+                let any_left = !live.is_empty();
+                prop_assert_eq!(l.state.lock().total, if any_left { mib } else { 0 });
+                let own_left = live.iter().any(|(q, _)| *q == p);
+                prop_assert_eq!(read_held_of(&l, &name(p)), if own_left { mib } else { 0 });
+            }
+            live.clear();
+            let state = l.state.lock();
+            prop_assert_eq!(state.total, 0);
+            prop_assert!(state.by_principal.is_empty());
+        }
+    }
+
+    proptest! {
+        /// For any sequence of read admissions, the total read charge stays at
+        /// or below the read cap, except through clause C (an idle ledger).
+        #[test]
+        fn total_read_charge_stays_within_the_read_cap_except_through_clause_c(
+            budget in 20usize..200, share in 1u8..=100, max_percent in 10u8..=100,
+            ops in proptest::collection::vec(op(), 0..100),
+        ) {
+            let l = new_read_ledger(budget, share, max_percent);
+            let cap = l.cap_mib;
+            let mut live: Vec<StreamCharge> = Vec::new();
+            for op in ops {
+                match op {
+                    Op::Charge(p, f, n) => {
+                        let before = l.state.lock().total;
+                        if let Some(c) = l.try_charge(name(p), &file(f), n) {
+                            let total = l.state.lock().total;
+                            prop_assert!(total <= cap || before == 0 || total == before,
+                                "total {total} over cap {cap} with {before} held before");
+                            live.push(c);
+                        }
+                    }
+                    Op::Drop(i) if !live.is_empty() => {
+                        let i = i % live.len();
+                        drop(live.swap_remove(i));
+                    }
+                    Op::Drop(_) => {}
+                }
+            }
+        }
+    }
+
+    /// A fill counts as soon as it is admitted, and its stream charge replaces
+    /// it: one charge for the file, never two.
+    #[test]
+    fn a_pending_fill_counts_and_the_stream_charge_replaces_it() {
+        let l = new_read_ledger(100, 25, 75);
+        let fill = l.try_pending(name(0), 10).expect("admitted");
+        assert_eq!(l.state.lock().total, 10);
+        let stream = fill.into_stream(&file(0), 6);
+        {
+            let state = l.state.lock();
+            assert_eq!(state.total, 6, "the pending 10 became the stream's 6");
+            assert_eq!(state.by_principal[&name(0)].pending, 0);
+        }
+        // A second request of the same principal on the same file pays nothing.
+        let again = l.try_charge(name(0), &file(0), 6).unwrap();
+        assert_eq!(l.state.lock().total, 6);
+        drop((stream, again));
+        assert!(l.state.lock().by_principal.is_empty());
+        // A fill that fails or is cancelled releases its charge.
+        let fill = l.try_pending(name(1), 20).unwrap();
+        assert_eq!(l.state.lock().total, 20);
+        drop(fill);
+        assert_eq!(l.state.lock().total, 0);
+        assert!(l.state.lock().by_principal.is_empty());
+    }
+
+    #[test]
+    fn a_principal_over_its_reach_is_refused_by_its_fills() {
+        let l = new_read_ledger(100, 25, 75);
+        // Reach alone: 56 of a read cap of 75 (the rest, 75 % of it).
+        let a = l.try_pending(name(0), 30).unwrap();
+        let b = l.try_pending(name(0), 26).unwrap();
+        assert!(
+            l.try_pending(name(0), 1).is_none(),
+            "a flood of fills stops"
+        );
+        assert!(l.try_charge(name(0), &file(9), 1).is_none(), "streams too");
+        // Another principal has its own share.
+        assert!(l.try_pending(name(1), 18).is_some());
+        drop((a, b));
+    }
+
+    /// The reference copy of a fill is a second charge of the same fill: the
+    /// same rule admits it, so the reads in flight stay within the cap; only
+    /// a fill that clause C admitted (one huge read on an idle ledger) may grow
+    /// past it.
+    #[test]
+    fn a_fills_reference_copy_is_admitted_by_the_same_rule() {
+        let l = new_read_ledger(100, 25, 75);
+        // Reach alone is 56 of 75. A fill of 30 admitted by the rule may add
+        // 26, no more: 30 + 27 = 57 is over it.
+        let fill = l.try_pending(name(0), 30).unwrap();
+        assert!(!fill.clause_c);
+        assert!(fill.extend(27).is_none(), "over the reach");
+        let copy = fill.extend(26).expect("up to the reach");
+        assert_eq!(l.state.lock().total, 56);
+        drop(copy);
+        assert_eq!(l.state.lock().total, 30, "the copy ends with its file");
+        drop(fill);
+        // One huge fill on an idle ledger runs (clause C), with its reference.
+        let huge = l.try_pending(name(0), 90).expect("clause C");
+        assert!(huge.clause_c);
+        let copy = huge.extend(40).expect("a clause C fill may grow");
+        assert!(l.try_pending(name(1), 1).is_none(), "nobody joins it");
+        drop((huge, copy));
+        let state = l.state.lock();
+        assert_eq!(state.total, 0);
+        assert!(state.by_principal.is_empty());
+    }
+
+    #[derive(Debug, Clone)]
+    enum FillOp {
+        Fill(usize, usize),
+        Extend(usize, usize),
+        Finish(usize, usize),
+        Cancel(usize),
+        Charge(usize, usize, usize),
+        Drop(usize),
+    }
+
+    fn fill_op() -> impl Strategy<Value = FillOp> {
+        prop_oneof![
+            (0usize..3, 1usize..30).prop_map(|(p, n)| FillOp::Fill(p, n)),
+            (any::<usize>(), 1usize..30).prop_map(|(i, n)| FillOp::Extend(i, n)),
+            (any::<usize>(), 0usize..6).prop_map(|(i, f)| FillOp::Finish(i, f)),
+            any::<usize>().prop_map(FillOp::Cancel),
+            (0usize..3, 0usize..6, 1usize..30).prop_map(|(p, f, n)| FillOp::Charge(p, f, n)),
+            any::<usize>().prop_map(FillOp::Drop),
+        ]
+    }
+
+    proptest! {
+        /// With fills in the mix, the books stay equal to the live charges (a
+        /// pending fill counts its whole reservation, a finished one the stream),
+        /// reads in total stay within the cap except through clause C, and
+        /// nothing is left when every charge is gone.
+        #[test]
+        fn fills_and_streams_keep_the_books_and_the_cap(
+            budget in 20usize..200, share in 1u8..=100, max_percent in 10u8..=100,
+            ops in proptest::collection::vec(fill_op(), 0..100),
+        ) {
+            let l = new_read_ledger(budget, share, max_percent);
+            let mut fills: Vec<(usize, usize, FillCharge)> = Vec::new();
+            // The reference copies of fills: (principal, mib, charge).
+            let mut copies: Vec<(usize, usize, FillCharge)> = Vec::new();
+            let mut streams: Vec<(usize, usize, usize, StreamCharge)> = Vec::new();
+            let mut sizes: std::collections::HashMap<usize, usize> = Default::default();
+            for op in ops {
+                let before = l.state.lock().total;
+                match op {
+                    FillOp::Fill(p, n) => {
+                        if let Some(c) = l.try_pending(name(p), n) { fills.push((p, n, c)); }
+                    }
+                    FillOp::Extend(i, n) if !fills.is_empty() => {
+                        let i = i % fills.len();
+                        if let Some(c) = fills[i].2.extend(n) {
+                            copies.push((fills[i].0, n, c));
+                        }
+                    }
+                    FillOp::Finish(i, f) if !fills.is_empty() => {
+                        let (p, n, c) = fills.swap_remove(i % fills.len());
+                        // A finished fill makes a file of its own, at most its size.
+                        match (0..6).map(|k| (f + k) % 6).find(|g| !sizes.contains_key(g)) {
+                            Some(g) => {
+                                let mib = (n / 2).max(1);
+                                sizes.insert(g, mib);
+                                streams.push((p, g, mib, c.into_stream(&file(g), mib)));
+                            }
+                            None => drop(c),
+                        }
+                    }
+                    FillOp::Cancel(i) if !fills.is_empty() => {
+                        drop(fills.swap_remove(i % fills.len()));
+                    }
+                    FillOp::Charge(p, f, n) => {
+                        let mib = *sizes.entry(f).or_insert(n);
+                        if let Some(c) = l.try_charge(name(p), &file(f), mib) {
+                            streams.push((p, f, mib, c));
+                        }
+                    }
+                    FillOp::Drop(i) if !streams.is_empty() => {
+                        let (p, f, _, c) = streams.swap_remove(i % streams.len());
+                        drop(c);
+                        let _ = p;
+                        if !streams.iter().any(|(_, g, _, _)| *g == f) {
+                            sizes.remove(&f);
+                        }
+                    }
+                    _ => {}
+                }
+                let mut seen = std::collections::HashSet::new();
+                let stream_total: usize = streams
+                    .iter()
+                    .filter(|(_, f, _, _)| seen.insert(*f))
+                    .map(|(_, _, m, _)| m)
+                    .sum();
+                let pending: usize = fills.iter().map(|(_, n, _)| n).sum();
+                let copied: usize = copies.iter().map(|(_, n, _)| n).sum();
+                let total = l.state.lock().total;
+                prop_assert_eq!(total, stream_total + pending + copied);
+                let by_clause_c = fills.iter().any(|f| f.2.clause_c)
+                    || copies.iter().any(|c| c.2.clause_c);
+                prop_assert!(total <= l.cap_mib || before == 0 || total <= before || by_clause_c,
+                    "total {total} over cap {} (was {before})", l.cap_mib);
+                // A copy ends with its file, at any time.
+                if let Some(k) = copies.len().checked_sub(1).filter(|k| k % 3 == 0) {
+                    drop(copies.swap_remove(k));
+                }
+            }
+            drop(fills);
+            copies.clear();
+            streams.clear();
+            let state = l.state.lock();
+            prop_assert_eq!(state.total, 0);
+            prop_assert!(state.by_principal.is_empty());
+        }
+    }
+
+    /// What principal `p` holds: each file once.
+    fn sizes_held(live: &[(usize, usize, usize, StreamCharge)], p: usize) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        live.iter()
+            .filter(|(q, f, _, _)| *q == p && seen.insert(*f))
+            .map(|(_, _, m, _)| m)
+            .sum()
+    }
+
+    /// The disk space of the live files: each file once, whoever reads it.
+    fn live_total(live: &[(usize, usize, usize, StreamCharge)]) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        live.iter()
+            .filter(|(_, f, _, _)| seen.insert(*f))
+            .map(|(_, _, m, _)| m)
+            .sum()
+    }
+
+    /// A read in no scope at all is a bug of its door: a hard error in debug
+    /// builds. A background job enters its own scope and is not charged.
+    #[tokio::test]
+    #[should_panic(expected = "outside every spool scope")]
+    async fn a_read_outside_every_scope_panics_in_debug_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 100 * MIB).unwrap();
+        let a = pool.acquire(MIB).await.unwrap();
+        let _ = pool.charge_stream(&a);
+    }
+
+    #[tokio::test]
+    async fn a_background_job_is_in_a_scope_and_is_not_charged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 100 * MIB).unwrap();
+        let a = pool.acquire(40 * MIB).await.unwrap();
+        let charged = as_background(async { pool.charge_stream(&a) }).await;
+        assert!(charged.unwrap().is_none());
+        assert!(as_background(async { pool.charge_fill(40) })
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(pool.read_held("anyone"), (0, 0));
+        // The release-build answer of an unscoped read is a plain error.
+        assert_eq!(unscoped_read_error().kind(), std::io::ErrorKind::Other);
+    }
+
+    /// A spawned task reads like its parent when it enters a captured context.
+    #[tokio::test]
+    async fn a_captured_context_carries_the_payer_and_the_backend_into_a_task() {
+        let ctx = as_principal("dana", scoped("hetzner-fsn1", async { capture_context() })).await;
+        let seen = tokio::spawn(in_context(ctx, async {
+            (current_payer(), current_scope())
+        }))
+        .await
+        .unwrap();
+        assert_eq!(seen.0, Some(Payer::Principal("dana".into())));
+        assert_eq!(seen.1.as_deref(), Some("hetzner-fsn1"));
+        // No scope captured, none entered.
+        let none = tokio::spawn(in_context(SpoolContext::default(), async {
+            current_payer()
+        }))
+        .await
+        .unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[tokio::test]
+    async fn charge_stream_needs_a_principal_and_a_share_below_100() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 100 * MIB)
+            .unwrap()
+            .with_read_share(25);
+        let a = pool.acquire(40 * MIB).await.unwrap();
+        let b = pool.acquire(40 * MIB).await.unwrap();
+        // A background job: no charge.
+        assert!(as_background(async { pool.charge_stream(&a) })
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(pool.read_held("dana"), (0, 0));
+        // With a principal: charged for the life of the charge.
+        let held = as_principal("dana", async { pool.charge_stream(&a) })
+            .await
+            .unwrap()
+            .expect("charged");
+        assert_eq!(pool.read_held("dana"), (40, 40));
+        // 40 + 40 is above the 75 the principal reaches alone.
+        let err = as_principal("dana", async { pool.charge_stream(&b) })
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.kind(), CONTENDED);
+        drop(held);
+        assert_eq!(pool.read_held("dana"), (0, 0));
+        // A refused charge leaves nothing behind.
+        assert_eq!(pool.used_bytes(), 80 * MIB);
+        // A share of 100 and a read cap of 100 turn the charge off.
+        let open = SpoolDir::new(tmp.path().to_path_buf(), 100 * MIB)
+            .unwrap()
+            .with_read_share(100)
+            .with_read_max(100);
+        let c = open.acquire(40 * MIB).await.unwrap();
+        assert!(as_principal("dana", async { open.charge_stream(&c) })
+            .await
+            .unwrap()
+            .is_none());
     }
 }

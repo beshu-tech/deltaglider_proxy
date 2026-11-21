@@ -1246,7 +1246,11 @@ mod stamp_tests {
 
         // The writer: holds the engine's object write lock (its window),
         // object stored, change not recorded.
-        let writer = st.engine.load().lock_object_write("b", "d/first.txt").await;
+        let writer = st
+            .engine
+            .load()
+            .lock_object_write("b", "d/first.txt", crate::types::WriteOrigin::Client)
+            .await;
         test_support::put_raw(&endpoint, "d/first.txt", &[7u8; 12_000]).await;
 
         // The scan runs right then.
@@ -1284,7 +1288,9 @@ mod stamp_tests {
     async fn a_scan_that_ends_inside_a_write_is_repeated_until_it_stamps() {
         let (st, usage, fake, endpoint) = state_at(0).await;
         let engine = st.engine.load_full();
-        let writer = engine.lock_object_write("b", "d/first.txt").await;
+        let writer = engine
+            .lock_object_write("b", "d/first.txt", crate::types::WriteOrigin::Client)
+            .await;
         test_support::put_raw(&endpoint, "d/first.txt", &[7u8; 12_000]).await;
         let scan = {
             let st = st.clone();
@@ -1318,7 +1324,9 @@ mod stamp_tests {
     async fn the_repeats_of_a_scan_are_bounded() {
         let (st, usage, fake, _endpoint) = state_at(1).await;
         let engine = st.engine.load_full();
-        let _held = engine.lock_object_write("b", "d/never-ends.txt").await;
+        let _held = engine
+            .lock_object_write("b", "d/never-ends.txt", crate::types::WriteOrigin::Client)
+            .await;
         let before = test_support::scope_lists(&fake).len();
         UsageScanner::scan_and_publish(
             &st.usage_scanner,
@@ -1346,7 +1354,9 @@ mod stamp_tests {
     async fn the_first_snapshot_is_published_after_one_scan_and_the_slot_is_free() {
         let (st, _usage, fake, _endpoint) = state_at(1).await;
         let engine = st.engine.load_full();
-        let _held = engine.lock_object_write("b", "d/never-ends.txt").await;
+        let _held = engine
+            .lock_object_write("b", "d/never-ends.txt", crate::types::WriteOrigin::Client)
+            .await;
         let task = {
             let st = st.clone();
             tokio::spawn(async move {
@@ -1437,7 +1447,11 @@ mod stamp_tests {
             assert_eq!(row.object_count, 1, "{row:?}");
         }
         // The upload ends: the commit and the record land on the stamped row.
-        let lock = st.engine.load().lock_object_write("b", "d/late.txt").await;
+        let lock = st
+            .engine
+            .load()
+            .lock_object_write("b", "d/late.txt", crate::types::WriteOrigin::Client)
+            .await;
         test_support::put_raw(&endpoint, "d/late.txt", b"0123456789").await;
         let meta = st.engine.load().head("b", "d/late.txt").await.unwrap();
         usage.apply_net("b", None, Some(&meta), 0);

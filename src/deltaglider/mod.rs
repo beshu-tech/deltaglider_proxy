@@ -14,10 +14,11 @@ pub mod memory_budget;
 pub(crate) mod range_spool;
 pub mod savings;
 pub mod spool;
+pub mod stall_guard;
 
 pub use cache::ReferenceCache;
 pub use codec::{CodecError, DeltaCodec};
-pub use engine::conditional::{ConditionalError, ObjectWriteGuard, Precondition};
+pub use engine::conditional::{ConditionalError, ObjectWriteGuard, Precondition, WriteGate};
 pub use engine::store::{
     KnownSha256, MultipartObjectFacts, PassthroughMultipartHandle, ReferenceHeal, RelayPart,
     BLOCKING_HASH_THRESHOLD,
@@ -30,9 +31,9 @@ pub(crate) use engine::{
 pub(crate) use engine::{s3_engine, store_deltas};
 pub use engine::{
     ConditionalDelete, DeleteHooks, DeleteItem, DeleteOutcome, DeltaGliderEngine, DynEngine,
-    EngineError, ListObjectsPage, ListedPageForms, PostCommitDelete, RefWriteProof, ReferenceScan,
-    RetrieveResponse, Rewritten, StoredForms, Unconditional, BULK_DELETE_CONCURRENCY,
-    REFERENCE_SCAN_LIMIT,
+    EngineError, ListObjectsPage, ListedPageForms, PlaintextScan, PostCommitDelete, RefWriteProof,
+    ReferenceScan, RetrieveResponse, Rewritten, ScanScope, StoredForms, Unconditional,
+    BULK_DELETE_CONCURRENCY, REFERENCE_SCAN_LIMIT,
 };
 pub use file_router::{
     normalize_extension, CompressionStrategy, FileRouter, DEFAULT_DELTA_EXTENSIONS,

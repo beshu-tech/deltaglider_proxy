@@ -118,6 +118,16 @@ spec:
                     format: int32
                     nullable: true
                     type: integer
+                  trustClientForwardedFor:
+                    description: |-
+                      Keep the `X-Forwarded-For`, `Forwarded` and `X-Real-IP` headers that a
+                      client sent (default false: the router deletes them and is the only
+                      writer of the client address). Set it only when a layer-7 hop that you
+                      trust (an Ingress controller or a CDN of yours) sits in front of the
+                      router, sets the client address, and no client can reach the router
+                      without passing through it.
+                    nullable: true
+                    type: boolean
                   trustedProxyCidrs:
                     description: |-
                       Networks that the router pods connect from (the cluster pod network),

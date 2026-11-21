@@ -49,6 +49,7 @@ impl DeleteFailure {
         let key_unusable = matches!(
             e,
             EngineError::InvalidArgument(_)
+                | EngineError::KeyRefused(_)
                 | EngineError::Storage(StorageError::InvalidKey(_))
                 | EngineError::Storage(StorageError::MetadataTooLarge(_))
         );

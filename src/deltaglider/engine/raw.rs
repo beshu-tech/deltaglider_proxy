@@ -76,24 +76,25 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Write a delta blob + metadata verbatim into a deltaspace. Call it
     /// inside [`Self::with_dest_prefix_lock`]; outside it, multi-instance
-    /// refuses. `lock`: the key's write lock, taken BEFORE the deltaspace
-    /// lock. `prior`: what the key held, read before the write
+    /// refuses. `gate`: the key's write lock, taken BEFORE the deltaspace
+    /// lock, and the proof that the key passed the write gate.
+    /// `prior`: what the key held, read before the write
     /// ([`Self::fast_path_prior`]); `CounterPrior::Unknown` when the
     /// caller did not read it.
-    #[allow(clippy::too_many_arguments)]
     pub async fn put_delta_raw(
         &self,
         _ticket: &crate::transfer::CommitTicket,
-        lock: &super::conditional::ObjectWriteGuard,
-        bucket: &str,
-        prefix: &str,
-        filename: &str,
+        gate: &super::conditional::WriteGate<'_>,
         body: crate::storage::PutBody<'_>,
         metadata: &FileMetadata,
         prior: &CounterPrior,
     ) -> Result<(), StorageError> {
-        lock.covers(bucket, prefix, filename)
-            .map_err(engine_to_storage)?;
+        let (lock, bucket, prefix, filename) = (
+            gate.lock(),
+            gate.bucket(),
+            gate.deltaspace_id(),
+            gate.filename(),
+        );
         // Inside `with_dest_prefix_lock`: the delta is only valid against the
         // reference the held cross-instance lock protects.
         let held = self.held_reference_lock(bucket, prefix, "delta")?;
@@ -137,11 +138,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     pub async fn put_reference_raw(
         &self,
         _ticket: &crate::transfer::CommitTicket,
-        bucket: &str,
-        prefix: &str,
+        gate: &super::conditional::WriteGate<'_>,
         body: crate::storage::PutBody<'_>,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        let (bucket, prefix) = (gate.bucket(), gate.deltaspace_id());
         let held = self.held_reference_lock(bucket, prefix, "reference")?;
         let written = match body {
             crate::storage::PutBody::File { path, spool } => {
@@ -194,7 +195,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         source_head: &FileMetadata,
         start: u64,
         end: u64,
-    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), EngineError> {
+    ) -> Result<
+        (
+            BoxStream<'static, Result<Bytes, StorageError>>,
+            u64,
+            crate::deltaglider::spool::HeldSpool,
+        ),
+        EngineError,
+    > {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
         self.retrieve_range_spooled(bucket, &deltaspace_id, &obj_key, source_head, start, end)
             .await

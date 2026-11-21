@@ -526,7 +526,8 @@ fn run_cli_async<F: std::future::Future<Output = i32>>(fut: F) -> i32 {
         .enable_all()
         .build()
     {
-        Ok(rt) => rt.block_on(fut),
+        // A CLI command is a background job: its reads pay no share.
+        Ok(rt) => rt.block_on(deltaglider_proxy::deltaglider::spool::as_background(fut)),
         Err(e) => {
             eprintln!("error: failed to start tokio runtime: {e}");
             deltaglider_proxy::cli::config::EXIT_IO
@@ -878,6 +879,13 @@ async fn async_main(
     );
     // The node-local job state, in its own unsynced file next to the config DB.
     let jobs_db = init_jobs_db(&db_keys, &config_db, config_db_mismatch, &config);
+    // The node's record of the buckets it encrypted lives in the jobs DB.
+    if let Some(db) = jobs_db.as_ref() {
+        engine
+            .encryption_policies()
+            .encrypts_record()
+            .install(db.clone());
+    }
     // After the DB: its IAM users (declarative ones are reconciled into it
     // by now) are credentials. A DB this key cannot read may hold users too.
     validate_auth_config(
@@ -1057,6 +1065,7 @@ async fn async_main(
                 .mutate_and_apply("Orphaned migration staging routes removed", move |cfg| {
                     for k in &orphans_clone {
                         cfg.buckets.remove(k);
+                        cfg.env_refs.drop_templates_under(&format!("/buckets/{k}"));
                     }
                 })
                 .await
@@ -1079,6 +1088,14 @@ async fn async_main(
     // Shared by the admin API and the delete jobs (both drop the totals a
     // delete changes).
     let savings_cache = Arc::new(deltaglider_proxy::api::admin::SavingsCache::new());
+    // Admission chain (lock-free, hot-swappable): bucket public prefixes plus
+    // the operator's blocks. Shared with the delete jobs, which act as a
+    // user and meet the same per-resource rules.
+    let admission_chain: deltaglider_proxy::admission::SharedAdmissionChain =
+        deltaglider_proxy::admission::build_shared_chain_from_parts(
+            &config.buckets,
+            &config.admission_blocks,
+        );
     let mut maintenance_worker = None;
     if !config_db_mismatch {
         if let Some(db) = jobs_db.as_ref() {
@@ -1088,6 +1105,7 @@ async fn async_main(
                 deltaglider_proxy::maintenance::delete::DeleteDeps {
                     iam: iam_state.clone(),
                     savings: savings_cache.clone(),
+                    admission: admission_chain.clone(),
                 },
             ));
         }
@@ -1127,19 +1145,6 @@ async fn async_main(
         std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
             deltaglider_proxy::bucket_policy::PublicPrefixSnapshot::from_config(&config.buckets),
         )));
-
-    // --- Admission chain (lock-free, hot-swappable) ---
-    // Derived from bucket config + operator-authored admission blocks
-    // (Phase 3b.2.a schema surface). `build_shared_chain_from_parts`
-    // wraps the resulting chain in the same `Arc<ArcSwap<_>>` shape as
-    // the public-prefix snapshot so hot-reload sites reuse the swap
-    // pattern. Operator-authored blocks log a startup warn explaining
-    // they are inert until Phase 3b.2.b lands.
-    let admission_chain: deltaglider_proxy::admission::SharedAdmissionChain =
-        deltaglider_proxy::admission::build_shared_chain_from_parts(
-            &config.buckets,
-            &config.admission_blocks,
-        );
 
     // --- S3 router ---
     let app = deltaglider_proxy::api::s3_router::build_s3_router(
@@ -1238,6 +1243,7 @@ async fn async_main(
         &external_auth,
         &session_store,
         &coordination_check,
+        &jobs_db,
     )
     .await;
 
@@ -1323,7 +1329,8 @@ async fn async_main(
     startup::spawn_stale_temp_sweeps(&config);
 
     // --- Start server ---
-    let limits = deltaglider_proxy::serve::ListenerLimits::from_tuning(&config.tuning);
+    let limits = deltaglider_proxy::serve::ListenerLimits::from_tuning(&config.tuning)
+        .with_trusted_proxies(proxy_trust.cidrs.clone());
     if let Some(rustls_config) = rustls_config {
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();

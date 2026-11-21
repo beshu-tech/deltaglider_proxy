@@ -47,7 +47,12 @@ pub(crate) const NODE_LOCAL_TABLES: &[&str] = &[
 /// file after a downgrade. Tests read it: the table-shape check and the
 /// node-local SQL source guard.
 #[cfg(test)]
-pub(crate) const JOBS_ONLY_TABLES: &[&str] = &["lifecycle_scan_cache", "lifecycle_run_counts"];
+pub(crate) const JOBS_ONLY_TABLES: &[&str] = &[
+    "lifecycle_scan_cache",
+    "lifecycle_run_counts",
+    "encrypts_record",
+    "sync_floors",
+];
 
 /// Columns that only the jobs DB has on a node-local table (table, column,
 /// declaration): added at every open when missing, without a schema version
@@ -434,6 +439,16 @@ CREATE INDEX IF NOT EXISTS idx_event_outbox_delivered
     ON event_outbox (delivered_at, id) WHERE status = 'delivered';
 CREATE INDEX IF NOT EXISTS idx_event_outbox_failed
     ON event_outbox (occurred_at, id) WHERE status = 'failed';
+-- Facts about the storage that the proxy keeps outside it (`node_facts.rs`).
+CREATE TABLE IF NOT EXISTS encrypts_record (
+    identity TEXT PRIMARY KEY,
+    noted_at INTEGER NOT NULL,
+    why      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sync_floors (
+    target     TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL
+);
 -- A delete job does not hold its bucket: several deletes, and a delete next
 -- to a job that does, run on one bucket. The index of schema v1 counted
 -- every kind.

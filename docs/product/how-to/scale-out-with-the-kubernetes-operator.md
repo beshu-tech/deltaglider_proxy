@@ -167,11 +167,21 @@ already-running fleet keeps its current size. The operator also sets the phase t
 with the exact problems listed in `status.message` (`kubectl -n dgp describe dgp dgp`
 shows them). Fix the spec and it scales up on its own.
 
-The routers add an `X-Forwarded-For` header that names the client. The proxy reads that
-header only on a connection from a network in `spec.router.trustedProxyCidrs`, so set it
+The routers delete the `X-Forwarded-For`, `Forwarded` and `X-Real-IP` headers that a client
+sent, and then add an `X-Forwarded-For` header that names the address the router saw. The
+router is the only writer of that header, so a client cannot choose the address that the
+proxy records. This is correct when clients connect to the router directly. When a layer-7
+hop that you trust (an Ingress controller or a CDN that you run) sits in front of the router
+and already sets the client address, the router would otherwise replace that address with the
+address of the hop. In that case only, set `spec.router.trustClientForwardedFor: true`: the
+router keeps the headers that arrive and appends the address of its own peer. Never set it
+when any client can reach the router without passing through that hop, because such a client
+could then forge its address. The proxy reads the header
+only on a connection from a network in `spec.router.trustedProxyCidrs`, so set it
 to the pod network of your cluster (`10.42.0.0/16` is the k3s default). When you leave it
 out, the operator uses every private range, and then any pod in those ranges can name a
-client.
+client. With that default, the proxy also leaves every client in those ranges out of its
+per-address connection limit (`DGP_MAX_CONNECTIONS_PER_IP`).
 
 The operator creates the proxy pods (a StatefulSet with one persistent volume per
 pod), the HAProxy router pods, and a Service named `dgp` in front of the routers.
@@ -252,7 +262,10 @@ When you add `aes256-gcm-proxy` to `configYaml`, the operator restarts the pods 
 new file, and no config write runs. Each pod checks the buckets after it starts. The
 first pod that finds plaintext objects in a bucket that no proxy encrypted before opens
 the conversion window of the bucket and queues the re-encrypt job. A pod that starts
-later finds the open window and queues no job of its own. Clients read the plaintext
+later finds the open window and queues no job of its own. The record that a bucket was
+encrypted before is per pod, in the jobs database of the pod, and the pods do not share it:
+a new pod, or a pod with an empty data volume, decides from the scan of the whole bucket
+alone. Clients read the plaintext
 history of the bucket until the job converts it, and the job then closes the window
 ([A conversion that a restart starts](../reference/encryption.md#a-conversion-that-a-restart-starts)).
 

@@ -350,7 +350,7 @@ pub fn refusal(at: &Location<'_>, raw: &FileMetadata) -> StorageError {
 
 /// The words of the refusal of an unencrypted object ([`refusal`]), by
 /// which [`is_plaintext_refusal`] knows it.
-const PLAINTEXT_REFUSAL: &str = "is not encrypted, but the bucket encrypts";
+pub(crate) const PLAINTEXT_REFUSAL: &str = "is not encrypted, but the bucket encrypts";
 
 /// Is `e` the read rule's refusal of an unencrypted object in a bucket
 /// that encrypts (not a seal that fails to open)?

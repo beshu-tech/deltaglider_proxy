@@ -444,118 +444,127 @@ async fn a_conditional_get_opens_no_body_for_a_304() {
 /// range-spool cache reads only the delta's GET (its metadata).
 #[tokio::test]
 async fn a_large_delta_reads_its_delta_after_admission() {
-    for kind in KINDS {
-        let fx = fixture(kind).await;
-        let svc = svc_on(large_engine_on(&fx.backend));
-        fx.fake.clear();
-        let (body, _) = run_get(&svc, get("dir/v1.zip")).await;
-        assert_eq!(body, fx.versions[1], "{kind:?}");
-        let reqs = key_requests(&fx.fake);
-        assert_eq!(
-            reqs.iter()
-                .filter(|r| *r == "GET /b/dir/v1.zip.delta")
-                .count(),
-            2,
-            "{kind:?}: {reqs:?}"
-        );
-        fx.fake.clear();
-        let (body, _) = run_get(&svc, get("dir/v1.zip")).await;
-        assert_eq!(body, fx.versions[1], "{kind:?}");
-        assert_eq!(
-            key_requests(&fx.fake),
-            ["GET /b/dir/v1.zip.delta"],
-            "{kind:?}"
-        );
-    }
+    crate::deltaglider::spool::as_background(async {
+        for kind in KINDS {
+            let fx = fixture(kind).await;
+            let svc = svc_on(large_engine_on(&fx.backend));
+            fx.fake.clear();
+            let (body, _) = run_get(&svc, get("dir/v1.zip")).await;
+            assert_eq!(body, fx.versions[1], "{kind:?}");
+            let reqs = key_requests(&fx.fake);
+            assert_eq!(
+                reqs.iter()
+                    .filter(|r| *r == "GET /b/dir/v1.zip.delta")
+                    .count(),
+                2,
+                "{kind:?}: {reqs:?}"
+            );
+            fx.fake.clear();
+            let (body, _) = run_get(&svc, get("dir/v1.zip")).await;
+            assert_eq!(body, fx.versions[1], "{kind:?}");
+            assert_eq!(
+                key_requests(&fx.fake),
+                ["GET /b/dir/v1.zip.delta"],
+                "{kind:?}"
+            );
+        }
+    })
+    .await
 }
 
 /// A client that drops a large-delta body half-way leaks nothing: with ONE
 /// codec slot, the next decode still runs.
 #[tokio::test]
 async fn a_dropped_body_leaks_no_permit() {
-    use futures::StreamExt;
-    let fx = fixture(Kind::Plain).await;
-    let mut cfg = crate::config::Config::default();
-    cfg.tuning.spool_threshold_bytes = Some(1024);
-    cfg.codec_concurrency = Some(1);
-    cfg.range_spool_ttl_secs = 0;
-    let svc = svc_on(DeltaGliderEngine::new_with_backend(
-        fx.backend.clone(),
-        &cfg,
-        None,
-    ));
-    for _ in 0..3 {
-        for key in ["dir/v0.zip", "dir/v1.zip", "pics/a.jpg"] {
-            let resp = get_object(&svc, request(get(key))).await.unwrap();
-            let mut body = resp.output.body.unwrap();
-            body.next().await.unwrap().unwrap();
-            drop(body);
+    crate::deltaglider::spool::as_background(async {
+        use futures::StreamExt;
+        let fx = fixture(Kind::Plain).await;
+        let mut cfg = crate::config::Config::default();
+        cfg.tuning.spool_threshold_bytes = Some(1024);
+        cfg.codec_concurrency = Some(1);
+        cfg.range_spool_ttl_secs = 0;
+        let svc = svc_on(DeltaGliderEngine::new_with_backend(
+            fx.backend.clone(),
+            &cfg,
+            None,
+        ));
+        for _ in 0..3 {
+            for key in ["dir/v0.zip", "dir/v1.zip", "pics/a.jpg"] {
+                let resp = get_object(&svc, request(get(key))).await.unwrap();
+                let mut body = resp.output.body.unwrap();
+                body.next().await.unwrap().unwrap();
+                drop(body);
+            }
         }
-    }
-    let done = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        run_get(&svc, get("dir/v1.zip")),
-    )
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_get(&svc, get("dir/v1.zip")),
+        )
+        .await
+        .expect("a codec slot or spool budget leaked");
+        assert_eq!(done.0, fx.versions[1]);
+    })
     .await
-    .expect("a codec slot or spool budget leaked");
-    assert_eq!(done.0, fx.versions[1]);
 }
 
 /// Encrypting wrapper over the filesystem: the opened form decrypts, and
 /// its metadata (the raw stored one) maps as on HEAD.
 #[tokio::test]
 async fn encrypted_filesystem_reads_in_one_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let fs = crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
-        .await
-        .unwrap();
-    let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(
-        crate::storage::EncryptionConfig {
-            key: Some(crate::storage::EncryptionKey::from_hex(&"cd".repeat(32)).unwrap()),
-            key_id: Some("kid".into()),
-            ..Default::default()
-        },
-    )));
-    let backend: Backend = Arc::new(DynStorageBackend::new_box(
-        crate::storage::EncryptingBackend::new(fs, cfg),
-    ));
-    let writer = engine_on(&backend, None);
-    writer.create_bucket("b").await.unwrap();
-    let photo = rnd(300 * 1024, 3);
-    writer
-        .store("b", "pics/a.jpg", &photo, None, Default::default())
-        .await
-        .unwrap();
-    let base = rnd(64 * 1024, 11);
-    let mut v1 = base.clone();
-    v1[7] ^= 1;
-    for (k, d) in [("dir/v0.zip", &base), ("dir/v1.zip", &v1)] {
-        writer
-            .store("b", k, d, None, Default::default())
+    crate::deltaglider::spool::as_background(async {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
             .await
             .unwrap();
-    }
-    for threshold in [None, Some(1024)] {
-        let svc = svc_on(engine_on(&backend, threshold));
-        for (key, want) in [
-            ("pics/a.jpg", &photo),
-            ("dir/v1.zip", &v1),
-            ("dir/v0.zip", &base),
-        ] {
-            for _ in 0..2 {
-                let got = run_get(&svc, get(key)).await;
-                assert_eq!(&got.0, want, "{key} {threshold:?}");
-                assert_eq!(got, headed_answer(&backend, key).await, "{key}");
-            }
-            let size = want.len() as u64;
-            for (first, last) in [(1000, Some(1999)), (size - 10, None)] {
-                let (body, _, range) = run_range(&svc, ranged(key, first, last)).await.unwrap();
-                let end = last.unwrap_or(size - 1);
-                assert_eq!(body, want[first as usize..=end as usize], "{key} range");
-                assert_eq!(range, format!("bytes {first}-{end}/{size}"), "{key}");
+        let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            crate::storage::EncryptionConfig {
+                key: Some(crate::storage::EncryptionKey::from_hex(&"cd".repeat(32)).unwrap()),
+                key_id: Some("kid".into()),
+                ..Default::default()
+            },
+        )));
+        let backend: Backend = Arc::new(DynStorageBackend::new_box(
+            crate::storage::EncryptingBackend::new(fs, cfg),
+        ));
+        let writer = engine_on(&backend, None);
+        writer.create_bucket("b").await.unwrap();
+        let photo = rnd(300 * 1024, 3);
+        writer
+            .store("b", "pics/a.jpg", &photo, None, Default::default())
+            .await
+            .unwrap();
+        let base = rnd(64 * 1024, 11);
+        let mut v1 = base.clone();
+        v1[7] ^= 1;
+        for (k, d) in [("dir/v0.zip", &base), ("dir/v1.zip", &v1)] {
+            writer
+                .store("b", k, d, None, Default::default())
+                .await
+                .unwrap();
+        }
+        for threshold in [None, Some(1024)] {
+            let svc = svc_on(engine_on(&backend, threshold));
+            for (key, want) in [
+                ("pics/a.jpg", &photo),
+                ("dir/v1.zip", &v1),
+                ("dir/v0.zip", &base),
+            ] {
+                for _ in 0..2 {
+                    let got = run_get(&svc, get(key)).await;
+                    assert_eq!(&got.0, want, "{key} {threshold:?}");
+                    assert_eq!(got, headed_answer(&backend, key).await, "{key}");
+                }
+                let size = want.len() as u64;
+                for (first, last) in [(1000, Some(1999)), (size - 10, None)] {
+                    let (body, _, range) = run_range(&svc, ranged(key, first, last)).await.unwrap();
+                    let end = last.unwrap_or(size - 1);
+                    assert_eq!(body, want[first as usize..=end as usize], "{key} range");
+                    assert_eq!(range, format!("bytes {first}-{end}/{size}"), "{key}");
+                }
             }
         }
-    }
+    })
+    .await
 }
 
 /// THE rule: a GET's full read goes through `retrieve_stream_fresh`
@@ -606,31 +615,34 @@ async fn a_cold_routed_get_resolves_its_bucket_once() {
 /// (range-spool cache on) and the GET's own copy (cache off).
 #[tokio::test]
 async fn a_large_delta_downloads_its_reference_with_one_get() {
-    for kind in KINDS {
-        for shared in [true, false] {
-            let fx = fixture(kind).await;
-            let mut cfg = crate::config::Config::default();
-            cfg.tuning.spool_threshold_bytes = Some(1024);
-            if !shared {
-                cfg.range_spool_ttl_secs = 0;
+    crate::deltaglider::spool::as_background(async {
+        for kind in KINDS {
+            for shared in [true, false] {
+                let fx = fixture(kind).await;
+                let mut cfg = crate::config::Config::default();
+                cfg.tuning.spool_threshold_bytes = Some(1024);
+                if !shared {
+                    cfg.range_spool_ttl_secs = 0;
+                }
+                let engine = DeltaGliderEngine::new_with_backend(fx.backend.clone(), &cfg, None);
+                engine.head("b", "dir/v1.zip").await.unwrap();
+                fx.fake.clear();
+                let (data, _) = engine.retrieve("b", "dir/v1.zip").await.unwrap();
+                assert_eq!(data, fx.versions[1], "{kind:?} shared={shared}");
+                let reqs = object_requests(&fx.fake);
+                let reference: Vec<&String> = reqs
+                    .iter()
+                    .filter(|r| r.ends_with("/dir/reference.bin"))
+                    .collect();
+                assert_eq!(
+                    reference,
+                    ["GET /b/dir/reference.bin"],
+                    "{kind:?} shared={shared}: {reqs:?}"
+                );
             }
-            let engine = DeltaGliderEngine::new_with_backend(fx.backend.clone(), &cfg, None);
-            engine.head("b", "dir/v1.zip").await.unwrap();
-            fx.fake.clear();
-            let (data, _) = engine.retrieve("b", "dir/v1.zip").await.unwrap();
-            assert_eq!(data, fx.versions[1], "{kind:?} shared={shared}");
-            let reqs = object_requests(&fx.fake);
-            let reference: Vec<&String> = reqs
-                .iter()
-                .filter(|r| r.ends_with("/dir/reference.bin"))
-                .collect();
-            assert_eq!(
-                reference,
-                ["GET /b/dir/reference.bin"],
-                "{kind:?} shared={shared}: {reqs:?}"
-            );
         }
-    }
+    })
+    .await
 }
 
 /// The filesystem keeps its hardlink: the reference source is the file

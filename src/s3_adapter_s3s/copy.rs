@@ -19,6 +19,12 @@ pub(super) async fn copy_object(
         .map(|c| c.0);
     check_copy_source_access_s3s(
         svc.state.engine.load().bucket_policy_registry(),
+        admission_refusal(
+            &req.extensions,
+            crate::admission::Effect::Read,
+            &source_bucket,
+            &source_key,
+        ),
         auth_user.as_deref(),
         &source_bucket,
         &source_key,
@@ -281,23 +287,28 @@ pub(super) async fn read_copy_source(
     head_size: u64,
 ) -> s3s::S3Result<(crate::deltaglider::ingest::IngestedBody, FileMetadata)> {
     use crate::deltaglider::ingest::{ingest, Destination, IngestPlan};
-    let (stream, metadata) = if head_size <= engine.spool_threshold() {
+    let (stream, metadata, held_spool) = if head_size <= engine.spool_threshold() {
         // small: the HEAD size is at most the spool threshold.
         let (data, metadata) = engine.retrieve(bucket, key).await?;
         let one: BoxStream<'static, Result<bytes::Bytes, StorageError>> =
             futures::stream::iter([Ok(bytes::Bytes::from(data))]).boxed();
-        (one, metadata)
+        (one, metadata, crate::deltaglider::spool::HeldSpool::NOTHING)
     } else {
         match engine.retrieve_stream(bucket, key).await? {
             RetrieveResponse::Buffered { data, metadata, .. } => (
                 futures::stream::iter([Ok(bytes::Bytes::from(data))]).boxed(),
                 metadata,
+                crate::deltaglider::spool::HeldSpool::NOTHING,
             ),
             RetrieveResponse::Streamed {
-                stream, metadata, ..
-            } => (stream, metadata),
+                stream,
+                metadata,
+                held_spool,
+                ..
+            } => (stream, metadata, held_spool),
         }
     };
+    // The proxy's own ingest paces this read, not the client: no stall guard.
     let plan = IngestPlan {
         declared: head_size,
         limit: copy_size_limit(engine),
@@ -306,7 +317,7 @@ pub(super) async fn read_copy_source(
         // the stream holds: the ingest of the copy holds that budget, so
         // it never waits for more (a wait there could wait on itself, or
         // on another copy that waits on it).
-        held_spool: engine.stream_held_spool(&metadata),
+        held_spool,
         strict_length: true,
         destination: Destination::Object,
     };
@@ -344,6 +355,12 @@ pub(super) async fn upload_part_copy(
         .map(|c| c.0);
     check_copy_source_access_s3s(
         svc.state.engine.load().bucket_policy_registry(),
+        admission_refusal(
+            &req.extensions,
+            crate::admission::Effect::Read,
+            &source_bucket,
+            &source_key,
+        ),
         auth_user.as_deref(),
         &source_bucket,
         &source_key,
@@ -393,7 +410,9 @@ pub(super) async fn upload_part_copy(
         return Err(s3s::s3_error!(EntityTooLarge));
     }
     // The upload admits the part before a byte of the source is read.
+    let payer = crate::iam::principal_id(auth_user.as_deref());
     let admission = svc.state.multipart.admit_part(
+        &payer,
         &input.upload_id,
         &input.bucket,
         &input.key,
@@ -404,7 +423,7 @@ pub(super) async fn upload_part_copy(
         Some((start, end)) if source_meta.is_delta() => {
             // Every part of a delta source reads one verified
             // reconstruction (it rebuilt the whole object per part).
-            let (stream, len) = engine
+            let (stream, len, held) = engine
                 .delta_copy_range(
                     &source_bucket,
                     &source_key,
@@ -413,7 +432,7 @@ pub(super) async fn upload_part_copy(
                     end as u64,
                 )
                 .await?;
-            Some((stream, len))
+            Some((stream, len, held))
         }
         Some((start, end)) => engine
             .retrieve_stream_range(
@@ -424,39 +443,43 @@ pub(super) async fn upload_part_copy(
                 Some(&source_meta),
             )
             .await?
-            .map(|(stream, len, _)| (stream, len)),
+            .map(|(stream, len, _, held)| (stream, len, held)),
         None => None,
     };
-    let stream: BoxStream<'static, Result<bytes::Bytes, StorageError>> = match ranged {
-        Some((stream, content_length)) => {
-            if content_length != part_len {
-                return Err(s3s::s3_error!(
-                    InternalError,
-                    "copy source range is not the length announced"
-                ));
-            }
-            stream
-        }
-        None => {
-            // What `retrieve_stream_range` does not serve as a range: an
-            // empty source, a delta or reference object at most the spool
-            // threshold, or a source gone or rewritten since its HEAD (a
-            // retry judges the new object).
-            if source_meta.file_size > engine.spool_threshold() {
-                return Err(crate::api::S3Error::copy_source_changed().into());
-            }
-            // small: at most the spool threshold (see above).
-            let (data, _) = engine.retrieve(&source_bucket, &source_key).await?;
-            let part = match range {
-                Some((start, end)) if end < data.len() => {
-                    bytes::Bytes::copy_from_slice(&data[start..=end])
+    let (stream, source_held): (BoxStream<'static, Result<bytes::Bytes, StorageError>>, _) =
+        match ranged {
+            Some((stream, content_length, held)) => {
+                if content_length != part_len {
+                    return Err(s3s::s3_error!(
+                        InternalError,
+                        "copy source range is not the length announced"
+                    ));
                 }
-                Some(_) => return Err(crate::api::S3Error::copy_source_changed().into()),
-                None => bytes::Bytes::new(),
-            };
-            futures::stream::iter([Ok(part)]).boxed()
-        }
-    };
+                (stream, held)
+            }
+            None => {
+                // What `retrieve_stream_range` does not serve as a range: an
+                // empty source, a delta or reference object at most the spool
+                // threshold, or a source gone or rewritten since its HEAD (a
+                // retry judges the new object).
+                if source_meta.file_size > engine.spool_threshold() {
+                    return Err(crate::api::S3Error::copy_source_changed().into());
+                }
+                // small: at most the spool threshold (see above).
+                let (data, _) = engine.retrieve(&source_bucket, &source_key).await?;
+                let part = match range {
+                    Some((start, end)) if end < data.len() => {
+                        bytes::Bytes::copy_from_slice(&data[start..=end])
+                    }
+                    Some(_) => return Err(crate::api::S3Error::copy_source_changed().into()),
+                    None => bytes::Bytes::new(),
+                };
+                (
+                    futures::stream::iter([Ok(part)]).boxed(),
+                    crate::deltaglider::spool::HeldSpool::NOTHING,
+                )
+            }
+        };
     // The same ingest as an UploadPart body: into a spool file, hashed on
     // the way (no Content-MD5 or checksum: the source is the proxy's own).
     let plan = crate::deltaglider::ingest::IngestPlan {
@@ -468,7 +491,9 @@ pub(super) async fn upload_part_copy(
             None,
             false,
         ),
-        held_spool: admission.held_spool,
+        // The part's own reservation and the source file that the stream holds:
+        // the ingest never waits for more while it holds them (hold-and-wait).
+        held_spool: admission.held_spool.plus(source_held),
         strict_length: true,
         destination: crate::deltaglider::ingest::Destination::MultipartPart,
     };
@@ -524,6 +549,7 @@ pub(crate) fn copy_source_bucket_key(
 
 pub(super) fn check_copy_source_access_s3s(
     registry: &crate::bucket_policy::BucketPolicyRegistry,
+    refusal: Option<crate::admission::Refusal>,
     auth_user: Option<&AuthenticatedUser>,
     source_bucket: &str,
     source_key: &str,
@@ -534,6 +560,18 @@ pub(super) fn check_copy_source_access_s3s(
     // a copy names a second bucket, refused here for every identity.
     if let Some(reason) = registry.reserved_bucket_reason(source_bucket) {
         return Err(crate::api::errors::S3Error::AccessDeniedReason(reason).into());
+    }
+    // An admission rule refuses the source whoever reads it (open access too).
+    if let Some(refusal) = refusal {
+        crate::audit::audit_log(
+            "access_denied",
+            auth_user.map_or("anonymous", |u| u.name.as_str()),
+            "CopySourceRead",
+            headers,
+            source_bucket,
+            source_key,
+        );
+        return Err(refusal_error(&refusal));
     }
     let Some(user) = auth_user else {
         return Ok(());

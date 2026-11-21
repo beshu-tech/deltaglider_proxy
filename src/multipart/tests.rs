@@ -7,6 +7,12 @@ use bytes::Bytes;
 
 const MIB: u64 = 1024 * 1024;
 
+/// A store without shares: tests that are not about the shares have one
+/// principal, which may then use the whole cap.
+pub(super) fn unshared(max_object_size: u64) -> MultipartStore {
+    MultipartStore::new(max_object_size).with_principal_share(100)
+}
+
 /// `data` as an ingested part body in `store`'s spool, the way the ingest
 /// of an UploadPart makes one: a reservation that covers the file only,
 /// taken without waiting beside the `held` budget that the upload holds.
@@ -43,8 +49,36 @@ pub(super) fn put(
     part_number: u32,
     data: impl AsRef<[u8]>,
 ) -> Result<String, S3Error> {
+    put_by(
+        "test-owner",
+        store,
+        upload_id,
+        bucket,
+        key,
+        part_number,
+        data,
+    )
+}
+
+/// [`put`] by the principal `payer`, which need not own the upload.
+pub(super) fn put_by(
+    payer: &str,
+    store: &MultipartStore,
+    upload_id: &str,
+    bucket: &str,
+    key: &str,
+    part_number: u32,
+    data: impl AsRef<[u8]>,
+) -> Result<String, S3Error> {
     let data = data.as_ref();
-    let admission = store.admit_part(upload_id, bucket, key, part_number, data.len() as u64)?;
+    let admission = store.admit_part(
+        payer,
+        upload_id,
+        bucket,
+        key,
+        part_number,
+        data.len() as u64,
+    )?;
     let body = spooled(store, data, admission.held_spool)?;
     store.upload_part(upload_id, bucket, key, part_number, body, admission)
 }
@@ -64,7 +98,7 @@ fn parts_fixture() -> Vec<(u32, String)> {
 
 #[tokio::test]
 async fn completion_registry_owner_join_tombstone_lifecycle() {
-    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let store = std::sync::Arc::new(unshared(1024));
     let parts = parts_fixture();
     let up1 = store.create("b", "k", None, Default::default()).unwrap();
 
@@ -101,7 +135,7 @@ async fn completion_registry_owner_join_tombstone_lifecycle() {
 
 #[tokio::test]
 async fn completion_registry_failure_clears_slot_for_fresh_retry() {
-    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let store = std::sync::Arc::new(unshared(1024));
     let parts = parts_fixture();
     let up2 = store.create("b", "k", None, Default::default()).unwrap();
     let owner = match store.begin_complete(&up2, "b", "k", &parts).unwrap() {
@@ -119,7 +153,7 @@ async fn completion_registry_failure_clears_slot_for_fresh_retry() {
 /// A joined retry answers the owner's S3 error, not a 500 (s3surface-17).
 #[tokio::test]
 async fn completion_joiner_sees_the_owners_error() {
-    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let store = std::sync::Arc::new(unshared(1024));
     let parts = parts_fixture();
     let up4 = store.create("b", "k", None, Default::default()).unwrap();
     let owner = match store.begin_complete(&up4, "b", "k", &parts).unwrap() {
@@ -139,7 +173,7 @@ async fn completion_joiner_sees_the_owners_error() {
 
 #[tokio::test]
 async fn completion_publisher_drop_without_publish_unwedges_registry() {
-    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let store = std::sync::Arc::new(unshared(1024));
     let parts = parts_fixture();
     let up3 = store.create("b", "k", None, Default::default()).unwrap();
     let owner = match store.begin_complete(&up3, "b", "k", &parts).unwrap() {
@@ -167,7 +201,7 @@ async fn completion_publisher_drop_without_publish_unwedges_registry() {
 /// is NoSuchUpload, like the same request after the completion (`Done`).
 #[tokio::test]
 async fn joining_an_inflight_completion_checks_bucket_and_key() {
-    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let store = std::sync::Arc::new(unshared(1024));
     let parts = parts_fixture();
     let up5 = store.create("b", "k", None, Default::default()).unwrap();
     let _owner = match store.begin_complete(&up5, "b", "k", &parts).unwrap() {
@@ -195,7 +229,7 @@ async fn joining_an_inflight_completion_checks_bucket_and_key() {
 /// own bucket and key may own its completion.
 #[tokio::test]
 async fn only_the_uploads_own_key_may_own_its_completion() {
-    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let store = std::sync::Arc::new(unshared(1024));
     let parts = parts_fixture();
     let id = store.create("b", "k", None, Default::default()).unwrap();
     for (id, bucket, key) in [
@@ -286,7 +320,7 @@ proptest::proptest! {
     ) {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let _rt = rt.enter();
-        let store = std::sync::Arc::new(MultipartStore::new(1024));
+        let store = std::sync::Arc::new(unshared(1024));
         let part_lists = [parts_fixture(), vec![(1, "\"other\"".to_string())]];
         let names = [["b0", "b1"], ["k0", "k1"]];
         // The upload records: (bucket, key) of ids 0 and 1; id 2 is unknown.
@@ -387,7 +421,7 @@ fn completion_fingerprint_is_order_sensitive_and_content_sensitive() {
 
 #[test]
 fn test_create_and_upload_part() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -400,7 +434,7 @@ fn test_create_and_upload_part() {
 
 #[test]
 fn test_complete_roundtrip() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -424,7 +458,7 @@ fn test_complete_roundtrip() {
 
 #[test]
 fn test_abort() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -443,7 +477,7 @@ fn test_abort() {
 
 #[test]
 fn test_bucket_key_mismatch() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket-a", "key.bin", None, HashMap::new())
         .unwrap();
@@ -461,7 +495,7 @@ fn test_bucket_key_mismatch() {
 
 #[test]
 fn test_invalid_part_number() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -489,7 +523,7 @@ fn test_invalid_part_number() {
 
 #[test]
 fn test_list_parts() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -515,7 +549,7 @@ fn test_list_parts() {
 
 #[test]
 fn test_overwrite_part() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -548,7 +582,7 @@ fn test_overwrite_part() {
 
 #[test]
 fn test_complete_with_zero_parts() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -569,7 +603,7 @@ fn test_complete_with_zero_parts() {
 
 #[test]
 fn test_complete_with_wrong_etag() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -595,7 +629,7 @@ fn test_complete_with_wrong_etag() {
 
 #[test]
 fn test_complete_with_non_contiguous_parts() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = store
         .create("bucket", "key.bin", None, HashMap::new())
         .unwrap();
@@ -617,7 +651,7 @@ fn test_complete_with_non_contiguous_parts() {
 
 #[test]
 fn test_max_uploads_limit() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     // Override max_uploads for testing
     let store = MultipartStore {
         max_uploads: 3,
@@ -649,7 +683,7 @@ fn seed_upload(store: &MultipartStore) -> String {
 
 #[test]
 fn test_complete_flips_state_to_completing() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = seed_upload(&store);
     let etag = {
         let u = store.uploads.read();
@@ -676,7 +710,7 @@ fn test_complete_flips_state_to_completing() {
 
 #[test]
 fn test_abort_refused_when_completing() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = seed_upload(&store);
     let etag = {
         let u = store.uploads.read();
@@ -709,7 +743,7 @@ fn test_abort_refused_when_completing() {
 /// bucket; `delete_bucket` translates that to `BucketNotEmpty`.
 #[test]
 fn test_purge_for_bucket_refuses_when_completing() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
 
     // One Open upload in `bucket-a` — would be safe to purge alone.
     let _ = seed_upload(&store); // bucket="bucket", key="key.bin"
@@ -757,7 +791,7 @@ fn test_purge_for_bucket_refuses_when_completing() {
 /// signature didn't break the happy path.
 #[test]
 fn test_purge_for_bucket_proceeds_when_all_open() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let _ = seed_upload(&store);
     let _ = store
         .create("bucket", "other.bin", None, HashMap::new())
@@ -778,7 +812,7 @@ fn test_purge_for_bucket_proceeds_when_all_open() {
 
 #[test]
 fn test_upload_part_refused_when_completing() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = seed_upload(&store);
     let etag = {
         let u = store.uploads.read();
@@ -803,7 +837,7 @@ fn test_upload_part_refused_when_completing() {
 
 #[test]
 fn test_rollback_upload_returns_to_open() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = seed_upload(&store);
     let etag = {
         let u = store.uploads.read();
@@ -828,7 +862,7 @@ fn test_rollback_upload_returns_to_open() {
 
 #[test]
 fn test_finish_upload_removes_entry() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = seed_upload(&store);
     let etag = {
         let u = store.uploads.read();
@@ -846,7 +880,7 @@ fn test_finish_upload_removes_entry() {
 
 #[test]
 fn test_double_complete_returns_conflict() {
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = seed_upload(&store);
     let etag = {
         let u = store.uploads.read();
@@ -871,7 +905,7 @@ fn test_double_complete_returns_conflict() {
 fn test_validation_failure_does_not_change_state() {
     // If complete() fails validation (wrong etag), state must stay Open
     // so the client can retry with correct metadata.
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = seed_upload(&store);
 
     let err = store
@@ -893,7 +927,7 @@ fn test_validation_failure_does_not_change_state() {
 #[test]
 fn test_abort_while_open_drops_upload() {
     // Baseline: abort on an Open upload still works normally.
-    let store = MultipartStore::new(100 * 1024 * 1024);
+    let store = unshared(100 * 1024 * 1024);
     let upload_id = seed_upload(&store);
     store.abort(&upload_id, "bucket", "key.bin").unwrap();
     assert!(store.uploads.read().get(&upload_id).is_none());
@@ -904,7 +938,7 @@ fn test_abort_while_open_drops_upload() {
 #[test]
 fn test_upload_part_rejects_when_cumulative_exceeds_max_object_size() {
     // max_object_size = 1 KiB. Upload 700 B + 200 B → OK, 300 B → rejected.
-    let store = MultipartStore::new(1024);
+    let store = unshared(1024);
     let upload_id = store.create("bucket", "key", None, HashMap::new()).unwrap();
     put(
         &store,
@@ -943,7 +977,7 @@ fn test_upload_part_rejects_when_cumulative_exceeds_max_object_size() {
 #[test]
 fn test_upload_part_overwrite_adjusts_cumulative_correctly() {
     // Overwrite a 1000 B part with 200 B — cumulative goes DOWN, not up.
-    let store = MultipartStore::new(1500);
+    let store = unshared(1500);
     let upload_id = store.create("bucket", "key", None, HashMap::new()).unwrap();
     put(
         &store,
@@ -980,18 +1014,27 @@ fn test_upload_part_overwrite_adjusts_cumulative_correctly() {
 
 #[test]
 fn test_upload_part_respects_global_byte_cap() {
-    // Tight global cap: 2 MiB of spool budget across all uploads.
-    let store = MultipartStore::new_for_test(10 * MIB, 2 * MIB, Duration::hours(24));
-    let id_a = store.create("b", "a", None, HashMap::new()).unwrap();
-    let id_b = store.create("b", "b", None, HashMap::new()).unwrap();
+    // Tight global cap: 2 MiB of spool budget across all uploads, the
+    // production share: every principal below is within its own share, so
+    // only the global cap can refuse.
+    let store = MultipartStore::new_for_test(10 * MIB, 2 * MIB, Duration::hours(24))
+        .with_principal_share(25);
+    let up = |owner: &str, key: &str| {
+        store
+            .create_for(owner, "b", key, None, HashMap::new())
+            .unwrap()
+    };
+    let (id_a, id_b, id_c) = (up("a", "a"), up("b", "b"), up("c", "c"));
 
-    // Upload A holds 1 MiB.
-    put(&store, &id_a, "b", "a", 1, Bytes::from(vec![0u8; 1024])).unwrap();
-    // Upload B holds 1 MiB (total now 2 MiB = cap).
-    put(&store, &id_b, "b", "b", 1, Bytes::from(vec![0u8; 1024])).unwrap();
-    // Next byte anywhere → SlowDown.
-    let err = put(&store, &id_a, "b", "a", 2, Bytes::from(vec![0u8; 1])).unwrap_err();
-    assert!(matches!(err, S3Error::SlowDown(_)), "got {:?}", err);
+    // A holds 1 MiB, B holds 1 MiB (total now 2 MiB = cap).
+    put_by("a", &store, &id_a, "b", "a", 1, vec![0u8; 1024]).unwrap();
+    put_by("b", &store, &id_b, "b", "b", 1, vec![0u8; 1024]).unwrap();
+    // C is within its own share, so only the global cap refuses it.
+    let err = put_by("c", &store, &id_c, "b", "c", 1, [0u8; 1]).unwrap_err();
+    assert!(
+        matches!(&err, S3Error::SlowDown(m) if m.contains("over the cap")),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -1171,7 +1214,7 @@ fn orphan_sweep_min_age_spares_recent_entries() {
 
 #[test]
 fn test_complete_parts_returns_the_relay_parts_in_order() {
-    let store = MultipartStore::new(10 * 1024);
+    let store = unshared(10 * 1024);
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     let e2 = put(&store, &id, "b", "k", 2, b"world").unwrap();
     let e1 = put(&store, &id, "b", "k", 1, b"hello").unwrap();
@@ -1208,7 +1251,7 @@ fn relay_files(store: &MultipartStore, id: &str) -> Vec<PathBuf> {
 fn an_ingested_part_becomes_the_relay_part_with_one_reservation() {
     let dir = tempfile::tempdir().unwrap();
     let spool = small_spool(&dir, 32);
-    let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+    let store = unshared(64 << 20).with_spool(spool.clone());
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     let body = spooled(&store, &[7u8; 3 << 20], HeldSpool::NOTHING).unwrap();
     let IngestedBody::Spooled { spool: file, .. } = &body else {
@@ -1216,7 +1259,9 @@ fn an_ingested_part_becomes_the_relay_part_with_one_reservation() {
     };
     let ingested_at = file.path().to_path_buf();
     assert_eq!(spool.free_mib(), 29);
-    let admission = store.admit_part(&id, "b", "k", 1, 3 << 20).unwrap();
+    let admission = store
+        .admit_part("test-owner", &id, "b", "k", 1, 3 << 20)
+        .unwrap();
     store
         .upload_part(&id, "b", "k", 1, body, admission)
         .unwrap();
@@ -1244,7 +1289,7 @@ fn an_ingested_part_becomes_the_relay_part_with_one_reservation() {
 fn an_overwritten_part_deletes_the_old_file_and_returns_its_budget() {
     let dir = tempfile::tempdir().unwrap();
     let spool = small_spool(&dir, 32);
-    let store = MultipartStore::new(64 << 20)
+    let store = unshared(64 << 20)
         .with_spool(spool.clone())
         .with_relay_upload_max(Some(8 << 20));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
@@ -1273,13 +1318,13 @@ fn an_overwritten_part_deletes_the_old_file_and_returns_its_budget() {
 fn a_refused_part_leaves_no_file() {
     let dir = tempfile::tempdir().unwrap();
     let spool = small_spool(&dir, 32);
-    let store = MultipartStore::new(4 << 20).with_spool(spool.clone());
+    let store = unshared(4 << 20).with_spool(spool.clone());
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     let etag = put(&store, &id, "b", "k", 1, vec![1u8; 3 << 20]).unwrap();
 
     // Admitted at a declared size that fits, refused on the size that
     // arrived.
-    let admission = store.admit_part(&id, "b", "k", 2, 1).unwrap();
+    let admission = store.admit_part("test-owner", &id, "b", "k", 2, 1).unwrap();
     let body = spooled(&store, &[2u8; 2 << 20], HeldSpool::of_stream_bytes(3 << 20)).unwrap();
     let err = store
         .upload_part(&id, "b", "k", 2, body, admission)
@@ -1289,7 +1334,7 @@ fn a_refused_part_leaves_no_file() {
     assert_eq!(spool.free_mib(), 29);
 
     // Admitted, then refused because the upload is completing.
-    let admission = store.admit_part(&id, "b", "k", 2, 4).unwrap();
+    let admission = store.admit_part("test-owner", &id, "b", "k", 2, 4).unwrap();
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
     let body = spooled(&store, b"late", HeldSpool::of_stream_bytes(3 << 20)).unwrap();
     let err = store
@@ -1308,38 +1353,46 @@ fn admit_part_refuses_before_the_body() {
     let code =
         |r: Result<PartAdmission, S3Error>| r.map(|a| a.held_spool.mib()).map_err(|e| e.code());
     assert_eq!(
-        code(store.admit_part("nope", "b", "k", 1, 1)),
+        code(store.admit_part("test-owner", "nope", "b", "k", 1, 1)),
         Err("NoSuchUpload")
     );
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     assert_eq!(
-        code(store.admit_part(&id, "b", "other", 1, 1)),
+        code(store.admit_part("test-owner", &id, "b", "other", 1, 1)),
         Err("NoSuchUpload")
     );
     assert_eq!(
-        code(store.admit_part(&id, "b", "k", 0, 1)),
+        code(store.admit_part("test-owner", &id, "b", "k", 0, 1)),
         Err("InvalidArgument")
     );
     assert_eq!(
-        code(store.admit_part(&id, "b", "k", 1, (4 << 20) + 1)),
+        code(store.admit_part("test-owner", &id, "b", "k", 1, (4 << 20) + 1)),
         Err("EntityTooLarge")
     );
     let etag = put(&store, &id, "b", "k", 1, vec![0u8; 3 << 20]).unwrap();
-    assert_eq!(code(store.admit_part(&id, "b", "k", 2, 1 << 20)), Ok(3));
+    assert_eq!(
+        code(store.admit_part("test-owner", &id, "b", "k", 2, 1 << 20)),
+        Ok(3)
+    );
     // The global cap: another upload holds 3 MiB of 6.
     let other = store.create("b", "o", None, HashMap::new()).unwrap();
     put(&store, &other, "b", "o", 1, vec![0u8; 3 << 20]).unwrap();
-    assert_eq!(code(store.admit_part(&id, "b", "k", 2, 1)), Err("SlowDown"));
+    assert_eq!(
+        code(store.admit_part("test-owner", &id, "b", "k", 2, 1)),
+        Err("SlowDown")
+    );
     // Replacing a part counts only the difference.
-    assert!(store.admit_part(&id, "b", "k", 1, 3 << 20).is_ok());
+    assert!(store
+        .admit_part("test-owner", &id, "b", "k", 1, 3 << 20)
+        .is_ok());
     store.complete_parts(&id, "b", "k", &[(1, etag)]).unwrap();
     assert_eq!(
-        code(store.admit_part(&id, "b", "k", 1, 1)),
+        code(store.admit_part("test-owner", &id, "b", "k", 1, 1)),
         Err("InvalidRequest")
     );
     store.abort(&other, "b", "o").unwrap();
     assert_eq!(
-        code(store.admit_part(&other, "b", "o", 1, 1)),
+        code(store.admit_part("test-owner", &other, "b", "o", 1, 1)),
         Err("NoSuchUpload")
     );
 }
@@ -1351,9 +1404,9 @@ fn admit_part_refuses_before_the_body() {
 fn an_abort_during_or_after_the_ingest_leaves_no_file_or_dir() {
     let dir = tempfile::tempdir().unwrap();
     let spool = small_spool(&dir, 32);
-    let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+    let store = unshared(64 << 20).with_spool(spool.clone());
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
-    let admission = store.admit_part(&id, "b", "k", 1, 5).unwrap();
+    let admission = store.admit_part("test-owner", &id, "b", "k", 1, 5).unwrap();
     let body = spooled(&store, b"hello", admission.held_spool).unwrap();
     store.abort(&id, "b", "k").unwrap();
     let err = store
@@ -1399,7 +1452,7 @@ fn the_ttl_sweep_deletes_relay_files_and_returns_their_budget() {
 fn a_part_with_the_budget_taken_is_slowdown_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let spool = small_spool(&dir, 4);
-    let store = MultipartStore::new(64 << 20)
+    let store = unshared(64 << 20)
         .with_spool(spool.clone())
         .with_relay_upload_max(Some(0));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
@@ -1467,39 +1520,54 @@ fn parallel_parts_cannot_pass_the_caps_together() {
     let store = MultipartStore::new_for_test(1 << 30, 1 << 30, Duration::hours(24))
         .with_relay_upload_max(Some(4 * MIB));
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
-    let a = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
-    let b = store.admit_part(&id, "b", "k", 2, 2 * MIB).unwrap();
+    let a = store
+        .admit_part("test-owner", &id, "b", "k", 1, 2 * MIB)
+        .unwrap();
+    let b = store
+        .admit_part("test-owner", &id, "b", "k", 2, 2 * MIB)
+        .unwrap();
     let err = store
-        .admit_part(&id, "b", "k", 3, 1)
+        .admit_part("test-owner", &id, "b", "k", 3, 1)
         .err()
         .expect("refused");
     assert_eq!(err.code(), "EntityTooLarge", "{err:?}");
     // A dropped admission (a failed ingest, a dropped request) gives its
     // share back.
     drop(b);
-    let b = store.admit_part(&id, "b", "k", 2, 2 * MIB).unwrap();
+    let b = store
+        .admit_part("test-owner", &id, "b", "k", 2, 2 * MIB)
+        .unwrap();
     drop((a, b));
 
-    // Global: 3 MiB across uploads.
-    let store = MultipartStore::new_for_test(1 << 30, 3 * MIB, Duration::hours(24));
-    let ids: Vec<_> = (0..3)
-        .map(|i| {
+    // Global: 3 MiB across uploads. Distinct principals, each within its own
+    // share, so the global cap is what refuses.
+    let store = MultipartStore::new_for_test(1 << 30, 3 * MIB, Duration::hours(24))
+        .with_principal_share(25);
+    let owners = ["o0", "o1", "o2"];
+    let ids: Vec<_> = owners
+        .iter()
+        .enumerate()
+        .map(|(i, owner)| {
             store
-                .create("b", &format!("k{i}"), None, HashMap::new())
+                .create_for(owner, "b", &format!("k{i}"), None, HashMap::new())
                 .unwrap()
         })
         .collect();
     let held: Vec<_> = ids[..2]
         .iter()
         .enumerate()
-        .map(|(i, id)| store.admit_part(id, "b", &format!("k{i}"), 1, 1).unwrap())
+        .map(|(i, id)| {
+            store
+                .admit_part(owners[i], id, "b", &format!("k{i}"), 1, 1)
+                .unwrap()
+        })
         .collect();
-    let third = store.admit_part(&ids[2], "b", "k2", 1, MIB + 1);
+    let third = store.admit_part("o2", &ids[2], "b", "k2", 1, MIB + 1);
     assert!(
         matches!(third, Err(S3Error::SlowDown(_))),
         "parallel parts passed the global cap"
     );
-    let third = store.admit_part(&ids[2], "b", "k2", 1, MIB).unwrap();
+    let third = store.admit_part("o2", &ids[2], "b", "k2", 1, MIB).unwrap();
     // Kept parts take over the charge of their admission: still 3 MiB.
     let mut kept = 0;
     for (i, admission) in held.into_iter().enumerate() {
@@ -1511,9 +1579,16 @@ fn parallel_parts_cannot_pass_the_caps_together() {
     }
     assert_eq!(kept, 2);
     assert_eq!(store.in_flight_bytes(), 2 * MIB);
-    assert!(store.admit_part(&ids[0], "b", "k0", 2, 1).is_err(), "full");
+    // A fourth principal is within its share: the full global cap refuses it.
+    let id3 = store
+        .create_for("o3", "b", "k3", None, HashMap::new())
+        .unwrap();
+    assert!(
+        store.admit_part("o3", &id3, "b", "k3", 1, 1).is_err(),
+        "full"
+    );
     drop(third);
-    assert!(store.admit_part(&ids[0], "b", "k0", 2, 1).is_ok());
+    assert!(store.admit_part("o3", &id3, "b", "k3", 1, 1).is_ok());
 }
 
 /// An admission ends with its part in every way: kept, refused when kept,
@@ -1528,20 +1603,24 @@ async fn an_admission_is_released_on_every_path() {
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     // The whole per-upload cap is admitted, then the admission is dropped
     // with the future that held it.
-    let admission = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
+    let admission = store
+        .admit_part("test-owner", &id, "b", "k", 1, 2 * MIB)
+        .unwrap();
     let task = tokio::spawn(async move {
         let _held = admission;
         futures::future::pending::<()>().await;
     });
     tokio::task::yield_now().await;
     assert!(
-        store.admit_part(&id, "b", "k", 2, 1).is_err(),
+        store.admit_part("test-owner", &id, "b", "k", 2, 1).is_err(),
         "held while streaming"
     );
     task.abort();
     let _ = task.await;
     // Refused when kept (aborted upload): the charge is released.
-    let admission = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
+    let admission = store
+        .admit_part("test-owner", &id, "b", "k", 1, 2 * MIB)
+        .unwrap();
     let body = spooled(&store, &[1u8; 2 << 20], HeldSpool::NOTHING).unwrap();
     store.abort(&id, "b", "k").unwrap();
     let err = store
@@ -1550,12 +1629,14 @@ async fn an_admission_is_released_on_every_path() {
     assert_eq!(err.code(), "NoSuchUpload");
     // An admission that outlives its upload's abort releases on drop.
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
-    let admission = store.admit_part(&id, "b", "k", 1, 2 * MIB).unwrap();
+    let admission = store
+        .admit_part("test-owner", &id, "b", "k", 1, 2 * MIB)
+        .unwrap();
     store.abort(&id, "b", "k").unwrap();
     drop(admission);
     let id = store.create("b", "k", None, HashMap::new()).unwrap();
     store
-        .admit_part(&id, "b", "k", 1, 2 * MIB)
+        .admit_part("test-owner", &id, "b", "k", 1, 2 * MIB)
         .map(drop)
         .unwrap();
     assert_eq!(store.admitted.lock().total, 0);
@@ -1573,7 +1654,7 @@ fn max_total_multipart_bytes_truth_table() {
     let dir = tempfile::tempdir().unwrap();
     let store = MultipartStore {
         max_total_configured: None,
-        ..MultipartStore::new(1 << 30).with_spool(small_spool(&dir, 32))
+        ..unshared(1 << 30).with_spool(small_spool(&dir, 32))
     };
     assert_eq!(store.max_total_multipart_bytes(), 16 << 20);
 }
@@ -1767,7 +1848,7 @@ fn guard_fixture() -> (
     CompletionPublisher,
     tokio::sync::watch::Receiver<Option<CompletionResult>>,
 ) {
-    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let store = std::sync::Arc::new(unshared(1024));
     let parts = parts_fixture();
     let id = store.create("b", "k", None, Default::default()).unwrap();
     let owner = match store.begin_complete(&id, "b", "k", &parts).unwrap() {
@@ -1903,7 +1984,7 @@ async fn an_error_after_the_commit_never_erases_the_success() {
 /// publish leaves the tombstone: the retry is `AlreadyDone`, not NoSuchUpload.
 #[tokio::test]
 async fn a_cut_between_finish_and_publish_keeps_the_tombstone() {
-    let store = std::sync::Arc::new(MultipartStore::new(1024));
+    let store = std::sync::Arc::new(unshared(1024));
     let id = store.create("b", "k", None, Default::default()).unwrap();
     let etag = put(&store, &id, "b", "k", 1, b"data").unwrap();
     let parts = vec![(1, etag)];
@@ -1925,4 +2006,230 @@ async fn a_cut_between_finish_and_publish_keeps_the_tombstone() {
             other.err()
         ),
     }
+}
+
+// ---- per-principal shares: work-conserving (see budget_share) ----
+
+/// A store whose caps are small enough to reach: 8 uploads, 8 MiB of parts,
+/// the default 25 % share (2 on its own, up to 6 while the total stays there).
+fn shared_store(dir: &tempfile::TempDir) -> MultipartStore {
+    let mut store = MultipartStore::new_for_test(1 << 30, 8 * MIB, Duration::hours(24))
+        .with_spool(small_spool(dir, 64))
+        .with_principal_share(25);
+    store.max_uploads = 8;
+    store
+}
+
+fn create_as(store: &MultipartStore, owner: &str) -> Result<String, S3Error> {
+    store.create_for(owner, "b", "k", None, HashMap::new())
+}
+
+fn is_own_limit(err: &S3Error) -> bool {
+    matches!(err, S3Error::SlowDown(m) if m.contains("your own limit"))
+}
+
+fn is_global_limit(err: &S3Error) -> bool {
+    matches!(err, S3Error::SlowDown(m) if !m.contains("your own limit"))
+}
+
+#[test]
+fn the_shares_of_the_caps() {
+    let u = upload_shares(1000, 25);
+    assert_eq!(
+        (u.own_cap(), u.shared_cap(), u.lone_reach()),
+        (250, 750, 750)
+    );
+    assert_eq!(upload_shares(3, 25).own_cap(), 1, "at least one upload");
+    let b = byte_shares(8 * MIB, 25);
+    assert_eq!((b.own_cap(), b.shared_cap()), (2 * MIB, 6 * MIB));
+    assert_eq!(byte_shares(MIB, 25).own_cap(), MIB, "at least one part");
+    assert_eq!(byte_shares(u64::MAX, 100).own_cap(), u64::MAX);
+}
+
+#[test]
+fn a_lone_principal_can_open_three_quarters_of_the_uploads() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = shared_store(&dir);
+    for _ in 0..6 {
+        create_as(&store, "dana").unwrap();
+    }
+    let err = create_as(&store, "dana").unwrap_err();
+    assert!(is_own_limit(&err), "got {err:?}");
+    // The last quarter stays reachable for the others, one share each.
+    create_as(&store, "ci-uploader").unwrap();
+    create_as(&store, "ci-uploader").unwrap();
+    // Now the global cap is full: the message does not say "your own".
+    let err = create_as(&store, "backup-bot").unwrap_err();
+    assert!(is_global_limit(&err), "got {err:?}");
+}
+
+#[test]
+fn an_upload_slot_returns_on_abort_complete_and_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = shared_store(&dir);
+    store.idle_ttl = Duration::milliseconds(1);
+    let ids: Vec<String> = (0..6)
+        .map(|_| create_as(&store, "mallory").unwrap())
+        .collect();
+    assert!(is_own_limit(&create_as(&store, "mallory").unwrap_err()));
+
+    store.abort(&ids[0], "b", "k").unwrap();
+    create_as(&store, "mallory").unwrap();
+    assert!(is_own_limit(&create_as(&store, "mallory").unwrap_err()));
+
+    let etag = put(&store, &ids[1], "b", "k", 1, b"data").unwrap();
+    store
+        .complete_parts(&ids[1], "b", "k", &[(1, etag)])
+        .unwrap();
+    store.finish_upload(&ids[1]);
+    create_as(&store, "mallory").unwrap();
+    assert!(is_own_limit(&create_as(&store, "mallory").unwrap_err()));
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let report = store.cleanup_expired(
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(3600),
+    );
+    assert_eq!(report.swept_open_uploads, 6);
+    for _ in 0..6 {
+        create_as(&store, "mallory").unwrap();
+    }
+}
+
+#[test]
+fn a_lone_principal_can_hold_three_quarters_of_the_part_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = shared_store(&dir);
+    let id = create_as(&store, "dana").unwrap();
+    for n in 1..=6 {
+        put_by("dana", &store, &id, "b", "k", n, b"x").unwrap();
+    }
+    let err = put_by("dana", &store, &id, "b", "k", 7, b"x").unwrap_err();
+    assert!(is_own_limit(&err), "got {err:?}");
+    // The last quarter is one other principal's share.
+    let id = create_as(&store, "ci-uploader").unwrap();
+    put_by("ci-uploader", &store, &id, "b", "k", 1, b"x").unwrap();
+    put_by("ci-uploader", &store, &id, "b", "k", 2, b"x").unwrap();
+    // 8 MiB are held: a third principal meets the global cap, not a share.
+    let id = create_as(&store, "backup-bot").unwrap();
+    let err = put_by("backup-bot", &store, &id, "b", "k", 1, b"x").unwrap_err();
+    assert!(is_global_limit(&err), "got {err:?}");
+}
+
+/// The bytes of a part are paid by the principal that sends it. Before, they
+/// counted for the creator of the upload, so any writer could fill a victim's
+/// share by sending 1-byte parts into the victim's upload id.
+#[test]
+fn a_part_is_paid_by_the_principal_that_sends_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = shared_store(&dir);
+    let victim_upload = create_as(&store, "dana").unwrap();
+    // Mallory fills its own reach (6 MiB) with parts of dana's upload.
+    for n in 1..=6 {
+        put_by("mallory", &store, &victim_upload, "b", "k", n, b"x").unwrap();
+    }
+    let err = put_by("mallory", &store, &victim_upload, "b", "k", 7, b"x").unwrap_err();
+    assert!(is_own_limit(&err), "got {err:?}");
+    // Dana still has its own share, in the same upload and in a new one.
+    put_by("dana", &store, &victim_upload, "b", "k", 7, b"x").unwrap();
+    let second = create_as(&store, "dana").unwrap();
+    put_by("dana", &store, &second, "b", "k", 1, b"x").unwrap();
+    // Dana's upload ends: Mallory's bytes go back to Mallory, not to Dana.
+    store.abort(&victim_upload, "b", "k").unwrap();
+    let other = create_as(&store, "mallory").unwrap();
+    for n in 1..=5 {
+        put_by("mallory", &store, &other, "b", "k", n, b"x").unwrap();
+    }
+    assert!(
+        store
+            .payer_bytes
+            .lock()
+            .get("mallory")
+            .copied()
+            .unwrap_or(0)
+            == 5 * MIB
+    );
+    assert_eq!(store.payer_bytes.lock().get("dana").copied(), Some(MIB));
+}
+
+#[test]
+fn a_part_that_replaces_another_moves_the_charge_to_its_sender() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = shared_store(&dir);
+    let id = create_as(&store, "dana").unwrap();
+    put_by("dana", &store, &id, "b", "k", 1, b"x").unwrap();
+    put_by("mallory", &store, &id, "b", "k", 1, b"yy").unwrap();
+    let payers = store.payer_bytes.lock().clone();
+    assert_eq!(payers.get("dana"), None, "no entry stays at 0");
+    assert_eq!(payers.get("mallory"), Some(&MIB));
+    assert_eq!(store.in_flight_bytes(), MIB);
+}
+
+#[test]
+fn an_admitted_part_counts_for_its_sender_while_it_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = shared_store(&dir);
+    let id = create_as(&store, "dana").unwrap();
+    // Six streaming parts of mallory are its reach; the seventh is refused.
+    let held: Vec<_> = (1..=6)
+        .map(|n| store.admit_part("mallory", &id, "b", "k", n, 1).unwrap())
+        .collect();
+    let err = store
+        .admit_part("mallory", &id, "b", "k", 7, 1)
+        .err()
+        .unwrap();
+    assert!(is_own_limit(&err), "got {err:?}");
+    // The upload's creator is not charged for them.
+    drop(store.admit_part("dana", &id, "b", "k", 7, 1).unwrap());
+    drop(held);
+    drop(store.admit_part("mallory", &id, "b", "k", 7, 1).unwrap());
+}
+
+#[test]
+fn part_bytes_return_on_abort_complete_and_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = shared_store(&dir);
+    store.idle_ttl = Duration::milliseconds(1);
+    let fill = |store: &MultipartStore| {
+        let id = create_as(store, "mallory").unwrap();
+        for n in 1..=6 {
+            put_by("mallory", store, &id, "b", "k", n, b"x").unwrap();
+        }
+        id
+    };
+    let full = |store: &MultipartStore| {
+        let id = create_as(store, "mallory").unwrap();
+        let refused = match put_by("mallory", store, &id, "b", "k", 1, b"x") {
+            Err(err) => {
+                assert!(is_own_limit(&err), "got {err:?}");
+                true
+            }
+            Ok(_) => false,
+        };
+        store.abort(&id, "b", "k").unwrap();
+        refused
+    };
+    let id = fill(&store);
+    assert!(full(&store));
+    store.abort(&id, "b", "k").unwrap();
+    assert!(!full(&store), "abort returned the bytes");
+
+    let id = fill(&store);
+    assert!(full(&store));
+    let parts: Vec<_> = (1..=6)
+        .map(|n| (n, format!("\"{:x}\"", Md5::digest(b"x"))))
+        .collect();
+    store.complete_parts(&id, "b", "k", &parts).unwrap();
+    store.finish_upload(&id);
+    assert!(!full(&store), "complete returned the bytes");
+
+    fill(&store);
+    assert!(full(&store));
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    store.cleanup_expired(
+        std::time::Duration::from_secs(3600),
+        std::time::Duration::from_secs(3600),
+    );
+    assert!(!full(&store), "expiry returned the bytes");
+    assert!(store.payer_bytes.lock().is_empty(), "no entry stays at 0");
 }

@@ -18,7 +18,11 @@ use super::{Action, AdmissionChain, Decision, Match, Predicates};
 /// Field conventions:
 /// - `bucket` is always lowercase (S3 bucket names are case-insensitive).
 /// - `key` is the percent-decoded object key for GET/HEAD on an object,
-///   or `None` for a bucket-level LIST request.
+///   or `None` for a bucket-level request (LIST, batch delete). A block's
+///   `path_glob` decides keys only: a request with no key meets a `deny`,
+///   `reject` or `continue` block only when the glob covers every key below
+///   the LIST prefix, and an `allow-anonymous` block when the glob can match
+///   some key below it.
 /// - `list_prefix` is the effective `prefix` query parameter on a LIST
 ///   request (`None` when no `?prefix=` was provided). Ignored when
 ///   `key.is_some()`.
@@ -55,8 +59,49 @@ impl<'a> RequestInfo<'a> {
 /// match wins. Callers must not assume the order of blocks; construction
 /// sites are responsible for the ordering they want to express.
 pub fn evaluate(chain: &AdmissionChain, req: &RequestInfo<'_>) -> Decision {
-    for block in chain.blocks() {
-        if matches(chain, &block.match_, &block.action, req) {
+    walk(chain, req, MethodView::Line)
+}
+
+/// Which methods a block's `method` list is compared with.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum MethodView<'a> {
+    /// The request line: `req.method` is the method of the request.
+    Line,
+    /// A resource that the request READS beyond its request line (a copy
+    /// source, a listed key, a ZIP entry): only the effect counts, so a list
+    /// that names `GET` or `HEAD` matches.
+    Read,
+    /// A key that the request WRITES or DELETES (a form POST key, a
+    /// DeleteObjects key): the effect (`req.method`, `PUT` or `DELETE`) or the
+    /// method of the request line, `line`.
+    Mutation { line: &'a str },
+}
+
+/// [`evaluate`] for a resource that the request reaches beyond its request
+/// line, over `blocks` (the blocks of the chain that can concern the
+/// resource's bucket, in chain order); `view` says which methods count
+/// (see `Effect`).
+pub(super) fn evaluate_blocks<'b>(
+    chain: &AdmissionChain,
+    blocks: impl Iterator<Item = &'b super::AdmissionBlock>,
+    req: &RequestInfo<'_>,
+    view: MethodView<'_>,
+) -> Decision {
+    walk_blocks(chain, blocks, req, view)
+}
+
+fn walk(chain: &AdmissionChain, req: &RequestInfo<'_>, view: MethodView<'_>) -> Decision {
+    walk_blocks(chain, chain.blocks().iter(), req, view)
+}
+
+fn walk_blocks<'b>(
+    chain: &AdmissionChain,
+    blocks: impl Iterator<Item = &'b super::AdmissionBlock>,
+    req: &RequestInfo<'_>,
+    view: MethodView<'_>,
+) -> Decision {
+    for block in blocks {
+        if matches(chain, &block.match_, &block.action, req, view) {
             return match &block.action {
                 Action::AllowAnonymous => Decision::AllowAnonymous {
                     matched: block.name.clone(),
@@ -84,10 +129,16 @@ pub fn evaluate(chain: &AdmissionChain, req: &RequestInfo<'_>) -> Decision {
 /// `match_predicates` can apply action-specific defaults (e.g. default
 /// `authenticated=false` for `allow-anonymous` blocks that didn't
 /// explicitly say so — see [`match_predicates`]).
-fn matches(chain: &AdmissionChain, m: &Match, action: &Action, req: &RequestInfo<'_>) -> bool {
+fn matches(
+    chain: &AdmissionChain,
+    m: &Match,
+    action: &Action,
+    req: &RequestInfo<'_>,
+    view: MethodView<'_>,
+) -> bool {
     match m {
         Match::PublicPrefixGrant { bucket } => match_public_prefix_grant(chain, bucket, req),
-        Match::Predicates(p) => match_predicates(p, action, req),
+        Match::Predicates(p) => match_predicates(p, action, req, view),
     }
 }
 
@@ -104,10 +155,79 @@ fn matches(chain: &AdmissionChain, m: &Match, action: &Action, req: &RequestInfo
 /// `$anonymous` principal (which often has no permissions, resulting
 /// in an unexpected 403). Signed callers should always flow through
 /// SigV4 verification — they *chose* to sign.
-fn match_predicates(p: &Predicates, action: &Action, req: &RequestInfo<'_>) -> bool {
+fn match_predicates(
+    p: &Predicates,
+    action: &Action,
+    req: &RequestInfo<'_>,
+    view: MethodView<'_>,
+) -> bool {
+    if !request_facts_match(p, action, req, view) || !bucket_matches(p, req) {
+        return false;
+    }
+    if let Some(glob) = &p.path_glob {
+        // A `path_glob` decides KEYS, never request text. A request that
+        // names no key (a LIST, a batch delete, a bucket-level verb) meets a
+        // `deny`, `reject` or `continue` block when the glob covers EVERY key
+        // below the request's prefix (the empty prefix for a verb with none):
+        // no key is left for the per-key walk to decide. Otherwise that walk
+        // decides, key by key. An `allow-anonymous` block admits such a
+        // request when SOME key below the prefix can match (the listing then
+        // shows just the matching keys).
+        match req.key {
+            Some(key) => {
+                if !glob.matches_key(key) {
+                    return false;
+                }
+            }
+            None => {
+                let prefix = req.list_prefix.unwrap_or("");
+                let covered = match action {
+                    Action::AllowAnonymous => glob.can_match_below(prefix),
+                    Action::Deny | Action::Reject { .. } | Action::Continue => {
+                        glob.matches_all_below(prefix)
+                    }
+                };
+                if !covered {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The `bucket` predicate.
+pub(super) fn bucket_matches(p: &Predicates, req: &RequestInfo<'_>) -> bool {
+    p.bucket.as_ref().is_none_or(|b| b == req.bucket)
+}
+
+/// The `method`, `source_ip`, `authenticated` and `config_flag` predicates.
+/// The last three describe the request as a whole. `method` names the method
+/// of the request line, or, for a resource that the request reaches beyond it,
+/// the effect on that resource (`req.method` is then the effect's method), see
+/// [`MethodView`]. `GET` and `HEAD` are ONE read: for a block with a `bucket`
+/// or a `path_glob` a list that names either matches both, so a `GET` rule
+/// cannot be read around with a `HEAD` (size, ETag, metadata).
+pub(super) fn request_facts_match(
+    p: &Predicates,
+    action: &Action,
+    req: &RequestInfo<'_>,
+    view: MethodView<'_>,
+) -> bool {
     if let Some(methods) = &p.methods {
-        let m_upper = req.method.to_ascii_uppercase();
-        if !methods.iter().any(|m| m == &m_upper) {
+        let named = |name: &str| methods.iter().any(|m| m.eq_ignore_ascii_case(name));
+        let is_read =
+            |name: &str| name.eq_ignore_ascii_case("GET") || name.eq_ignore_ascii_case("HEAD");
+        let one_read = p.bucket.is_some() || p.path_glob.is_some();
+        let names = |name: &str| {
+            named(name) || (one_read && is_read(name) && (named("GET") || named("HEAD")))
+        };
+        let ok = match view {
+            MethodView::Line => names(req.method),
+            MethodView::Read => named("GET") || named("HEAD"),
+            MethodView::Mutation { line } => names(req.method) || names(line),
+        };
+        if !ok {
             return false;
         }
     }
@@ -120,20 +240,6 @@ fn match_predicates(p: &Predicates, action: &Action, req: &RequestInfo<'_>) -> b
             return false;
         };
         if !nets.iter().any(|n| n.contains(&ip)) {
-            return false;
-        }
-    }
-    if let Some(bucket) = &p.bucket {
-        if bucket != req.bucket {
-            return false;
-        }
-    }
-    if let Some(glob) = &p.path_glob {
-        // Match against the key for object ops, or the list prefix for
-        // bucket LIST. Missing both = match against empty string so
-        // path_glob: "*" still fires on a bare bucket LIST.
-        let target = req.key.or(req.list_prefix).unwrap_or("");
-        if !glob.is_match(target) {
             return false;
         }
     }
@@ -153,14 +259,9 @@ fn match_predicates(p: &Predicates, action: &Action, req: &RequestInfo<'_>) -> b
             }
         }
     }
-    if p.config_flag.is_some() {
-        // No flag registry exists yet — every config_flag predicate
-        // fails closed. The chain builder emits a `tracing::warn!`
-        // per block so operators see the gap. Live dispatch lands
-        // with the Phase 3b.2.c rate-limit work.
-        return false;
-    }
-    true
+    // No flag registry exists yet — every config_flag predicate fails
+    // closed (the chain builder warns per block).
+    p.config_flag.is_none()
 }
 
 /// The single admission predicate currently implemented. Conditions for a
@@ -731,7 +832,7 @@ mod glob_proptests {
             let _ = denied(&glob, Some(&key), None);
         }
 
-        /// `lit*` fires exactly on keys (and LIST prefixes) that start with
+        /// `lit*` fires exactly on keys that start with
         /// `lit`, `*` crossing `/`: a Deny on `secret/*` covers
         /// `secret/a/b`. A literal glob fires on that one key only.
         #[test]
@@ -741,10 +842,222 @@ mod glob_proptests {
         ) {
             let glob = format!("{lit}*");
             prop_assert_eq!(denied(&glob, Some(&key), None), key.starts_with(&lit), "{} vs {}", glob, key);
+            // A LIST meets the block when the glob covers every key below its prefix.
             prop_assert_eq!(denied(&glob, None, Some(&key)), key.starts_with(&lit));
             if !lit.is_empty() {
                 prop_assert_eq!(denied(&lit, Some(&key), None), key == lit);
             }
         }
+    }
+}
+
+/// A request that names no key against a block with a `path_glob`: the old
+/// rule matched the glob against the TEXT of the prefix; the new rule asks
+/// whether the glob covers every key below the prefix. The table lists both
+/// answers for every kind of keyless request and every action.
+#[cfg(test)]
+mod keyless_tests {
+    use super::*;
+    use crate::admission::spec::{
+        ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction, TaggedAction,
+    };
+    use std::collections::BTreeMap;
+
+    /// The rule before keyless requests had their own: the glob against the prefix text.
+    fn old_matches(glob: &str, prefix: &str) -> bool {
+        globset::Glob::new(glob)
+            .unwrap()
+            .compile_matcher()
+            .is_match(prefix)
+    }
+
+    fn block(glob: &str, action: ActionSpec) -> AdmissionBlockSpec {
+        AdmissionBlockSpec {
+            name: "g".into(),
+            match_: MatchSpec {
+                path_glob: Some(glob.into()),
+                bucket: Some("b".into()),
+                ..Default::default()
+            },
+            action,
+        }
+    }
+
+    fn fires(glob: &str, action: ActionSpec, prefix: Option<&str>) -> bool {
+        let chain = AdmissionChain::from_config_parts(&BTreeMap::new(), &[block(glob, action)]);
+        let req = RequestInfo {
+            method: "GET",
+            bucket: "b",
+            key: None,
+            list_prefix: prefix,
+            authenticated: false,
+            source_ip: None,
+        };
+        !matches!(evaluate(&chain, &req), Decision::Continue { matched: None })
+    }
+
+    fn actions() -> Vec<(&'static str, ActionSpec)> {
+        vec![
+            ("deny", ActionSpec::Simple(SimpleAction::Deny)),
+            (
+                "reject",
+                ActionSpec::Tagged(TaggedAction::Reject {
+                    status: 503,
+                    message: None,
+                }),
+            ),
+            ("continue", ActionSpec::Simple(SimpleAction::Continue)),
+        ]
+    }
+
+    /// (case, glob, list prefix, old text rule fires, new rule fires).
+    /// A bucket-level verb (CreateBucket, HEAD bucket, DeleteObjects) has no prefix.
+    const TABLE: [(&str, &str, Option<&str>, bool, bool); 17] = [
+        ("LIST inside the glob", "db/**", Some("db/"), true, true),
+        ("LIST deeper inside", "db/**", Some("db/sub/"), true, true),
+        (
+            "LIST a name prefix inside",
+            "db/**",
+            Some("db/a"),
+            true,
+            true,
+        ),
+        (
+            "LIST outside the glob",
+            "db/**",
+            Some("docs/"),
+            false,
+            false,
+        ),
+        ("LIST partly inside (`d`)", "db/**", Some("d"), false, false),
+        ("LIST of the bucket root", "db/**", None, false, false),
+        ("DeleteObjects", "db/**", None, false, false),
+        ("CreateBucket", "db/**", None, false, false),
+        ("HEAD bucket", "db/**", None, false, false),
+        ("LIST under `**`", "**", Some("db/"), true, true),
+        ("DeleteObjects under `**`", "**", None, true, true),
+        ("CreateBucket under `**`", "**", None, true, true),
+        ("HEAD bucket under `**`", "**", None, true, true),
+        // The old text rule fired here although `a.zip.bak` is no zip: wrong.
+        (
+            "LIST `a.zip` under `*.zip`",
+            "*.zip",
+            Some("a.zip"),
+            true,
+            false,
+        ),
+        ("LIST root under `*.zip`", "*.zip", None, false, false),
+        (
+            "LIST inside a folder glob with a class",
+            "[ab]/**",
+            Some("a/x"),
+            true,
+            true,
+        ),
+        (
+            "LIST partly inside a class glob",
+            "[ab]/**",
+            Some(""),
+            false,
+            false,
+        ),
+    ];
+
+    #[test]
+    fn a_keyless_request_meets_a_block_that_covers_every_key_below_its_prefix() {
+        for (name, action) in actions() {
+            for (case, glob, prefix, old, new) in TABLE {
+                assert_eq!(
+                    old_matches(glob, prefix.unwrap_or("")),
+                    old,
+                    "old rule: {case} / {glob}"
+                );
+                assert_eq!(
+                    fires(glob, action.clone(), prefix),
+                    new,
+                    "{name}: {case} / {glob}"
+                );
+            }
+        }
+    }
+
+    /// `allow-anonymous` keeps its own rule: some key below the prefix can match.
+    #[test]
+    fn allow_anonymous_admits_a_keyless_request_when_some_key_can_match() {
+        let anon = || ActionSpec::Simple(SimpleAction::AllowAnonymous);
+        for (case, glob, prefix, expected) in [
+            ("LIST inside", "db/**", Some("db/"), true),
+            ("LIST partly inside", "db/**", Some("d"), true),
+            ("LIST of the root", "db/**", None, true),
+            ("LIST outside", "db/**", Some("docs/"), false),
+            ("LIST root under `*.zip`", "*.zip", None, true),
+        ] {
+            assert_eq!(fires(glob, anon(), prefix), expected, "{case}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod one_read_tests {
+    use super::*;
+    use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
+    use std::collections::BTreeMap;
+
+    fn denied(match_: MatchSpec, method: &str, key: Option<&str>) -> bool {
+        let block = AdmissionBlockSpec {
+            name: "d".into(),
+            match_,
+            action: ActionSpec::Simple(SimpleAction::Deny),
+        };
+        let chain = AdmissionChain::from_config_parts(&BTreeMap::new(), &[block]);
+        let req = RequestInfo {
+            method,
+            bucket: "b",
+            key,
+            list_prefix: None,
+            authenticated: true,
+            source_ip: None,
+        };
+        matches!(evaluate(&chain, &req), Decision::Deny { .. })
+    }
+
+    fn rule(glob: Option<&str>, bucket: Option<&str>, methods: &[&str]) -> MatchSpec {
+        MatchSpec {
+            path_glob: glob.map(Into::into),
+            bucket: bucket.map(Into::into),
+            method: Some(methods.iter().map(|m| m.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// GET and HEAD are ONE read: a rule with a `path_glob` or a `bucket` that
+    /// names either covers both request lines (a HEAD shows size, ETag and metadata).
+    #[test]
+    fn get_and_head_are_one_read_for_a_rule_with_a_glob_or_a_bucket() {
+        for (m, other) in [("GET", "HEAD"), ("HEAD", "GET")] {
+            let r = || rule(Some("secret/**"), None, &[m]);
+            assert!(denied(r(), m, Some("secret/x")));
+            assert!(
+                denied(r(), other, Some("secret/x")),
+                "{m} rule, {other} line"
+            );
+            assert!(!denied(r(), other, Some("public/x")));
+            assert!(denied(rule(None, Some("b"), &[m]), other, Some("any")));
+        }
+        // A rule that names other methods is no read rule.
+        assert!(!denied(
+            rule(Some("secret/**"), None, &["PUT"]),
+            "HEAD",
+            Some("secret/x")
+        ));
+        assert!(!denied(
+            rule(Some("secret/**"), None, &["GET"]),
+            "PUT",
+            Some("secret/x")
+        ));
+        // Without a bucket or a glob the method match stays literal.
+        let plain = || rule(None, None, &["GET"]);
+        assert!(denied(plain(), "GET", Some("any")));
+        assert!(!denied(plain(), "HEAD", Some("any")));
     }
 }

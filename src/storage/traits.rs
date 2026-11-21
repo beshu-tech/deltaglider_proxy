@@ -1685,6 +1685,17 @@ pub trait StorageBackend: Send + Sync {
         bucket.to_string()
     }
 
+    /// Why this backend cannot store a NEW object at `prefix`/`filename` of
+    /// `bucket` although key validation accepts it, or `None`: a folder of the
+    /// key whose name is a file of the proxy in its parent (the filesystem
+    /// keeps baselines, deltas, temp files and folder markers by name).
+    /// Asked for every write that creates a key, never for a read or a delete.
+    /// A wrapper must forward it (guard `wrappers_forward_the_new_key_refusal`).
+    fn new_key_refusal(&self, bucket: &str, prefix: &str, filename: &str) -> Option<String> {
+        let _ = (bucket, prefix, filename);
+        None
+    }
+
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -1777,6 +1788,25 @@ pub trait StorageBackend: Send + Sync {
         bucket: &str,
         scope: &str,
     ) -> impl Future<Output = Result<Vec<String>, StorageError>> + Send;
+
+    /// [`Self::list_reference_prefixes`] as a stream, for a caller that must
+    /// not hold the whole list (the boot scan of a bucket with a deltaspace
+    /// for each object). The default lists them; the filesystem walks its
+    /// directories one entry at a time. Every wrapper must forward it, or
+    /// the bound silently disappears.
+    fn list_reference_prefix_stream(
+        &self,
+        bucket: &str,
+        scope: &str,
+    ) -> impl Future<Output = Result<BoxStream<'static, Result<String, StorageError>>, StorageError>>
+           + Send {
+        async move {
+            let all = self.list_reference_prefixes(bucket, scope).await?;
+            Ok(futures::StreamExt::boxed(futures::stream::iter(
+                all.into_iter().map(Ok),
+            )))
+        }
+    }
 
     /// Get total storage size used (for metrics), optionally scoped to a bucket
     fn total_size(

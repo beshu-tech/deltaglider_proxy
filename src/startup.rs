@@ -809,6 +809,12 @@ fn init_config_db_attempt(
                 }
             }
 
+            if let Ok(rules) = db.load_group_mapping_rules() {
+                deltaglider_proxy::iam::external_auth::mapping::warn_email_regex_rules_that_changed(
+                    &rules,
+                );
+            }
+
             // If DB has existing users, switch to IAM mode
             if let Ok(users) = db.load_users() {
                 if !users.is_empty() {
@@ -1763,6 +1769,7 @@ pub async fn init_config_sync(
     external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
     sessions: &Arc<deltaglider_proxy::session::SessionStore>,
     boot: &CoordinationBoot,
+    jobs_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::JobsDb>>>,
 ) -> Option<Arc<ConfigDbSync>> {
     let sync_bucket = match &config.config_sync_bucket {
         Some(b) if !b.is_empty() => b.clone(),
@@ -1794,7 +1801,8 @@ pub async fn init_config_sync(
         .map(|s| {
             Arc::new(
                 s.with_profile_cell(boot.profile.clone())
-                    .with_status(boot.status.clone()),
+                    .with_status(boot.status.clone())
+                    .with_jobs_db(jobs_db.clone()),
             )
         })
     };
@@ -1817,6 +1825,7 @@ pub async fn init_config_sync(
     };
 
     info!("Config DB S3 sync: enabled (bucket={})", sync_bucket);
+    sync.seed_generation_floor(config_db).await;
 
     // Boot gate: PROVE the coordination bucket enforces atomic conditional
     // writes before any HA feature (leases, single-writer locks) hinges on it.
@@ -2239,17 +2248,21 @@ pub async fn shutdown_signal() {
 // The ones covered below are called from main.rs on every boot; a bug
 // here is a boot-path regression that nothing else would catch.
 // ─────────────────────────────────────────────────────────────────────
+/// Buckets that the boot scans at once.
+const BOOT_SCANS_AT_ONCE: usize = 4;
+
 /// Issue #120: an admin apply that turns on encryption over a bucket's
 /// plaintext history opens a conversion window and starts the re-encrypt
 /// job; a restart from an edited file (operator, Helm, GitOps) does the
-/// same here. In the background (boot does not wait), sample each bucket
-/// that encrypts with a proxy key, does not serve plaintext and has no
-/// open conversion window. A bucket with plaintext, no key claim and no
-/// marker starts its conversion
+/// same here. In the background (boot does not wait), scan each bucket
+/// that encrypts with a proxy key and has no open conversion window. A
+/// bucket that this proxy never encrypted, whose whole listing holds
+/// plaintext and nothing sealed, with no key claim and no marker, starts
+/// its conversion
 /// (`maintenance::conversion::start_at_boot`); any other refused object
 /// is a warning that names it and the request that converts it.
 pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Config) {
-    const SAMPLE: u32 = 100;
+    const SAMPLE: u64 = 100;
     let state = state.clone();
     let config = config.clone();
     tokio::spawn(async move {
@@ -2270,31 +2283,36 @@ pub(crate) fn spawn_plaintext_refusal_check(state: &Arc<AppState>, config: &Conf
             })
         });
         use deltaglider_proxy::maintenance::conversion::{start_at_boot, BootConversion};
-        for bucket in refusing {
-            match start_at_boot(&state, &config, bucket, SAMPLE).await {
-                Ok(BootConversion::WindowOpen | BootConversion::NoPlaintext) => {}
-                Ok(BootConversion::Started { run, job_id }) => info!(
-                    "bucket '{bucket}' encrypts with a proxy key and holds plaintext history: \
+        use futures::StreamExt;
+        // A few buckets at a time: each scan sends one HEAD per object.
+        let (state, config) = (&state, &config);
+        futures::stream::iter(refusing)
+            .for_each_concurrent(BOOT_SCANS_AT_ONCE, |bucket| async move {
+                match start_at_boot(state, config, bucket, SAMPLE).await {
+                    Ok(BootConversion::WindowOpen | BootConversion::NoPlaintext) => {}
+                    Ok(BootConversion::Started { run, job_id }) => info!(
+                        "bucket '{bucket}' encrypts with a proxy key and holds plaintext history: \
                      the boot opened its conversion window (run {}) and queued the re-encrypt \
                      job maintenance:{job_id}; clients read the history until the job ends",
-                    hex::encode(run)
-                ),
-                Ok(BootConversion::NoAtomicWrites { key, why }) => {
-                    warn!("{}", boot_conversion_advice(bucket, &key, &why, true))
+                        hex::encode(run)
+                    ),
+                    Ok(BootConversion::NoAtomicWrites { key, why }) => {
+                        warn!("{}", boot_conversion_advice(bucket, &key, &why, true))
+                    }
+                    Ok(BootConversion::Refused { key, why }) => {
+                        // A bucket on a backend without atomic writes cannot be
+                        // converted, whatever stopped the boot: the advice is the
+                        // way out, never a re-encrypt that the backend refuses.
+                        let non_atomic = state
+                            .atomic_write_block(bucket)
+                            .await
+                            .is_some_and(|b| b.is_read_only());
+                        warn!("{}", boot_conversion_advice(bucket, &key, &why, non_atomic))
+                    }
+                    Err(e) => warn!("plaintext check of bucket '{bucket}' failed: {e}"),
                 }
-                Ok(BootConversion::Refused { key, why }) => {
-                    // A bucket on a backend without atomic writes cannot be
-                    // converted, whatever stopped the boot: the advice is the
-                    // way out, never a re-encrypt that the backend refuses.
-                    let non_atomic = state
-                        .atomic_write_block(bucket)
-                        .await
-                        .is_some_and(|b| b.is_read_only());
-                    warn!("{}", boot_conversion_advice(bucket, &key, &why, non_atomic))
-                }
-                Err(e) => warn!("plaintext check of bucket '{bucket}' failed: {e}"),
-            }
-        }
+            })
+            .await;
     });
 }
 

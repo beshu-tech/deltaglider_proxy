@@ -67,10 +67,12 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
         value={rule.match_value}
         onChange={e => onUpdate({ match_value: e.target.value })}
         style={{ width: 180 }}
+        title={rule.match_type === 'email_regex' ? 'The pattern must match the whole address.' : undefined}
         placeholder={
           rule.match_type === 'email_glob' ? '*@company.com' :
           rule.match_type === 'email_domain' ? 'company.com' :
           rule.match_type === 'email_exact' ? 'alice@company.com' :
+          rule.match_type === 'email_regex' ? '.*@company\\.com' :
           'value'
         }
       />

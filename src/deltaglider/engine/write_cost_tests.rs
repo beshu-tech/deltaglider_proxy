@@ -186,16 +186,16 @@ async fn a_raw_delta_write_drops_the_other_form_through_the_helper() {
     let meta = engine.delta_meta("b", "run", filename).await.unwrap();
     for (prior, deletes) in [(CounterPrior::Absent, 0), (CounterPrior::Unknown, 1)] {
         fake.clear();
-        let lock = engine.lock_object_write("b", "run/copy.zip").await;
+        let lock = engine
+            .lock_object_write("b", "run/copy.zip", crate::types::WriteOrigin::Client)
+            .await;
         let res: Result<(), EngineError> = engine
             .with_dest_prefix_lock("b", "run", || async {
+                let gate = engine.gate_write(&lock)?;
                 Ok(engine
                     .put_delta_raw(
                         &crate::transfer::CommitTicket::for_test(),
-                        &lock,
-                        "b",
-                        "run",
-                        "copy.zip",
+                        &gate,
                         crate::storage::PutBody::Bytes(bytes::Bytes::copy_from_slice(&bytes)),
                         &meta,
                         &prior,
@@ -261,7 +261,9 @@ async fn a_form_a_peer_adds_after_the_read_is_dropped_by_the_next_write() {
     fake.clear();
     engine
         .store_inner(
-            &engine.lock_object_write("b", key).await,
+            &engine
+                .lock_object_write("b", key, crate::types::WriteOrigin::Client)
+                .await,
             "b",
             key,
             &Bytes::from(ours.clone()),
@@ -565,27 +567,30 @@ fn variant(base: &[u8], n: u8) -> Vec<u8> {
 /// downloaded the whole reference.bin: 2 reference GETs for 2 PUTs, now 1.
 #[tokio::test]
 async fn back_to_back_large_puts_download_the_reference_once() {
-    let (endpoint, fake) = crate::storage::fake_s3::start().await;
-    let base = noise(51, 64 * 1024);
-    let seeder = spooling_engine_at(&endpoint);
-    seeder.create_bucket("b").await.unwrap();
-    put_large(&seeder, "rel/a.zip", &base).await;
-    // Another engine (another node, or after the cache TTL): nothing cached.
-    let engine = spooling_engine_at(&endpoint);
-    fake.clear();
-    for n in 1..=2 {
-        let r = put_large(&engine, &format!("rel/v{n}.zip"), &variant(&base, n)).await;
-        assert_eq!(r.metadata.storage_info.label(), "delta");
-    }
-    assert_eq!(reference_gets(&fake), 1, "{:#?}", fake.requests());
-    // The deltas decode against the reference they were encoded with.
-    for n in 1..=2u8 {
-        let (got, _) = engine
-            .retrieve("b", &format!("rel/v{n}.zip"))
-            .await
-            .unwrap();
-        assert_eq!(got, variant(&base, n));
-    }
+    crate::deltaglider::spool::as_background(async {
+        let (endpoint, fake) = crate::storage::fake_s3::start().await;
+        let base = noise(51, 64 * 1024);
+        let seeder = spooling_engine_at(&endpoint);
+        seeder.create_bucket("b").await.unwrap();
+        put_large(&seeder, "rel/a.zip", &base).await;
+        // Another engine (another node, or after the cache TTL): nothing cached.
+        let engine = spooling_engine_at(&endpoint);
+        fake.clear();
+        for n in 1..=2 {
+            let r = put_large(&engine, &format!("rel/v{n}.zip"), &variant(&base, n)).await;
+            assert_eq!(r.metadata.storage_info.label(), "delta");
+        }
+        assert_eq!(reference_gets(&fake), 1, "{:#?}", fake.requests());
+        // The deltas decode against the reference they were encoded with.
+        for n in 1..=2u8 {
+            let (got, _) = engine
+                .retrieve("b", &format!("rel/v{n}.zip"))
+                .await
+                .unwrap();
+            assert_eq!(got, variant(&base, n));
+        }
+    })
+    .await
 }
 
 /// P2.7: the PUT that creates a reference keeps its body as the folder's
@@ -660,44 +665,47 @@ async fn a_large_put_refuses_a_corrupt_reference() {
 /// passed the bytes. A buffered PUT keeps its small delta in memory.
 #[tokio::test]
 async fn a_kept_streaming_delta_commits_from_its_spool_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let faulty = crate::storage::FaultyFs::new(
-        crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+    crate::deltaglider::spool::as_background(async {
+        let dir = tempfile::tempdir().unwrap();
+        let faulty = crate::storage::FaultyFs::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let faults = faulty.faults.clone();
+        let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
+        let mut config = Config::default();
+        config.tuning.spool_threshold_bytes = Some(1024);
+        let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
+        engine.create_bucket("b").await.unwrap();
+        let base = noise(61, 64 * 1024);
+        // The first PUT is the baseline and a delta against itself.
+        for (n, key) in [(1, "rel/a.zip"), (2, "rel/v1.zip")] {
+            let body = if n == 1 {
+                base.clone()
+            } else {
+                variant(&base, 1)
+            };
+            let r = put_large(&engine, key, &body).await;
+            assert_eq!(r.metadata.storage_info.label(), "delta");
+            assert_eq!(faults.delta_file_writes(), n, "the delta went as a file");
+        }
+        let (got, _) = engine.retrieve("b", "rel/v1.zip").await.unwrap();
+        assert_eq!(got, variant(&base, 1));
+        // The buffered PUT (below the threshold) writes its delta from memory.
+        let small = noise(62, 900);
+        engine
+            .store("b", "small/a.zip", &small, None, HashMap::new())
             .await
-            .unwrap(),
-    );
-    let faults = faulty.faults.clone();
-    let backend: Box<DynStorageBackend<'static>> = DynStorageBackend::new_box(faulty);
-    let mut config = Config::default();
-    config.tuning.spool_threshold_bytes = Some(1024);
-    let engine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
-    engine.create_bucket("b").await.unwrap();
-    let base = noise(61, 64 * 1024);
-    // The first PUT is the baseline and a delta against itself.
-    for (n, key) in [(1, "rel/a.zip"), (2, "rel/v1.zip")] {
-        let body = if n == 1 {
-            base.clone()
-        } else {
-            variant(&base, 1)
-        };
-        let r = put_large(&engine, key, &body).await;
+            .unwrap();
+        let mut v = small.clone();
+        v[10] ^= 1;
+        let r = engine
+            .store("b", "small/b.zip", &v, None, HashMap::new())
+            .await
+            .unwrap();
         assert_eq!(r.metadata.storage_info.label(), "delta");
-        assert_eq!(faults.delta_file_writes(), n, "the delta went as a file");
-    }
-    let (got, _) = engine.retrieve("b", "rel/v1.zip").await.unwrap();
-    assert_eq!(got, variant(&base, 1));
-    // The buffered PUT (below the threshold) writes its delta from memory.
-    let small = noise(62, 900);
-    engine
-        .store("b", "small/a.zip", &small, None, HashMap::new())
-        .await
-        .unwrap();
-    let mut v = small.clone();
-    v[10] ^= 1;
-    let r = engine
-        .store("b", "small/b.zip", &v, None, HashMap::new())
-        .await
-        .unwrap();
-    assert_eq!(r.metadata.storage_info.label(), "delta");
-    assert_eq!(faults.delta_file_writes(), 2, "a buffered delta is bytes");
+        assert_eq!(faults.delta_file_writes(), 2, "a buffered delta is bytes");
+    })
+    .await
 }

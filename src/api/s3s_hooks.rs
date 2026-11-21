@@ -40,39 +40,82 @@ impl S3Auth for DeltaGliderS3sAuth {
                 // banner say.
                 Ok(SecretKey::from(access_key.to_string()))
             }
-            IamState::Legacy(auth) if access_key == auth.access_key_id => {
+            IamState::Legacy(auth)
+                if crate::security::secret_eq(
+                    access_key.as_bytes(),
+                    auth.access_key_id.as_bytes(),
+                ) =>
+            {
                 Ok(SecretKey::from(auth.secret_access_key.clone()))
             }
-            IamState::Iam(index) => index
-                .get(access_key)
-                .filter(|user| user.enabled)
-                .map(|user| SecretKey::from(user.secret_access_key.clone()))
-                .ok_or_else(|| s3s::s3_error!(InvalidAccessKeyId)),
-            _ => Err(s3s::s3_error!(InvalidAccessKeyId)),
+            // An unknown or disabled key id: a secret nobody has, so s3s
+            // answers SignatureDoesNotMatch as for a wrong secret.
+            IamState::Iam(index) => Ok(SecretKey::from(
+                index
+                    .get(access_key)
+                    .filter(|user| user.enabled)
+                    .map_or_else(
+                        || crate::security::unmatchable_secret().to_string(),
+                        |user| user.secret_access_key.clone(),
+                    ),
+            )),
+            _ => Ok(SecretKey::from(
+                crate::security::unmatchable_secret().to_string(),
+            )),
         }
     }
 }
 
+/// The only S3 operations the anonymous (`$anonymous`) principal may run:
+/// public reads and public listings. Judged on the s3s operation, never on
+/// the method or the query text.
+const ANONYMOUS_OPS: [&str; 4] = ["GetObject", "HeadObject", "ListObjects", "ListObjectsV2"];
+
+/// Pure: whether the anonymous principal may run the s3s operation `op`.
+pub(crate) fn anonymous_may_run(op: &str) -> bool {
+    ANONYMOUS_OPS.contains(&op)
+}
+
 /// s3s access hook: refuses a request unless s3s verified the identity the
-/// SigV4 middleware resolved, then runs the post-verification gates.
+/// SigV4 middleware resolved, then answers the authorization verdict that
+/// the IAM middleware recorded, then runs the post-verification gates.
+///
+/// THE order: no layer before this hook shows an authorization verdict (or
+/// anything else that depends on which key ids exist) to a caller whose
+/// signature s3s has not verified. This hook runs after s3s checked the
+/// signature and before s3s reads any body (`ops/mod.rs`: the access check
+/// precedes `extract_full_body`, and no operation handler has run).
 #[derive(Clone)]
 pub struct VerifiedIdentityS3sAccess;
 
 #[async_trait::async_trait]
 impl S3Access for VerifiedIdentityS3sAccess {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> s3s::S3Result<()> {
-        // IAM/admission authorization is enforced by the outer Axum
-        // middleware chain, against the identity the SigV4 middleware
-        // resolved. This hook binds that identity to the key s3s verified
-        // (see `resolved_identity_is_verified`). It also replaces s3s'
-        // default "auth provider implies anonymous deny", which would
-        // reject already-admitted public/open-mode requests.
+        // The outer middleware resolves identity and records the IAM verdict;
+        // this hook binds it to the key s3s verified and answers it.
         check_grant_xml_body_size(
             cx.s3_op().name(),
             cx.headers().get(axum::http::header::CONTENT_LENGTH),
         )?;
         let verified = cx.credentials().map(|c| c.access_key.clone());
         let resolved = crate::iam::request_principal(cx.extensions_mut()).cloned();
+        // No principal for the key id: s3s could verify only another identity.
+        if cx
+            .extensions_mut()
+            .get::<crate::api::auth::UnresolvedCredential>()
+            .is_some()
+        {
+            return Err(s3s::s3_error!(SignatureDoesNotMatch));
+        }
+        if resolved.as_deref().is_some_and(|u| u.is_anonymous())
+            && !anonymous_may_run(cx.s3_op().name())
+        {
+            tracing::warn!(
+                "SECURITY | event=anonymous_operation_refused | op={}",
+                cx.s3_op().name()
+            );
+            return Err(s3s::s3_error!(AccessDenied));
+        }
         if crate::api::auth::resolved_identity_is_verified(resolved.as_deref(), verified.as_deref())
         {
             // Only a real verified credential counts as an auth success
@@ -84,6 +127,25 @@ impl S3Access for VerifiedIdentityS3sAccess {
                         outcome.mark_identified();
                     }
                 }
+            }
+            // The IAM verdict is shown only now: the signature is verified
+            // (or the request needs none: anonymous, open access).
+            if let Some(denied) = cx
+                .extensions_mut()
+                .get::<crate::iam::middleware::AuthzDenied>()
+                .cloned()
+            {
+                // Audit-log every IAM denial with the resolved (action,
+                // bucket, key) the check evaluated.
+                crate::audit::audit_log(
+                    "access_denied",
+                    &denied.user,
+                    &format!("{:?}", denied.action),
+                    cx.headers(),
+                    &denied.bucket,
+                    &denied.key,
+                );
+                return Err(s3s::s3_error!(AccessDenied));
             }
             // The maintenance + backend-health gates run HERE, after s3s
             // verified the signature: their 503 names a busy bucket or a
@@ -101,6 +163,7 @@ impl S3Access for VerifiedIdentityS3sAccess {
             )
             .map_err(s3s::S3Error::from)
         } else {
+            // s3s verified another identity than the one we resolved.
             tracing::warn!(
                 "SECURITY | event=identity_mismatch | resolved={} | verified={}",
                 resolved
@@ -109,7 +172,7 @@ impl S3Access for VerifiedIdentityS3sAccess {
                     .unwrap_or(""),
                 verified.as_deref().unwrap_or("<none>")
             );
-            Err(s3s::s3_error!(AccessDenied))
+            Err(s3s::s3_error!(SignatureDoesNotMatch))
         }
     }
 }
@@ -120,6 +183,11 @@ impl S3Access for VerifiedIdentityS3sAccess {
 /// about 2.1 MB; the cap leaves room for longer ETags and DeleteObjects
 /// with 1,000 entity-escaped keys.
 pub const S3S_XML_MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
+
+/// The largest file part s3s reads for a `PostObject`. The router never lets
+/// such a request reach s3s (the browser form is served by the form handler,
+/// every other multipart POST is refused), so this is a second bound.
+pub const S3S_POST_OBJECT_MAX_FILE_SIZE: u64 = 1024 * 1024;
 
 /// The operations whose XML body s3s parses through a `Grantee` start tag,
 /// the only tag whose attributes it iterates (`Grant` and `TargetGrant` in
@@ -166,6 +234,7 @@ pub fn s3s_config(clock_skew_secs: u32) -> std::sync::Arc<s3s::config::StaticCon
     let mut config = s3s::config::S3Config::default();
     config.presigned_url_max_skew_time_secs = clock_skew_secs;
     config.xml_max_body_size = S3S_XML_MAX_BODY_SIZE;
+    config.post_object_max_file_size = S3S_POST_OBJECT_MAX_FILE_SIZE;
     std::sync::Arc::new(s3s::config::StaticConfigProvider::new(std::sync::Arc::new(
         config,
     )))
@@ -175,6 +244,61 @@ pub fn s3s_config(clock_skew_secs: u32) -> std::sync::Arc<s3s::config::StaticCon
 mod tests {
     use super::*;
     use s3s::config::S3ConfigProvider as _;
+
+    #[test]
+    fn the_anonymous_principal_runs_only_reads_and_lists() {
+        for op in ["GetObject", "HeadObject", "ListObjects", "ListObjectsV2"] {
+            assert!(anonymous_may_run(op), "{op}");
+        }
+        for op in [
+            "ListMultipartUploads",
+            "ListParts",
+            "ListObjectVersions",
+            "ListBuckets",
+            "HeadBucket",
+            "GetBucketAcl",
+            "GetBucketVersioning",
+            "GetBucketLocation",
+            "GetObjectAcl",
+            "GetObjectTagging",
+            "GetObjectAttributes",
+            "PutObject",
+            "CreateMultipartUpload",
+            "DeleteObject",
+            "PostObject",
+        ] {
+            assert!(!anonymous_may_run(op), "{op}");
+        }
+    }
+
+    /// Source guard: the access hook answers the recorded authorization
+    /// verdict only after it bound the identity to the key s3s verified.
+    #[test]
+    fn the_authorization_verdict_is_answered_after_the_identity_is_verified() {
+        let text: String =
+            crate::source_scan::prod_lines(&crate::source_scan::read("src/api/s3s_hooks.rs"))
+                .into_iter()
+                .map(|(_, l)| format!("{l}\n"))
+                .collect();
+        let verified = text
+            .find("resolved_identity_is_verified(resolved")
+            .expect("the identity check");
+        let verdict = text
+            .find("AuthzDenied>()")
+            .expect("the recorded verdict is read");
+        assert!(
+            verified < verdict,
+            "the verdict is answered before the identity check"
+        );
+    }
+
+    #[test]
+    fn s3s_reads_a_post_object_file_up_to_a_small_cap() {
+        assert_eq!(
+            s3s_config(900).snapshot().post_object_max_file_size,
+            S3S_POST_OBJECT_MAX_FILE_SIZE
+        );
+    }
 
     #[test]
     fn s3s_reads_xml_bodies_up_to_the_cap() {

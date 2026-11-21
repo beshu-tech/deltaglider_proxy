@@ -356,6 +356,7 @@ pub(crate) mod iam_merge;
 pub(crate) mod job_store;
 pub mod jobs_db;
 pub mod key;
+mod node_facts;
 pub mod restore;
 mod users;
 pub(crate) use users::first_free_user_name;
@@ -1701,7 +1702,7 @@ mod tests {
         // Merging a peer encrypted with a different key must fail and leave the
         // local IAM untouched (no half-applied wipe).
         assert!(local
-            .merge_iam_from(&peer_path, None, "local-pass")
+            .merge_iam_from(&peer_path, None, "local-pass", 0)
             .is_err());
         assert_eq!(
             local.load_users().unwrap().len(),
@@ -1728,7 +1729,7 @@ mod tests {
                 .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
                 .unwrap();
         }
-        let err = local.merge_iam_from(&peer_path, None, pass).unwrap_err();
+        let err = local.merge_iam_from(&peer_path, None, pass, 0).unwrap_err();
         assert!(
             err.to_string().contains("schema"),
             "expected a schema-version rejection, got: {err}"

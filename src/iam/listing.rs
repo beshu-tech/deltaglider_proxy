@@ -307,8 +307,7 @@ async fn visible_key_under<L: Lister>(
     lister: &L,
     bucket: &str,
     folded: &str,
-    user: &crate::iam::AuthenticatedUser,
-    context: &iam_rs::Context,
+    vis: &Visibility<'_>,
     budget: &mut usize,
     resumed: Option<Option<String>>,
 ) -> Result<Proof, EngineError> {
@@ -336,7 +335,7 @@ async fn visible_key_under<L: Lister>(
         *budget = budget.saturating_sub(scan_cost(requests));
         for (key, _) in &page.objects {
             if key.starts_with(folded) {
-                if user_can_see_listed_key(user, bucket, key, context) {
+                if vis.sees_key(bucket, key) {
                     return Ok(Proof::Visible);
                 }
             } else if key.as_str() > folded {
@@ -393,10 +392,11 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     cursor: Option<&str>,
     metadata: bool,
     scope: Option<&ListScope>,
+    rules: Option<&crate::admission::ResourceRules>,
     budget: usize,
     proof: Option<ProofResume>,
 ) -> Result<CallerPage, EngineError> {
-    let Some(Visibility { user, context }) = Visibility::of(scope) else {
+    let Some(vis) = Visibility::of(scope, rules, bucket) else {
         return Ok(CallerPage {
             page: lister
                 .list_for_client(bucket, prefix, delimiter, max_keys, cursor, metadata)
@@ -414,8 +414,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
         prefix,
         delimiter,
         cursor,
-        user,
-        context,
+        &vis,
         want,
         &mut budget,
         proof,
@@ -466,11 +465,13 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
 /// reads each engine page once. A walk that spends the budget before the
 /// end is `ScanBudgetSpent`, because a partial folder must never be acted
 /// on. An unrestricted caller is bounded by `max_keys`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn list_keys_for_caller<L: Lister>(
     lister: &L,
     bucket: &str,
     prefix: &str,
     scope: Option<&ListScope>,
+    rules: Option<&crate::admission::ResourceRules>,
     start_after: Option<&str>,
     max_keys: usize,
     budget: usize,
@@ -479,7 +480,7 @@ pub(crate) async fn list_keys_for_caller<L: Lister>(
     let mut keys = Vec::new();
     // The engine's cursor is a key: the listing starts after it.
     let mut cursor: Option<String> = start_after.filter(|k| !k.is_empty()).map(String::from);
-    let visibility = Visibility::of(scope);
+    let visibility = Visibility::of(scope, rules, bucket);
     loop {
         let (objects, next) = match &visibility {
             None => {
@@ -489,7 +490,7 @@ pub(crate) async fn list_keys_for_caller<L: Lister>(
                 let next = page.next_continuation_token.filter(|_| page.is_truncated);
                 (page.objects, next)
             }
-            Some(Visibility { user, context }) => {
+            Some(vis) => {
                 let want = max_keys.saturating_sub(keys.len()) + 1;
                 let scan = scan_visible(
                     lister,
@@ -497,8 +498,7 @@ pub(crate) async fn list_keys_for_caller<L: Lister>(
                     prefix,
                     None,
                     cursor.as_deref(),
-                    user,
-                    context,
+                    vis,
                     want,
                     &mut budget,
                     None,
@@ -551,17 +551,64 @@ fn range_is_past(prefix: &str, cursor: Option<&str>) -> bool {
     cursor.is_some_and(|c| c > prefix && !c.starts_with(prefix))
 }
 
-/// The policy a filtered listing filters with.
+/// What a filtered listing filters with: the caller's IAM policy (a
+/// `ListScope::Filtered` caller) and the admission rules of the request
+/// ([`crate::admission::ResourceRules`]). An entry is visible only when both
+/// show it.
 struct Visibility<'a> {
-    user: &'a crate::iam::AuthenticatedUser,
-    context: &'a iam_rs::Context,
+    iam: Option<(&'a crate::iam::AuthenticatedUser, &'a iam_rs::Context)>,
+    /// The rules of the bucket (its name lowered and its blocks picked once).
+    rules: Option<crate::admission::BucketRules<'a>>,
 }
 
 impl<'a> Visibility<'a> {
-    fn of(scope: Option<&'a ListScope>) -> Option<Self> {
-        match scope {
-            Some(ListScope::Filtered { user, context }) => Some(Self { user, context }),
+    /// `None` when nothing filters: the listing is the engine's.
+    fn of(
+        scope: Option<&'a ListScope>,
+        rules: Option<&'a crate::admission::ResourceRules>,
+        bucket: &'a str,
+    ) -> Option<Self> {
+        let iam = match scope {
+            Some(ListScope::Filtered { user, context }) => Some((&**user, &**context)),
             _ => None,
+        };
+        let rules = rules
+            .filter(|r| r.affects_bucket(bucket))
+            .map(|r| r.in_bucket(bucket));
+        (iam.is_some() || rules.is_some()).then_some(Self { iam, rules })
+    }
+
+    fn sees_key(&self, bucket: &str, key: &str) -> bool {
+        self.iam
+            .is_none_or(|(user, context)| user_can_see_listed_key(user, bucket, key, context))
+            && self.rules.as_ref().is_none_or(|r| r.lists_key(key))
+    }
+
+    /// May the folder name be shown at all (before any proof)?
+    fn sees_prefix(&self, bucket: &str, name: &str) -> bool {
+        self.iam
+            .is_none_or(|(user, context)| user_can_see_common_prefix(user, bucket, name, context))
+            && self
+                .rules
+                .as_ref()
+                .is_none_or(|r| r.prefix_verdict(name) != crate::admission::PrefixVerdict::Hidden)
+    }
+
+    /// Can a hidden key lie under the folder name? Then the name is shown
+    /// only when a visible key lies under it too ([`visible_key_under`]).
+    fn may_hide_under(&self, bucket: &str, name: &str) -> bool {
+        self.iam
+            .is_some_and(|(user, _)| deny_may_hide_keys_under(user, bucket, name))
+            || self.rules.as_ref().is_some_and(|r| {
+                r.prefix_verdict(name) == crate::admission::PrefixVerdict::NeedsProof
+            })
+    }
+
+    /// The key prefixes that hold every key the caller can see.
+    fn visible_prefixes(&self, bucket: &str) -> Vec<String> {
+        match self.iam {
+            Some((user, _)) => crate::iam::permissions::visible_key_prefixes(user, bucket),
+            None => vec![String::new()],
         }
     }
 }
@@ -619,13 +666,12 @@ async fn scan_visible<L: Lister>(
     prefix: &str,
     delimiter: Option<&str>,
     cursor: Option<&str>,
-    user: &crate::iam::AuthenticatedUser,
-    context: &iam_rs::Context,
+    vis: &Visibility<'_>,
     want: usize,
     budget: &mut usize,
     resume: Option<ProofResume>,
 ) -> Result<Scanned, EngineError> {
-    let visible = crate::iam::permissions::visible_key_prefixes(user, bucket);
+    let visible = vis.visible_prefixes(bucket);
     let mut targets = list_targets(prefix, delimiter, &visible);
     let engine_takes = |t: &ListTarget| match t {
         ListTarget::Scan(p) => crate::types::ObjectKey::validate_prefix(p).is_ok(),
@@ -661,7 +707,7 @@ async fn scan_visible<L: Lister>(
                 position
                     .as_deref()
                     .is_some_and(|c| common_prefix.as_str() <= c)
-                    || !user_can_see_common_prefix(user, bucket, common_prefix, context)
+                    || !vis.sees_prefix(bucket, common_prefix)
             }
         };
         if adds_nothing {
@@ -679,7 +725,7 @@ async fn scan_visible<L: Lister>(
                 common_prefix,
                 probes,
             } => {
-                if deny_may_hide_keys_under(user, bucket, &common_prefix) {
+                if vis.may_hide_under(bucket, &common_prefix) {
                     // A Deny may protect keys under the name: one probe key
                     // could be a hidden one. Look for a visible key under
                     // each visible prefix: every visible key lies under one.
@@ -694,10 +740,8 @@ async fn scan_visible<L: Lister>(
                             continue;
                         }
                         skipping = false;
-                        proof = visible_key_under(
-                            lister, bucket, probe, user, context, budget, resumed,
-                        )
-                        .await?;
+                        proof =
+                            visible_key_under(lister, bucket, probe, vis, budget, resumed).await?;
                         if proof != Proof::NotVisible {
                             proved = probe.clone();
                             break;
@@ -767,17 +811,15 @@ async fn scan_visible<L: Lister>(
                 folded_names.sort();
                 let mut cut: Option<(String, String, Option<String>)> = None;
                 for folded in &folded_names {
-                    if !user_can_see_common_prefix(user, bucket, folded, context) {
+                    if !vis.sees_prefix(bucket, folded) {
                         continue;
                     }
-                    if !deny_may_hide_keys_under(user, bucket, folded) {
+                    if !vis.may_hide_under(bucket, folded) {
                         scan.prefixes.insert(folded.clone());
                         continue;
                     }
                     let resumed = take_resume(&mut pending, folded);
-                    match visible_key_under(lister, bucket, folded, user, context, budget, resumed)
-                        .await?
-                    {
+                    match visible_key_under(lister, bucket, folded, vis, budget, resumed).await? {
                         Proof::Visible => {
                             scan.prefixes.insert(folded.clone());
                         }
@@ -805,7 +847,7 @@ async fn scan_visible<L: Lister>(
                     page.objects
                         .into_iter()
                         .filter(|(key, _)| below.is_none_or(|name| key.as_str() < name))
-                        .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
+                        .filter(|(key, _)| vis.sees_key(bucket, key)),
                 );
                 if let Some((name, before, inner)) = cut {
                     scan.resume = Some(before);
@@ -906,6 +948,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             2,
             None,
         )
@@ -924,6 +967,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             6,
             None,
         )
@@ -952,6 +996,7 @@ mod tests {
             Some(start_after),
             false,
             Some(scope),
+            None,
             budget,
             None,
         )
@@ -1082,6 +1127,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             10,
             None,
         )
@@ -1171,6 +1217,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             TEST_BUDGET,
             None,
         )
@@ -1187,6 +1234,7 @@ mod tests {
             p1.next_continuation_token.as_deref(),
             false,
             Some(&scope),
+            None,
             TEST_BUDGET,
             None,
         )
@@ -1316,6 +1364,7 @@ mod tests {
                 token.as_deref(),
                 false,
                 Some(scope),
+                None,
                 budget,
                 proof.take(),
             )
@@ -1409,6 +1458,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             1,
             None,
         )
@@ -1426,6 +1476,7 @@ mod tests {
             Some(&cursor),
             false,
             Some(&scope),
+            None,
             1,
             None,
         )
@@ -1464,6 +1515,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             2,
             None,
         )
@@ -1540,6 +1592,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             TEST_BUDGET,
             None,
         )
@@ -1577,13 +1630,13 @@ mod tests {
         };
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
         let lister = counting(keys);
-        let err = list_keys_for_caller(&lister, "b", "", Some(&scope), None, 5000, 2)
+        let err = list_keys_for_caller(&lister, "b", "", Some(&scope), None, None, 5000, 2)
             .await
             .unwrap_err();
         assert!(matches!(err, ListingError::ScanBudgetSpent), "{err:?}");
         assert_eq!(calls(&lister), 2, "the budget is for the whole walk");
         let (keys, truncated) =
-            list_keys_for_caller(&lister, "b", "", Some(&scope), None, 5000, 10)
+            list_keys_for_caller(&lister, "b", "", Some(&scope), None, None, 5000, 10)
                 .await
                 .unwrap();
         assert_eq!(keys.len(), 1001);
@@ -1597,7 +1650,7 @@ mod tests {
         let lister = counting((0..10).map(|i| format!("y/{i}")).collect());
         let scope = scoped(vec![rule("Allow", &["b/x/*"])]);
         let (keys, truncated) =
-            list_keys_for_caller(&lister, "b", "y/", Some(&scope), None, 5000, 10)
+            list_keys_for_caller(&lister, "b", "y/", Some(&scope), None, None, 5000, 10)
                 .await
                 .unwrap();
         assert!(keys.is_empty() && !truncated);
@@ -1608,11 +1661,11 @@ mod tests {
     #[tokio::test]
     async fn a_folder_walk_stops_one_key_past_max() {
         let lister = counting((0..5).map(|i| format!("k/{i}")).collect());
-        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, None, 5, 1)
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, None, None, 5, 1)
             .await
             .unwrap();
         assert_eq!((keys.len(), truncated), (5, false));
-        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, None, 4, 1)
+        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, None, None, 4, 1)
             .await
             .unwrap();
         assert_eq!((keys.len(), truncated), (4, true));
@@ -1623,9 +1676,10 @@ mod tests {
     #[tokio::test]
     async fn a_folder_walk_starts_after_the_given_key() {
         let lister = counting((0..5).map(|i| format!("k/{i}")).collect());
-        let (keys, truncated) = list_keys_for_caller(&lister, "b", "k/", None, Some("k/1"), 2, 1)
-            .await
-            .unwrap();
+        let (keys, truncated) =
+            list_keys_for_caller(&lister, "b", "k/", None, None, Some("k/1"), 2, 1)
+                .await
+                .unwrap();
         assert_eq!(
             (keys, truncated),
             (vec!["k/2".to_string(), "k/3".to_string()], true)
@@ -1654,6 +1708,7 @@ mod tests {
                 cursor.as_deref(),
                 false,
                 Some(&scope),
+                None,
                 50,
                 None,
             )
@@ -1678,7 +1733,7 @@ mod tests {
         let res: Vec<&str> = res.iter().map(String::as_str).collect();
         let scope = scoped(vec![rule("Allow", &res)]);
         let (keys, truncated) =
-            list_keys_for_caller(&lister, "b", "", Some(&scope), None, 5000, 12)
+            list_keys_for_caller(&lister, "b", "", Some(&scope), None, None, 5000, 12)
                 .await
                 .unwrap();
         assert_eq!((keys.len(), truncated), (1006, false));
@@ -1736,6 +1791,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             budget,
             None,
         )
@@ -1775,6 +1831,7 @@ mod tests {
                 token.as_deref(),
                 false,
                 scope,
+                None,
                 50,
                 None,
             )
@@ -1854,6 +1911,7 @@ mod tests {
                     token.as_deref(),
                     false,
                     Some(&scope),
+                    None,
                     TEST_BUDGET,
                     None,
                 )
@@ -1913,6 +1971,7 @@ mod tests {
                         token.as_deref(),
                         false,
                         Some(&scope),
+                        None,
                         budget,
                         None,
                     )
@@ -1961,6 +2020,7 @@ mod tests {
             None,
             true,
             Some(&scope),
+            None,
             64,
             None,
         )
@@ -2071,6 +2131,7 @@ mod tests {
             None,
             false,
             Some(&scope),
+            None,
             2,
             None,
         )

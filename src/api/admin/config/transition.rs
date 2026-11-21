@@ -512,6 +512,8 @@ pub(super) struct GateInputs {
     pub downgrades: Option<Vec<String>>,
     /// The configured buckets (old ∪ new) that no backend lists.
     pub absent: Vec<String>,
+    /// The writer is the migrate job's own: it owns the `__dgmigrate_*` routes.
+    pub server_writer: bool,
 }
 
 impl GateInputs {
@@ -525,6 +527,7 @@ impl GateInputs {
         new_cfg: &Config,
         headers: Option<&HeaderMap>,
         forward: bool,
+        server_writer: bool,
     ) -> Self {
         use crate::config::{confirmed_subjects, CONFIRM_ENCRYPTION_DOWNGRADE_HEADER};
         let judged = |header: &str| forward.then(|| confirmed_subjects(headers, header));
@@ -534,6 +537,7 @@ impl GateInputs {
             key_removals: confirmed_subjects(headers, CONFIRM_KEY_REMOVAL_HEADER),
             downgrades: judged(CONFIRM_ENCRYPTION_DOWNGRADE_HEADER),
             absent,
+            server_writer,
         }
     }
 }
@@ -547,6 +551,8 @@ pub(super) fn static_transition_gates(
     inputs: &GateInputs,
 ) -> Result<(), String> {
     let absent_buckets = &inputs.absent;
+    // Every writer meets the frozen set here, the background ones too.
+    super::write::frozen_check(old_cfg, new_cfg, inputs.server_writer)?;
     // FATAL config-graph errors (bucket → undefined backend, duplicate
     // backend names): un-runnable states that boot refuses too.
     let mut fatal = new_cfg.check_fatal();
@@ -615,13 +621,13 @@ async fn transition_gates(
     let app = ctx.app();
     // A background change (migrate) confirms nothing; the gates judge
     // forward admin writes only.
-    let (headers, forward) = match ctx {
+    let (headers, forward, server_writer) = match ctx {
         TransitionCtx::Admin {
             headers, restoring, ..
-        } => (Some(*headers), !*restoring),
-        TransitionCtx::Background { .. } => (None, false),
+        } => (Some(*headers), !*restoring, false),
+        TransitionCtx::Background { .. } => (None, false, true),
     };
-    let inputs = GateInputs::gather(app, old_cfg, new_cfg, headers, forward).await;
+    let inputs = GateInputs::gather(app, old_cfg, new_cfg, headers, forward, server_writer).await;
     static_transition_gates(old_cfg, new_cfg, &inputs)?;
     // A backend host that resolves only to refused addresses would fail
     // every request: refuse the apply that makes one.
@@ -1186,6 +1192,7 @@ mod keyless_proxy_gate_tests {
             key_removals: Vec::new(),
             downgrades: Some(Vec::new()),
             absent: absent.iter().map(|s| s.to_string()).collect(),
+            server_writer: false,
         }
     }
 

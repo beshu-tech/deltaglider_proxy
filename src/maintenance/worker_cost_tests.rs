@@ -747,6 +747,7 @@ async fn the_worker_drains_at_start_and_wakes_when_a_row_comes_due() {
                 crate::iam::IamState::deny_all(),
             )),
             savings: Default::default(),
+            admission: crate::admission::build_shared_chain_from_parts(&Default::default(), &[]),
         },
     );
     let row = settled(&e.db, queued, 2).await;

@@ -110,6 +110,99 @@ pub struct ObjectKey {
 /// The reserved file name of a deltaspace's delta baseline.
 pub const REFERENCE_FILE_NAME: &str = "reference.bin";
 
+/// The suffix of a stored delta.
+pub const DELTA_SUFFIX: &str = ".delta";
+
+/// The file that stores a folder marker on the filesystem backend.
+pub const FOLDER_MARKER_FILE: &str = ".dg-folder-marker";
+
+/// The prefix of the filesystem backend's own temp files.
+pub const TEMP_FILE_PREFIX: &str = ".dg-tmp.";
+
+/// Who writes an object, which decides how strictly its key is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOrigin {
+    /// A client request (PutObject, CopyObject destination, multipart, form
+    /// POST, admin bulk copy or move): a NEW key. Any path segment that is a
+    /// reserved name, in any letter case, is refused.
+    Client,
+    /// A background job (migration, replication, lifecycle transition, backfill,
+    /// re-encrypt rewrite) copying a key that already exists: only the names
+    /// that really collide on the destination backend are refused. The S3
+    /// backend (exact case) refuses the exact names of `validate_object`; a
+    /// filesystem backend adds its own check of its root's case mode.
+    Job,
+}
+
+/// A name that the proxy keeps for its own files inside a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservedName {
+    /// `reference.bin`: the delta baseline of the folder.
+    Baseline,
+    /// A name that ends in `.delta`: a stored delta.
+    DeltaSuffix,
+    /// `.dg`: the proxy's own directory.
+    InternalDir,
+    /// `.dg-folder-marker`: the file of a folder marker.
+    FolderMarker,
+    /// A name that starts with `.dg-tmp.`: a temp file of the filesystem backend.
+    TempFile,
+}
+
+impl ReservedName {
+    /// Why the proxy keeps the name, for the refusal message.
+    pub fn why(self) -> &'static str {
+        match self {
+            Self::Baseline => "the proxy stores the delta baseline of each folder under it",
+            Self::DeltaSuffix => "the proxy stores delta-encoded objects under that suffix",
+            Self::InternalDir => "the proxy keeps its own files in directories with this name",
+            Self::FolderMarker => "the filesystem backend stores folder markers under it",
+            Self::TempFile => "the filesystem backend writes its temp files under that prefix",
+        }
+    }
+}
+
+/// Simple Unicode case folding of `text`: each char lowercased. APFS folds
+/// KELVIN SIGN (U+212A) to `k`, so `.dg-folder-mar\u{212A}er` is the marker
+/// file there; an ASCII-only comparison would miss it.
+fn fold_case(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// THE reserved-name rule, for ONE path segment: compared after Unicode case
+/// folding, because on a case-insensitive disk `REFERENCE.BIN` is the
+/// baseline file. Key validation (a client write refuses a key with such a
+/// segment at any position) and the filesystem segment check both ask it.
+/// The reserved names themselves are lower case.
+pub fn reserved_name(segment: &str) -> Option<ReservedName> {
+    let folded = fold_case(segment);
+    if folded == REFERENCE_FILE_NAME {
+        Some(ReservedName::Baseline)
+    } else if folded == crate::storage::listing_facts::INTERNAL_DIR {
+        Some(ReservedName::InternalDir)
+    } else if folded == FOLDER_MARKER_FILE {
+        Some(ReservedName::FolderMarker)
+    } else if folded.starts_with(TEMP_FILE_PREFIX) {
+        Some(ReservedName::TempFile)
+    } else if folded.ends_with(DELTA_SUFFIX) {
+        Some(ReservedName::DeltaSuffix)
+    } else {
+        None
+    }
+}
+
+/// The first segment of `path` (a key or a prefix, `/`-separated) that is
+/// reserved, with its kind.
+pub fn first_reserved_segment(path: &str) -> Option<(&str, ReservedName)> {
+    path.split('/')
+        .find_map(|segment| reserved_name(segment).map(|kind| (segment, kind)))
+}
+
+/// `true` when `text` starts with the lower-case `prefix`, after case folding.
+fn starts_with_folded(text: &str, prefix: &str) -> bool {
+    fold_case(text).starts_with(prefix)
+}
+
 /// THE rule for "this key is a delta baseline": its last path segment is
 /// exactly [`REFERENCE_FILE_NAME`]. A client key such as
 /// `docs/api-reference.bin` only ends with the same text.
@@ -239,8 +332,23 @@ impl ObjectKey {
     /// malformed `a//b` key (a client path-join bug) — but reads/deletes still
     /// use `validate_object` so pre-existing `//` objects stay reachable for
     /// cleanup. A single trailing `/` (folder marker) is unaffected.
-    pub fn validate_ingest(&self) -> Result<(), KeyValidationError> {
+    pub fn validate_ingest(&self, origin: WriteOrigin) -> Result<(), KeyValidationError> {
         self.validate_object()?;
+        // A CLIENT write is refused when ANY segment is a reserved name
+        // (`a/reference.bin/x` would put a directory where the baseline file goes). A read, a
+        // listing and a delete of a key that already has such a segment
+        // keep working, so an operator can clean up. A job copy of an existing key is
+        // judged by the destination backend itself.
+        if origin == WriteOrigin::Client {
+            if let Some((segment, kind)) = first_reserved_segment(&self.full_key()) {
+                return Err(KeyValidationError(format!(
+                    "Object key '{}' is refused: the path segment '{segment}' is reserved, because {}. \
+                     See {RESERVED_KEYS_DOC_URL}",
+                    self.full_key(),
+                    kind.why()
+                )));
+            }
+        }
         // `parse` strips leading `/` and puts no trailing `/` in the prefix, so
         // any empty segment is an internal `//` (including one just before the
         // filename: `a//x` has prefix `a/`).
@@ -251,10 +359,14 @@ impl ObjectKey {
         }
         // The capability probe writes and removes its keys here, and a sweep
         // removes the stale ones of its own shape: a client key must not live there.
-        if self
-            .full_key()
-            .starts_with(crate::coordination::cas_probe::PROBE_PREFIX)
-        {
+        let full = self.full_key();
+        let in_probe_prefix = match origin {
+            WriteOrigin::Client => {
+                starts_with_folded(&full, crate::coordination::cas_probe::PROBE_PREFIX)
+            }
+            WriteOrigin::Job => full.starts_with(crate::coordination::cas_probe::PROBE_PREFIX),
+        };
+        if in_probe_prefix {
             return Err(KeyValidationError(format!(
                 "Object key '{}' is refused: keys under '{}' are reserved, because the proxy \
                  writes its capability probe there. See {RESERVED_KEYS_DOC_URL}",
@@ -271,8 +383,8 @@ impl ObjectKey {
     /// CreateMultipartUpload): the ingest rule, and a key that ends in `/`
     /// is a folder marker, which only a zero-byte `store` writes. One rule,
     /// so a refused key fails at the first request, not after all parts.
-    pub fn validate_data_ingest(&self) -> Result<(), KeyValidationError> {
-        self.validate_ingest()?;
+    pub fn validate_data_ingest(&self, origin: WriteOrigin) -> Result<(), KeyValidationError> {
+        self.validate_ingest(origin)?;
         if self.is_directory_marker() {
             return Err(KeyValidationError(
                 "A key that ends in '/' is a folder marker and must have an empty body".to_string(),
@@ -1109,7 +1221,7 @@ mod tests {
     fn test_validate_rejects_double_slash() {
         // The CI-uploader path-join bug: an internal `//` is refused at INGEST.
         assert!(ObjectKey::parse("b", "ror/builds//enterprise/x.zip")
-            .validate_ingest()
+            .validate_ingest(WriteOrigin::Client)
             .is_err());
         // ...but reads/deletes stay permissive so existing `//` objects are
         // reachable for cleanup.
@@ -1117,13 +1229,15 @@ mod tests {
             .validate_object()
             .is_ok());
         // `//` just before the file name: prefix `a/`, still an empty segment.
-        assert!(ObjectKey::parse("b", "a//x.zip").validate_ingest().is_err());
+        assert!(ObjectKey::parse("b", "a//x.zip")
+            .validate_ingest(WriteOrigin::Client)
+            .is_err());
         assert!(ObjectKey::parse("b", "a///x.zip")
-            .validate_ingest()
+            .validate_ingest(WriteOrigin::Client)
             .is_err());
         // A clean key + a single trailing slash (folder marker) stay valid on ingest.
         assert!(ObjectKey::parse("b", "ror/builds/enterprise/x.zip")
-            .validate_ingest()
+            .validate_ingest(WriteOrigin::Client)
             .is_ok());
         assert!(ObjectKey::validate_prefix("ror/builds/").is_ok());
     }
@@ -1136,9 +1250,11 @@ mod tests {
         assert!(marker.is_directory_marker());
         assert_eq!(marker.full_key(), "photos/2024/");
         assert!(marker.validate_object().is_ok());
-        assert!(marker.validate_ingest().is_ok());
+        assert!(marker.validate_ingest(WriteOrigin::Client).is_ok());
         assert!(ObjectKey::parse("b", "/").validate_object().is_err());
-        assert!(ObjectKey::parse("b", "a//").validate_ingest().is_err());
+        assert!(ObjectKey::parse("b", "a//")
+            .validate_ingest(WriteOrigin::Client)
+            .is_err());
         assert!(ObjectKey::parse("b", "../").validate_object().is_err());
         assert!(!ObjectKey::parse("b", "photos/a.jpg").is_directory_marker());
     }
@@ -1171,7 +1287,7 @@ mod tests {
         ] {
             let k = ObjectKey::parse("b", key);
             assert!(k.validate_object().is_err(), "{key}");
-            assert!(k.validate_ingest().is_err(), "{key}");
+            assert!(k.validate_ingest(WriteOrigin::Client).is_err(), "{key}");
         }
     }
 
@@ -1191,7 +1307,9 @@ mod tests {
         ] {
             let k = ObjectKey::parse("b", key);
             for e in [
-                k.validate_ingest().unwrap_err().to_string(),
+                k.validate_ingest(WriteOrigin::Client)
+                    .unwrap_err()
+                    .to_string(),
                 k.validate_object().unwrap_err().to_string(),
             ] {
                 assert!(e.contains("reserved directory name"), "{key}: {e}");
@@ -1206,7 +1324,9 @@ mod tests {
             "a.dg/b",
         ] {
             assert!(
-                ObjectKey::parse("b", key).validate_ingest().is_ok(),
+                ObjectKey::parse("b", key)
+                    .validate_ingest(WriteOrigin::Client)
+                    .is_ok(),
                 "{key}"
             );
         }
@@ -1237,7 +1357,7 @@ mod tests {
         assert!(e.contains("'.delta'"), "{e}");
         assert!(e.contains(RESERVED_KEYS_DOC_URL), "{e}");
         let e = ObjectKey::parse("b", ".dg/facts/x")
-            .validate_ingest()
+            .validate_ingest(WriteOrigin::Client)
             .unwrap_err()
             .to_string();
         assert!(e.contains("listing facts"), "{e}");
@@ -1254,7 +1374,7 @@ mod tests {
             format!("{PROBE_PREFIX}sub/x"),
         ] {
             let e = ObjectKey::parse("b", &key)
-                .validate_ingest()
+                .validate_ingest(WriteOrigin::Client)
                 .unwrap_err()
                 .to_string();
             assert!(e.contains(PROBE_PREFIX), "{e}");
@@ -1265,10 +1385,10 @@ mod tests {
             );
         }
         assert!(ObjectKey::parse("b", ".deltaglider/other/x")
-            .validate_ingest()
+            .validate_ingest(WriteOrigin::Client)
             .is_ok());
         assert!(ObjectKey::parse("b", &format!("a/{PROBE_PREFIX}x"))
-            .validate_ingest()
+            .validate_ingest(WriteOrigin::Client)
             .is_ok());
     }
 
@@ -1399,8 +1519,213 @@ mod tests {
 }
 
 #[cfg(test)]
+mod reserved_name_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn the_reserved_names_in_any_case() {
+        use ReservedName::*;
+        for (name, kind) in [
+            ("reference.bin", Baseline),
+            ("REFERENCE.BIN", Baseline),
+            ("Reference.Bin", Baseline),
+            (".dg", InternalDir),
+            (".DG", InternalDir),
+            (".dg-folder-marker", FolderMarker),
+            (".DG-Folder-Marker", FolderMarker),
+            (".dg-tmp.abc", TempFile),
+            (".DG-TMP.", TempFile),
+            // KELVIN SIGN (U+212A) lowercases to `k`; APFS folds it, so this
+            // is the marker file there.
+            (".dg-folder-mar\u{212A}er", FolderMarker),
+            (".DG-FOLDER-MAR\u{212A}ER", FolderMarker),
+            ("app.zip.delta", DeltaSuffix),
+            ("app.zip.DELTA", DeltaSuffix),
+            (".delta", DeltaSuffix),
+        ] {
+            assert_eq!(reserved_name(name), Some(kind), "{name}");
+        }
+        for name in [
+            "api-reference.bin",
+            "reference.bin.txt",
+            ".dgx",
+            ".dg-x",
+            ".dg-tmp",
+            "delta",
+            "x.deltas",
+            "",
+            "app.zip",
+        ] {
+            assert_eq!(reserved_name(name), None, "{name}");
+        }
+    }
+
+    /// DGP-17: a reserved name in ANY segment refuses a write, with a message
+    /// that names the segment; a read or delete of such a key still passes
+    /// key validation (an operator can clean up).
+    #[test]
+    fn a_write_refuses_a_reserved_segment_at_any_position() {
+        for key in [
+            "a/reference.bin/x.txt",
+            "a/REFERENCE.BIN/x.txt",
+            "reference.bin/x",
+            "a/x.zip.delta/y",
+            "a/X.ZIP.DELTA/y",
+            "a/.dg-folder-marker/y",
+            "a/.dg-tmp.q/y",
+            "a/b/.DG/y",
+            "a/Reference.Bin",
+            "a/x.DELTA",
+            ".deltaglider/_CWPROBE/x",
+        ] {
+            let k = ObjectKey::parse("b", key);
+            let err = k
+                .validate_data_ingest(WriteOrigin::Client)
+                .expect_err(key)
+                .to_string();
+            assert!(err.contains("refused"), "{key}: {err}");
+        }
+        let err = ObjectKey::parse("b", "a/reference.bin/x.txt")
+            .validate_data_ingest(WriteOrigin::Client)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'reference.bin'"), "{err}");
+        for key in [
+            "a/reference.bin/x.txt",
+            "a/x.zip.delta/y",
+            "a/.dg-folder-marker/y",
+        ] {
+            assert!(
+                ObjectKey::parse("b", key).validate_object().is_ok(),
+                "{key}"
+            );
+        }
+        for key in ["a/ref.bin", "a/x.zip", "a/b/c.txt", "reference.binx/y"] {
+            assert!(
+                ObjectKey::parse("b", key)
+                    .validate_data_ingest(WriteOrigin::Client)
+                    .is_ok(),
+                "{key}"
+            );
+        }
+    }
+
+    /// The two write gates. A client write keeps the strict folded any-segment
+    /// rule; a job copy of an existing key is judged by the exact names that
+    /// collide on the destination (the destination backend adds its own case rule).
+    #[test]
+    fn a_job_copy_is_judged_by_the_exact_destination_rule() {
+        for key in [
+            "logs/run.DELTA",
+            "Reference.Bin",
+            "a/.Dg/x",
+            "a/reference.bin/x",
+            "a/b.delta/c",
+            "a/.dg-folder-marker/y",
+        ] {
+            let k = ObjectKey::parse("b", key);
+            assert!(
+                k.validate_ingest(WriteOrigin::Client).is_err(),
+                "client {key}"
+            );
+            let job = k.validate_ingest(WriteOrigin::Job);
+            // `a/.Dg/x` is a real directory name on a case-sensitive root and on S3.
+            assert!(job.is_ok(), "job {key}: {job:?}");
+        }
+        let probe = format!("{}x", crate::coordination::cas_probe::PROBE_PREFIX);
+        for key in [
+            "a/reference.bin",
+            "x.delta",
+            "d/y.delta",
+            "a/.dg/x",
+            ".dg/x",
+            "a//b",
+            probe.as_str(),
+        ] {
+            let k = ObjectKey::parse("b", key);
+            assert!(k.validate_ingest(WriteOrigin::Job).is_err(), "job {key}");
+            assert!(
+                k.validate_ingest(WriteOrigin::Client).is_err(),
+                "client {key}"
+            );
+        }
+        // A job still refuses what the data PUT refuses beyond the name rule.
+        assert!(ObjectKey::parse("b", "d/")
+            .validate_data_ingest(WriteOrigin::Job)
+            .is_err());
+    }
+
+    proptest! {
+        /// Any case variant of a reserved name is reserved, at every
+        /// position of the key.
+        #[test]
+        fn every_case_variant_in_every_position_is_refused(
+            base in prop::sample::select(vec!["reference.bin", ".dg", ".dg-folder-marker", ".dg-tmp.x", "a.delta"]),
+            flips in prop::collection::vec(any::<bool>(), 0..24),
+            before in prop::collection::vec("[a-z0-9]{1,5}", 0..3),
+            after in prop::collection::vec("[a-z0-9]{1,5}", 0..3),
+        ) {
+            let name: String = base
+                .chars()
+                .enumerate()
+                .map(|(i, c)| if flips.get(i).copied().unwrap_or(false) { c.to_ascii_uppercase() } else { c })
+                .collect();
+            prop_assert!(reserved_name(&name).is_some(), "{}", name);
+            let mut segments: Vec<String> = before.clone();
+            segments.push(name.clone());
+            segments.extend(after.clone());
+            let key = segments.join("/");
+            prop_assert_eq!(first_reserved_segment(&key).map(|(s, _)| s.to_string()), Some(name));
+            prop_assert!(ObjectKey::parse("b", &key).validate_data_ingest(WriteOrigin::Client).is_err(), "{}", key);
+        }
+
+        /// Any string that lowercases to a reserved name is reserved, whatever
+        /// the letters that spell it (Unicode case folding, not only ASCII).
+        #[test]
+        fn every_string_that_lowercases_to_a_reserved_name_is_refused(
+            base in prop::sample::select(vec!["reference.bin", ".dg", ".dg-folder-marker"]),
+            picks in prop::collection::vec(0usize..4, 0..24),
+        ) {
+            let name: String = base
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    let pool = [c, c.to_ascii_uppercase(), '\u{212A}', c.to_uppercase().next().unwrap_or(c)];
+                    let pick = pool[picks.get(i).copied().unwrap_or(0)];
+                    if pick.to_lowercase().eq(c.to_lowercase()) { pick } else { c }
+                })
+                .collect();
+            prop_assert_eq!(name.chars().flat_map(char::to_lowercase).collect::<String>(), base);
+            prop_assert!(reserved_name(&name).is_some(), "{}", name);
+            let key = format!("a/{name}/x");
+            prop_assert!(ObjectKey::parse("b", &key).validate_data_ingest(WriteOrigin::Client).is_err(), "{}", key);
+        }
+
+        /// The same for the prefix and suffix rules: any text after
+        /// `.dg-tmp.`, any text before `.delta`, in any spelling.
+        #[test]
+        fn folded_prefix_and_suffix_rules_refuse(
+            stem in "[a-z0-9 \u{212A}]{0,8}",
+            upper in any::<bool>(),
+        ) {
+            let delta = if upper { ".DELTA" } else { ".delta" };
+            let temp = if upper { ".DG-TMP." } else { ".dg-tmp." };
+            prop_assert_eq!(reserved_name(&format!("{stem}{delta}")), Some(ReservedName::DeltaSuffix));
+            prop_assert_eq!(reserved_name(&format!("{temp}{stem}")), Some(ReservedName::TempFile));
+        }
+
+        /// A key whose segments are none reserved is not refused by the rule.
+        #[test]
+        fn plain_segments_are_never_reserved(segments in prop::collection::vec("[a-z0-9]{1,6}", 1..5)) {
+            prop_assert!(first_reserved_segment(&segments.join("/")).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
 mod key_path_proptests {
-    use super::{validate_key_path, ObjectKey};
+    use super::{validate_key_path, ObjectKey, WriteOrigin};
     use proptest::prelude::*;
 
     proptest! {
@@ -1442,7 +1767,7 @@ mod key_path_proptests {
             "[a/.\\\\\u{0}]{0,12}",
         ]) {
             let k = ObjectKey::parse("b", &key);
-            if k.validate_ingest().is_ok() {
+            if k.validate_ingest(WriteOrigin::Client).is_ok() {
                 prop_assert!(k.validate_object().is_ok());
                 let full = k.full_key();
                 prop_assert!(!full.is_empty());

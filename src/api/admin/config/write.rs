@@ -80,8 +80,6 @@ struct Steps {
     validate: bool,
     /// `normalize_shorthands` (the document parser already runs it).
     normalize: bool,
-    /// Carry the running config's env-ref provenance into the document.
-    merge_env_refs: bool,
 }
 
 impl Surface<'_> {
@@ -93,19 +91,16 @@ impl Surface<'_> {
                 bootstrap_guard: false,
                 validate: false,
                 normalize: false,
-                merge_env_refs: false,
             },
             Surface::Section { .. } => Steps {
                 bootstrap_guard: true,
                 validate: true,
                 normalize: true,
-                merge_env_refs: false,
             },
             Surface::Document { .. } => Steps {
                 bootstrap_guard: true,
                 validate: true,
                 normalize: false,
-                merge_env_refs: true,
             },
             // Starts from the full running config (nothing redacted, env
             // refs carried), so only the gates of `validate` run.
@@ -113,7 +108,6 @@ impl Surface<'_> {
                 bootstrap_guard: false,
                 validate: true,
                 normalize: false,
-                merge_env_refs: false,
             },
         }
     }
@@ -280,6 +274,7 @@ pub(super) async fn run(
                     &p.new_cfg,
                     write.headers,
                     true,
+                    false,
                 )
                 .await,
             ) {
@@ -445,7 +440,9 @@ async fn apply_locked(
     {
         return Outcome::Conflict { current };
     }
-    let prepared = match build(cfg).and_then(|b| prepare_with_refs(cfg, b, write, refs)) {
+    let prepared = match build_over_masked_frozen(cfg, write.surface, build)
+        .and_then(|b| prepare_with_refs(cfg, b, write, refs))
+    {
         Ok(p) => p,
         Err(r) => return Outcome::Rejected(r),
     };
@@ -461,14 +458,7 @@ async fn apply_locked(
     let ctx = TransitionCtx::Admin {
         state,
         headers,
-        // A backup restore's rollback puts back the config that was live.
-        restoring: matches!(
-            write.surface,
-            Surface::Internal {
-                action: RESTORE_ROLLBACK_ACTION,
-                ..
-            }
-        ),
+        restoring: false,
     };
     let report = match super::apply_config_transition(ctx, cfg, new_cfg).await {
         Ok(r) => r,
@@ -496,6 +486,46 @@ async fn apply_locked(
         version,
         conversions: report.conversions,
     }
+}
+
+/// `Err` when `new` differs from `old` over the frozen set (see
+/// `env_template::frozen_violation`). `server_writer`: the migrate job's own writer.
+pub(crate) fn frozen_check(old: &Config, new: &Config, server_writer: bool) -> Result<(), String> {
+    if old.env_refs.frozen.is_empty() {
+        return Ok(());
+    }
+    let tree = |c: &Config| serde_yaml::to_value(c).map_err(|e| format!("internal: {e}"));
+    match crate::config::env_template::frozen_violation(
+        &old.env_refs,
+        &tree(old)?,
+        &tree(new)?,
+        server_writer,
+    ) {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// Run `build` on a view with a random mask in every string that a reference
+/// supplies (see `config::env_mask`): a field written there is refused whatever
+/// it holds, and a mask copied to a path with no declared copy refuses the write.
+fn build_over_masked_frozen(
+    old: &Config,
+    surface: Surface<'_>,
+    build: impl FnOnce(&Config) -> Result<Built, Rejection>,
+) -> Result<Built, Rejection> {
+    use crate::config::env_mask::MaskedView;
+    let by_field = matches!(surface, Surface::Patch | Surface::Internal { .. });
+    if !by_field {
+        return build(old);
+    }
+    let refuse = |m: String| Rejection::new(Stage::EnvResolve, StatusCode::BAD_REQUEST, m);
+    let view = MaskedView::of(old, false).map_err(|e| refuse(e.message()))?;
+    let mut built = build(&view.config.clone())?;
+    built.incoming = view
+        .finish(built.incoming)
+        .map_err(|e| refuse(e.message()))?;
+    Ok(built)
 }
 
 /// THE config file write of a running-config change.
@@ -575,50 +605,13 @@ pub(super) fn prepare_with_refs(
         );
     }
 
-    // Env-ref provenance.
-    match write.surface {
-        // `into_flat` starts from a default: carry the refs through, then
-        // resolve the full-scalar `${env:NAME}` strings of the body (section
-        // GETs emit refs for ref-sourced secrets, so a GUI round-trip echoes
-        // them back). Only recorded names resolve, never the server env (S7).
-        Surface::Section { .. } => {
-            incoming.env_refs = old.env_refs.clone();
-            let resolved = incoming.resolve_env_ref_scalars();
-            refs.extend(incoming.env_refs.clone());
-            if let Err(e) = resolved {
-                reject!(
-                    Stage::EnvResolve,
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "env reference in section body did not resolve: {e}. Only names the \
-                         boot config uses, or names listed in {}, resolve.",
-                        crate::config::CONFIG_ENV_ALLOWLIST_VAR
-                    )
-                );
-            }
-        }
-        // A document applied through the CLI arrives pre-expanded, so the
-        // parse recorded no refs for names the BOOT file resolved: without
-        // this merge those secrets would persist materialised. Newly
-        // recorded names win over stale ones.
-        Surface::Document { .. } if steps.merge_env_refs => {
-            for (name, value) in &old.env_refs {
-                if !incoming.env_refs.contains_key(name) {
-                    incoming.env_refs.insert(name.clone(), value.clone());
-                    if let Some(path) = old.env_refs.paths.get(name) {
-                        incoming.env_refs.paths.insert(name.clone(), path.clone());
-                    }
-                    if let Some(default) = old.env_refs.defaults.get(name) {
-                        incoming
-                            .env_refs
-                            .defaults
-                            .insert(name.clone(), default.clone());
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
+    // Env-ref provenance. A document and a section body were judged and
+    // expanded by `env_template` before this step (S7), and their configs
+    // carry the running provenance plus what the allowlist added; PATCH and
+    // the internal writers carry none and take it from the running config.
+    let mut provenance = old.env_refs.clone();
+    provenance.merge(std::mem::take(&mut incoming.env_refs));
+    incoming.env_refs = provenance;
     // Every surface: the values this body resolved (a document's parse, a
     // section's resolve, a name admitted by DGP_CONFIG_ENV_ALLOWLIST) are
     // scrubbed from every later answer, a rejection included (review B6:
@@ -656,6 +649,16 @@ pub(super) fn prepare_with_refs(
     match super::reapply_env(old, &mut incoming, document) {
         Ok(ew) => w.env = ew,
         Err(e) => reject!(Stage::EnvReapply, StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+
+    // The frozen set (S7): what the config file gave to the environment
+    // stays as it is, whatever the request.
+    if let Err(e) = frozen_check(old, &incoming, false) {
+        reject!(Stage::EnvResolve, StatusCode::BAD_REQUEST, e);
+    }
+    // A `__dgmigrate_*` route is the migrate job's: no request makes, edits or ends one.
+    if let Some(e) = crate::maintenance::migrate::reserved_route_change(old, &incoming) {
+        reject!(Stage::Check, StatusCode::BAD_REQUEST, e);
     }
 
     // Y1: expand the shorthands (`public: true`, storage `s3:`) before the
@@ -702,6 +705,16 @@ pub(super) fn prepare_with_refs(
                 refusal.errors().join("; ")
             ),
         }
+    }
+
+    // What persist would refuse is refused now, before the change is live (an apply and
+    // a validate alike): after the transition only a failed file write is left.
+    if let Err(e) = incoming.check_persistable() {
+        reject!(
+            Stage::Check,
+            StatusCode::BAD_REQUEST,
+            format!("config refused: {e}")
+        );
     }
 
     let diff = write
@@ -960,9 +973,39 @@ where
     result
 }
 
-/// The internal-write action of a backup restore's rollback: it puts back
-/// a config that was live, so the forward-only gates do not apply.
-pub(crate) const RESTORE_ROLLBACK_ACTION: &str = "restore_rollback";
+/// Put back a config that was live before a failed restore: a transition with the
+/// forward-only gates off, then the file write. It holds real values, so no mask view.
+pub(crate) async fn put_back_config(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    snapshot: Config,
+) -> Result<(), String> {
+    let mut discoveries = Vec::new();
+    let mut cfg = state.config.write().await;
+    let ctx = TransitionCtx::Admin {
+        state,
+        headers,
+        restoring: true,
+    };
+    let result = match super::apply_config_transition(ctx, &mut cfg, snapshot).await {
+        Ok(report) => {
+            discoveries.extend(report.discovery);
+            persist(state, &cfg)
+                .map(|_| super::super::audit_log("restore_rollback", "admin", "config", headers))
+                .map_err(|(path, e)| {
+                    let e = crate::config::scrub_env_values(&e, &cfg.env_refs);
+                    format!("config file {path} not restored: {e}")
+                })
+        }
+        Err(e) => Err(format!(
+            "config not restored: {}",
+            crate::config::scrub_env_values(&e.message, &cfg.env_refs)
+        )),
+    };
+    drop(cfg);
+    run_discoveries(discoveries).await;
+    result
+}
 
 /// Put `old` back after a failed internal write, and into the file when
 /// the write reached it.
@@ -1401,5 +1444,337 @@ mod tests {
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(!text.contains("sekret-value-1234"), "{text}");
         assert!(text.contains("${env:S}"), "{text}");
+    }
+
+    // ── The mask view of an internal writer ──
+
+    const SK: &str = "bootstrap-secret-0001";
+    const SSK: &str = "s3-singleton-secret-0002";
+    const EK: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn singleton() -> Config {
+        let text = "access:\n  access_key_id: AKB\n  secret_access_key: ${env:SK}\n\
+            storage:\n  backend:\n    type: s3\n    endpoint: http://127.0.0.1:1\n    region: us-east-1\n    access_key_id: AKS\n    secret_access_key: ${env:SSK}\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key: ${env:EK}\n    key_id: k\n";
+        let env = |n: &str| match n {
+            "SK" => Some(SK.to_string()),
+            "SSK" => Some(SSK.to_string()),
+            "EK" => Some(EK.to_string()),
+            _ => None,
+        };
+        Config::from_template_with(text, &env).unwrap()
+    }
+
+    fn internal() -> Surface<'static> {
+        Surface::Internal {
+            action: "test",
+            target: "test",
+        }
+    }
+
+    fn made(c: Config) -> Result<Built, Rejection> {
+        Ok(Built {
+            incoming: c,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// A mask that lands anywhere but on its own frozen path is refused with
+    /// the path, whether it stands alone, inside a longer text or in a key.
+    #[test]
+    fn a_mask_that_lands_outside_its_frozen_path_is_refused() {
+        let cfg = singleton();
+        for (label, edit) in [
+            (
+                "/public_url",
+                (|c: &mut Config, mask: &str| c.public_url = Some(mask.to_string()))
+                    as fn(&mut Config, &str),
+            ),
+            ("/public_url", |c, mask| {
+                c.public_url = Some(format!("http://h.example/{mask}/x"))
+            }),
+            ("/buckets/", |c, mask| {
+                c.buckets.insert(mask.to_string(), Default::default());
+            }),
+        ] {
+            let err = build_over_masked_frozen(&cfg, internal(), |masked| {
+                let mut c = masked.clone();
+                let mask = masked.secret_access_key.clone().unwrap();
+                edit(&mut c, &mask);
+                made(c)
+            })
+            .err()
+            .unwrap_or_else(|| panic!("{label}: not refused"));
+            assert!(err.error.contains(label), "{label}: {}", err.error);
+            assert!(!err.error.contains(SK), "{}", err.error);
+        }
+    }
+
+    /// The singleton's references go with its copy: the new backend `default`
+    /// holds the real values, and no mask is left.
+    #[test]
+    fn the_singleton_copy_gets_the_real_values_and_the_templates() {
+        let cfg = singleton();
+        let made = build_over_masked_frozen(&cfg, internal(), |masked| {
+            let mut c = masked.clone();
+            c.add_named_backend(
+                crate::config::NamedBackendConfig {
+                    name: "second".into(),
+                    backend: crate::config::BackendConfig::Filesystem {
+                        path: "/data/second".into(),
+                    },
+                    encryption: Default::default(),
+                },
+                false,
+            )
+            .unwrap();
+            made(c)
+        })
+        .unwrap()
+        .incoming;
+        let default = &made.backends[0];
+        assert_eq!(default.name, "default");
+        match &default.backend {
+            crate::config::BackendConfig::S3 {
+                secret_access_key, ..
+            } => assert_eq!(secret_access_key.as_deref(), Some(SSK)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(default.encryption.primary_key(), Some(EK));
+        for path in [
+            "/backends/[default]/secret_access_key",
+            "/backends/[default]/encryption/key",
+        ] {
+            assert!(made.env_refs.template_at(path).is_some(), "{path}");
+        }
+        assert!(!serde_yaml::to_string(&made).unwrap().contains("frozen-"));
+        // Persist writes the references at the copy, never the values.
+        let text = made.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
+        assert!(!text.contains(SSK) && !text.contains(EK), "{text}");
+        assert_eq!(text.matches("${env:SSK}").count(), 2, "{text}");
+    }
+
+    const AL: &str = "ALLOWED-SECRET-0003";
+
+    /// A running config whose S3 secret comes from an allowlisted reference
+    /// that an admin request added: a holder that is not frozen.
+    fn allowlisted() -> Config {
+        let text = format!(
+            "access:\n  access_key_id: AKB\n  secret_access_key: plain-bootstrap-0001\nstorage:\n  backend:\n    type: s3\n    endpoint: http://127.0.0.1:1\n    region: us-east-1\n    access_key_id: AKS\n    secret_access_key: {AL}\n"
+        );
+        let mut cfg = Config::from_yaml_str(&text).unwrap();
+        cfg.env_refs.insert("AL".into(), AL.into());
+        cfg.env_refs.templates.insert(
+            "/backend/secret_access_key".into(),
+            crate::config::env_template::Template::parse("${env:AL}").unwrap(),
+        );
+        cfg
+    }
+
+    fn backend_secret(c: &Config) -> String {
+        match &c.backend {
+            crate::config::BackendConfig::S3 {
+                secret_access_key, ..
+            } => secret_access_key.clone().unwrap(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A fake NEW copy site: a writer that clones a field that comes from a
+    /// reference to a path with no declared derive step. Frozen or not, the
+    /// write is refused before any transition, with the path.
+    #[test]
+    fn an_undeclared_copy_of_any_reference_holder_is_refused() {
+        type Edit = fn(&mut Config, &str);
+        let to_url: Edit = |c, m| c.public_url = Some(m.to_string());
+        let inside: Edit = |c, m| c.public_url = Some(format!("http://h.example/{m}/x"));
+        let as_key: Edit = |c, m| {
+            c.buckets.insert(m.to_string(), Default::default());
+        };
+        for (cfg, from) in [(singleton(), true), (allowlisted(), false)] {
+            for (label, edit) in [
+                ("/public_url", to_url),
+                ("/public_url", inside),
+                ("/buckets/", as_key),
+            ] {
+                let err = build_over_masked_frozen(&cfg, internal(), |masked| {
+                    let mut c = masked.clone();
+                    let mask = if from {
+                        masked.secret_access_key.clone().unwrap()
+                    } else {
+                        backend_secret(masked)
+                    };
+                    edit(&mut c, &mask);
+                    made(c)
+                })
+                .err()
+                .unwrap_or_else(|| panic!("frozen={from} {label}: not refused"));
+                assert_eq!(err.status, StatusCode::BAD_REQUEST);
+                assert!(err.error.contains(label), "{label}: {}", err.error);
+                assert!(
+                    err.error.contains("comes from the environment"),
+                    "{}",
+                    err.error
+                );
+                assert!(
+                    !err.error.contains(AL) && !err.error.contains(SK),
+                    "{}",
+                    err.error
+                );
+            }
+        }
+    }
+
+    /// The same copy with its derive step declared is kept, with the real
+    /// value and the template; a writer that changes a holder that is not
+    /// frozen is free to.
+    #[test]
+    fn a_declared_copy_of_a_non_frozen_holder_is_kept() {
+        let cfg = allowlisted();
+        let kept = build_over_masked_frozen(&cfg, internal(), |masked| {
+            let mut c = masked.clone();
+            c.add_named_backend(
+                crate::config::NamedBackendConfig {
+                    name: "second".into(),
+                    backend: crate::config::BackendConfig::Filesystem {
+                        path: "/data/second".into(),
+                    },
+                    encryption: Default::default(),
+                },
+                false,
+            )
+            .unwrap();
+            made(c)
+        })
+        .unwrap()
+        .incoming;
+        assert_eq!(backend_secret_of_named(&kept, "default"), AL);
+        assert!(kept
+            .env_refs
+            .template_at("/backends/[default]/secret_access_key")
+            .is_some());
+        let freed = build_over_masked_frozen(&cfg, internal(), |masked| {
+            let mut c = masked.clone();
+            if let crate::config::BackendConfig::S3 {
+                secret_access_key, ..
+            } = &mut c.backend
+            {
+                *secret_access_key = Some("a-new-secret-0004".into());
+            }
+            made(c)
+        })
+        .unwrap()
+        .incoming;
+        assert_eq!(backend_secret(&freed), "a-new-secret-0004");
+    }
+
+    fn backend_secret_of_named(c: &Config, name: &str) -> String {
+        match &c.backends.iter().find(|b| b.name == name).unwrap().backend {
+            crate::config::BackendConfig::S3 {
+                secret_access_key, ..
+            } => secret_access_key.clone().unwrap(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A `__dgmigrate_*` route belongs to the migrate job: no admin surface
+    /// creates, changes or removes one, and a write that leaves it as it is
+    /// (a save during a job) is no change.
+    #[test]
+    fn no_admin_write_creates_changes_or_removes_a_migrate_route() {
+        let route = format!("{}a_0", crate::maintenance::migrate::TRANSIENT_PREFIX);
+        let with_route = |compression: bool| {
+            let mut c = running();
+            c.buckets.insert(
+                route.clone(),
+                crate::bucket_policy::BucketPolicyConfig {
+                    compression: Some(compression),
+                    ..Default::default()
+                },
+            );
+            c
+        };
+        let body = serde_json::json!({});
+        for surface in [
+            Surface::Patch,
+            Surface::Section {
+                section: super::SectionName::Storage,
+                body: &body,
+            },
+            Surface::Document { yaml: "" },
+            internal(),
+        ] {
+            let refused = |old: &Config, new: Config| {
+                prepare(old, built(new), &write(surface, Mode::DryRun)).err()
+            };
+            let created = refused(&running(), with_route(true)).expect("create");
+            assert_eq!(created.status, StatusCode::BAD_REQUEST);
+            assert!(created.error.contains(&route), "{}", created.error);
+            assert!(
+                refused(&with_route(true), with_route(false)).is_some(),
+                "change"
+            );
+            assert!(refused(&with_route(true), running()).is_some(), "remove");
+            assert!(
+                refused(&with_route(true), with_route(true)).is_none(),
+                "a save that leaves the route as it is"
+            );
+        }
+    }
+
+    /// What persist refuses is refused before the change is live: the pipeline asks
+    /// `check_persistable` in `prepare_with_refs` (apply and validate), and the
+    /// background writer asks it before its transition.
+    #[test]
+    fn persist_refusals_come_before_the_transition() {
+        let write = crate::source_scan::prod_text(include_str!("write.rs"));
+        let prepare = write.find("pub(super) fn prepare_with_refs(").unwrap();
+        let check = write.find("incoming.check_persistable()").unwrap();
+        assert!(prepare < check, "the check is outside prepare");
+        let prepared = write.find(".and_then(|b| prepare_with_refs(cfg, b, write, refs))");
+        let applied = write.find("let report = match super::apply_config_transition(");
+        assert!(
+            prepared < applied,
+            "an apply prepares before its transition"
+        );
+        let apply = crate::source_scan::prod_text(include_str!("../../../config_apply.rs"));
+        let check = apply.find(".check_persistable()").unwrap();
+        let transition = apply
+            .find("apply_config_transition(ctx(), &mut cfg, new_cfg)")
+            .unwrap();
+        assert!(check < transition, "the background writer persists first");
+    }
+
+    /// An edit sees a mask in every frozen string, and the mask of a key
+    /// parses as a key: nothing it does with a mask can reach a credential.
+    #[test]
+    fn the_edit_sees_masks_and_only_masks() {
+        let cfg = singleton();
+        let mut seen = false;
+        build_over_masked_frozen(&cfg, internal(), |masked| {
+            seen = true;
+            assert_ne!(masked.secret_access_key.as_deref(), Some(SK));
+            let key = masked.backend_encryption.primary_key().unwrap();
+            assert_ne!(key, EK);
+            assert!(crate::storage::EncryptionKey::from_hex(key).is_ok());
+            made(masked.clone())
+        })
+        .unwrap();
+        assert!(seen);
+    }
+
+    /// The closures that edit a masked view are plain `FnOnce`: they cannot
+    /// wait on I/O, so no probe, health gate or request runs on a mask. The
+    /// gates of the backend endpoints run on the request body or on the
+    /// running config, before the lock.
+    #[test]
+    fn nothing_acts_on_a_masked_view() {
+        let write = crate::source_scan::prod_text(include_str!("write.rs"));
+        for sig in [
+            "build: impl FnOnce(&Config) -> Result<Built, Rejection>,",
+            "edit: impl FnOnce(&mut Config, &mut H) -> Result<(), E>,",
+            "edit: impl FnOnce(&mut Config),",
+        ] {
+            assert!(write.contains(sig), "a writer closure changed: {sig}");
+        }
     }
 }

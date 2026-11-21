@@ -169,3 +169,272 @@ async fn a_too_long_file_name_is_400_key_too_long() {
     let r = http.put(&ok).body(b"fits".to_vec()).send().await.unwrap();
     assert_eq!(r.status(), 200);
 }
+
+/// A WRITE of a key over 1024 bytes and the query text of a LIST over 1024
+/// bytes are refused before authorization and before the engine, with the
+/// error that S3 answers. The text of the limit itself still passes.
+#[tokio::test]
+async fn key_text_over_1024_bytes_is_refused_for_writes_and_list_text() {
+    let server = TestServer::filesystem().await;
+    let http = server.http();
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    let long = "a/".repeat(513);
+    let limit = format!("{}ab", "a/".repeat(511));
+    assert_eq!(limit.len(), 1024);
+    let code = |body: &str| {
+        let start = body.find("<Code>").map(|i| i + 6).unwrap_or(0);
+        let end = body.find("</Code>").unwrap_or(body.len());
+        body[start..end].to_string()
+    };
+
+    // The key of a write: PutObject, the destination of a copy, the start
+    // of a multipart upload.
+    let r = http
+        .put(format!("{ep}/{bucket}/{long}"))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(code(&r.text().await.unwrap()), "KeyTooLongError");
+    let r = http
+        .put(format!("{ep}/{bucket}/{long}"))
+        .header("x-amz-copy-source", format!("{bucket}/src.bin"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(code(&r.text().await.unwrap()), "KeyTooLongError");
+    let r = http
+        .post(format!("{ep}/{bucket}/{long}?uploads"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(code(&r.text().await.unwrap()), "KeyTooLongError");
+    let r = http
+        .put(format!("{ep}/{bucket}/{limit}"))
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "a key of 1024 bytes passes the limit");
+
+    // The text parameters of a LIST.
+    for name in ["prefix", "start-after", "marker", "delimiter"] {
+        let r = http
+            .get(format!("{ep}/{bucket}?list-type=2&{name}={long}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400, "{name}");
+        assert_eq!(code(&r.text().await.unwrap()), "InvalidArgument", "{name}");
+    }
+    let r = http
+        .get(format!("{ep}/{bucket}?list-type=2&prefix={limit}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // A key in the body of a DeleteObjects request is not a write: a key
+    // over the limit is an object that does not exist, so the delete succeeds.
+    let xml = format!(
+        "<Delete><Object><Key>fine.bin</Key></Object><Object><Key>{long}</Key></Object></Delete>"
+    );
+    let r = http
+        .post(format!("{ep}/{bucket}?delete"))
+        .header("content-type", "application/xml")
+        .body(xml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+/// An object whose key is longer than 1024 bytes can exist: the filesystem
+/// backend limits a path SEGMENT (255 bytes), not the whole key, and release
+/// 2.2.5 stored such keys. They stay reachable through every door that the
+/// proxy itself owns: LIST shows them, DeleteObjects and the admin bulk delete
+/// remove them. A write of such a key is refused with `KeyTooLongError`.
+/// A request that names such a key in its URL path (GET, HEAD, DELETE) is
+/// refused with `KeyTooLongError`, as S3 answers: the length check of the
+/// URL applies to every method, and s3s refuses the key too.
+/// (The principal of these requests is the bootstrap admin, which no key
+/// length limits when a policy reads it.)
+#[tokio::test]
+async fn an_existing_key_over_1024_bytes_stays_reachable_and_cannot_be_written_again() {
+    let server = TestServer::filesystem().await;
+    let http = server.http();
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    let data = server
+        .data_dir()
+        .expect("a filesystem backend")
+        .to_path_buf();
+    // Segments of 250 bytes: a key of 1244 bytes, each segment (and its
+    // `.delta` form) within the 255 bytes of the filesystem.
+    let segments: Vec<String> = [("a", 250), ("b", 250), ("c", 250), ("d", 250), ("e", 240)]
+        .iter()
+        .map(|(c, n)| c.repeat(*n))
+        .collect();
+    let key = segments.join("/");
+    assert!(key.len() > 1024);
+    let on_disk = segments
+        .iter()
+        .fold(data.join(bucket).join("deltaspaces"), |p, s| p.join(s));
+    // Laid out as the backend lays out a stored object: the file in its folder.
+    let place = |content: &[u8]| {
+        std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        std::fs::write(&on_disk, content).unwrap();
+    };
+    place(b"stored by an older release");
+    let code = |body: &str| {
+        let start = body.find("<Code>").map(|i| i + 6).unwrap_or(0);
+        let end = body.find("</Code>").unwrap_or(body.len());
+        body[start..end].to_string()
+    };
+    let prefix = segments[..3].join("/");
+    let listed = || async {
+        http.get(format!("{ep}/{bucket}?list-type=2&prefix={prefix}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .contains(&key)
+    };
+
+    // LIST shows it (a prefix of 752 bytes is within the limit).
+    assert!(listed().await, "the long key is listed");
+
+    // A new PUT of that key is refused by the length rule of writes.
+    let r = http
+        .put(format!("{ep}/{bucket}/{key}"))
+        .body(b"new".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(code(&r.text().await.unwrap()), "KeyTooLongError");
+    assert_eq!(
+        std::fs::read(&on_disk).unwrap(),
+        b"stored by an older release"
+    );
+
+    // A read names the key in its URL path: refused for its length.
+    let r = http
+        .get(format!("{ep}/{bucket}/{key}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert_eq!(code(&r.text().await.unwrap()), "KeyTooLongError");
+
+    // DeleteObjects names the key in its body: it removes the object.
+    let xml = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
+    let r = http
+        .post(format!("{ep}/{bucket}?delete"))
+        .header("content-type", "application/xml")
+        .body(xml)
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body = r.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("<Deleted>"), "{body}");
+    assert!(!on_disk.exists(), "DeleteObjects removed the file");
+    assert!(!listed().await, "and the listing no longer shows it");
+
+    // The admin bulk delete has no length limit either (`path_guard` checks
+    // the segments, not the length).
+    place(b"again");
+    let admin = common::admin_http_client(&ep).await;
+    let r = admin
+        .post(format!("{ep}/_/api/admin/objects/delete"))
+        .json(&serde_json::json!({ "bucket": bucket, "keys": [key] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let answer: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(answer["deleted"].as_u64(), Some(1), "{answer}");
+    assert!(!on_disk.exists(), "the bulk delete removed the file");
+}
+
+/// A user whose policy holds `${iam:username}` is not an unconditional admin:
+/// the keys that a request puts into a policy are bounded, so a key of 1 MiB
+/// in a DeleteObjects body, or of 60 KB in a URL, is refused at once and
+/// does not keep the proxy busy (iam-rs matched such a resource with a
+/// search that costs the key squared).
+#[tokio::test]
+async fn a_long_key_is_refused_at_once_for_a_user_with_a_templated_policy() {
+    use std::time::{Duration, Instant};
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    let admin = common::admin_http_client(&ep).await;
+    let before = common::get_iam_version(&admin, &ep).await;
+    let r = admin
+        .post(format!("{ep}/_/api/admin/users"))
+        .json(&serde_json::json!({
+            "name": "dana",
+            "permissions": [{
+                "effect": "Allow",
+                "actions": ["read", "write", "delete", "list"],
+                "resources": [format!("{bucket}/scrap/customers/${{iam:username}}/*")],
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+    let user: serde_json::Value = r.json().await.unwrap();
+    common::wait_for_iam_rebuild(&admin, &ep, before).await;
+    let dana = common::S3Http::signed(
+        user["access_key_id"].as_str().unwrap(),
+        user["secret_access_key"].as_str().unwrap(),
+    );
+    let home = "scrap/customers/dana";
+    // A key of 1 MiB in a DeleteObjects body (the body limit is 4 MiB).
+    let long = format!("{home}/{}", "a".repeat(1 << 20));
+    let xml = format!(
+        "<Delete><Object><Key>fine.bin</Key></Object><Object><Key>{long}</Key></Object></Delete>"
+    );
+    let started = Instant::now();
+    let r = dana
+        .post(format!("{ep}/{bucket}?delete"))
+        .header("content-type", "application/xml")
+        .body(xml)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<Code>AccessDenied</Code>"), "{body:.300}");
+    // A key of 60 KB in the URL.
+    let url_long = format!("{ep}/{bucket}/{home}/{}", "b".repeat(60_000));
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::HEAD,
+        reqwest::Method::DELETE,
+    ] {
+        let r = dana
+            .request(method.clone(), &url_long)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400, "{method}");
+    }
+    // The proxy stays responsive while it did that.
+    let health = reqwest::get(format!("{ep}/_/health")).await.unwrap();
+    assert!(health.status().is_success());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the requests took {:?}",
+        started.elapsed()
+    );
+}

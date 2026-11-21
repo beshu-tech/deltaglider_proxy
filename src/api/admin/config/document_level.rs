@@ -245,25 +245,31 @@ pub async fn config_defaults(
 /// surfaces the parse error to the caller and leaves state unchanged.
 fn parse_and_validate_yaml(
     yaml: &str,
-    known_env: &std::collections::BTreeMap<String, String>,
+    running: &crate::config::EnvRefs,
 ) -> Result<(crate::config::Config, Vec<String>), String> {
     if yaml.trim().is_empty() {
         return Err(EMPTY_DOCUMENT.to_string());
     }
-    // Expand `${env:NAME}` refs, but ONLY names the running config already
-    // resolved from its file (S7: see `expand_env_admin`), and record the
-    // provenance so persist/export re-emit the refs instead of the values.
-    // The `config apply` CLI expands client-side against the OPERATOR env
-    // and escapes `$`, so this pass leaves its text unchanged.
-    let (yaml, env_refs) = crate::config::expand_env_admin(yaml, known_env).map_err(|e| {
-        format!(
-            "env expansion error: {e}. The admin API resolves only `${{env:NAME}}` refs \
-             that the config file loaded at boot already uses, or names listed in \
-             {}; reference a new variable in that file, allowlist it, or expand it \
-             client-side (`config apply`).",
-            crate::config::CONFIG_ENV_ALLOWLIST_VAR
-        )
+    // S7: judge every string and key of the document BEFORE any expansion. An
+    // unescaped `${env:NAME}` is accepted only at the path where the config
+    // file has the same template (or, for an allowlisted name, in a
+    // credential field). The values that the document then takes are scrubbed
+    // from every error. The `config apply` CLI expands client-side against
+    // the OPERATOR env and escapes `$`, so its document holds no reference.
+    let allowed = crate::config::admin_env_allowed;
+    let (tree, added) = crate::config::env_template::admit_document(
+        yaml,
+        running,
+        &allowed,
+        &crate::config::admin_env_lookup,
+    )
+    .map_err(|e| match e {
+        crate::config::ConfigError::Parse(_) => parse_refusal_text(yaml, &e),
+        other => format!("env reference refused: {other}"),
     })?;
+    let mut env_refs = running.clone();
+    env_refs.merge(added);
+    let yaml = serde_yaml::to_string(&tree).map_err(|e| format!("internal: {e}"))?;
     let scrub = |m: String| crate::config::scrub_env_values(&m, &env_refs);
     use crate::config::DocumentRefusal as R;
     let (mut cfg, warnings) =
@@ -279,7 +285,6 @@ fn parse_and_validate_yaml(
             })
         })?;
     cfg.env_refs = env_refs.clone();
-    cfg.record_env_ref_paths();
     // The rule gates need the RUNNING config (a new defect vs. a standing
     // one): the write pipeline runs them.
     Ok((cfg, warnings.into_iter().map(scrub).collect()))
@@ -413,7 +418,7 @@ pub async fn validate_config_doc(
     State(state): State<Arc<AdminState>>,
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
-    let known = (*state.config.read().await.env_refs).clone();
+    let known = state.config.read().await.env_refs.clone();
     let no_env = ScrubMap::new();
     let write = ConfigWrite {
         surface: Surface::Document { yaml: &body.yaml },
@@ -430,13 +435,13 @@ pub async fn validate_config_doc(
 async fn run_document(
     state: &Arc<AdminState>,
     yaml: &str,
-    known: ScrubMap,
+    known: crate::config::EnvRefs,
     write: ConfigWrite<'_>,
 ) -> WriteResult {
     match parse_and_validate_yaml(yaml, &known) {
         Err(err) => WriteResult {
             outcome: Outcome::Rejected(Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, err)),
-            refs: known,
+            refs: (*known).clone(),
         },
         Ok((incoming, warnings)) => {
             write::run(state, write, |_| Ok(Built { incoming, warnings })).await
@@ -553,10 +558,11 @@ pub(crate) async fn apply_config_inner_with_env(
     state: &Arc<AdminState>,
     headers: &HeaderMap,
     body: ConfigDocumentRequest,
-    extra_env: &std::collections::BTreeMap<String, String>,
+    extra: &crate::config::EnvRefs,
 ) -> (StatusCode, ConfigApplyResponse) {
-    let mut known = (*state.config.read().await.env_refs).clone();
-    known.extend(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let mut known = state.config.read().await.env_refs.clone();
+    known.merge(extra.clone());
+    let extra_env: &ScrubMap = extra;
     // Parse before the lock (pure work): a bad document answers 400 even
     // with a stale `If-Match`.
     let write = ConfigWrite {
@@ -742,7 +748,22 @@ pub async fn export_declarative_iam(
         )));
     }
     drop(db);
+    let mut snapshot = snapshot;
     if q.include_secrets {
+        // A secret that the file gives to the environment is never exported.
+        let cfg = state.config.read().await;
+        let frozen = &cfg.env_refs.frozen;
+        for p in &mut snapshot.auth_providers {
+            if frozen.holds_item("auth_providers", &p.name, "client_secret") {
+                p.client_secret = None;
+            }
+        }
+        for u in &mut snapshot.users {
+            if frozen.holds_item("iam_users", &u.name, "secret_access_key") {
+                u.secret_access_key.clear();
+            }
+        }
+        drop(cfg);
         audit_log("export_iam_with_secrets", "admin", "", &headers);
     }
 
@@ -1253,7 +1274,7 @@ mod tests {
     /// C63: a refused value names its YAML path in plain English.
     #[test]
     fn parse_refusals_read_as_plain_english() {
-        let no_env = ScrubMap::new();
+        let no_env = crate::config::EnvRefs::default();
         let cases: &[(&str, &str)] = &[
             (
                 "storage:\n  buckets:\n    releases:\n      quota_bytes: notanumber\n",
@@ -1324,6 +1345,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let running = crate::config::Config::default();
         let no_env = ScrubMap::new();
+        let no_refs = crate::config::EnvRefs::default();
         for (name, yaml, ok) in corpus {
             let path = dir.path().join("cfg.yaml");
             std::fs::write(&path, yaml).unwrap();
@@ -1335,7 +1357,7 @@ mod tests {
                 headers: None,
                 extra_env: &no_env,
             };
-            let validate_ok = parse_and_validate_yaml(yaml, &no_env)
+            let validate_ok = parse_and_validate_yaml(yaml, &no_refs)
                 .map_err(|e| Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, e))
                 .and_then(|(incoming, warnings)| {
                     write::prepare(&running, Built { incoming, warnings }, &write)
@@ -1353,34 +1375,45 @@ mod env_leak_tests {
 
     /// S7: the admin document path must not read arbitrary server env vars.
     /// `HOME` is set in every test environment and is not referenced by any
-    /// loaded config, so its value must never appear in the result.
+    /// loaded config, so its reference is refused and its value never shows.
     #[test]
     fn admin_doc_does_not_expand_unreferenced_env() {
         let home = std::env::var("HOME").expect("HOME is set");
-        let res = parse_and_validate_yaml("log_level: \"${env:HOME}\"\n", &Default::default());
-        match res {
-            Ok((cfg, w)) => {
-                assert_ne!(cfg.log_level, home);
-                assert!(!w.iter().any(|w| w.contains(&home)));
-            }
-            Err(e) => assert!(!e.contains(&home), "leaked HOME: {e}"),
-        }
+        let err = parse_and_validate_yaml("log_level: \"${env:HOME}\"\n", &Default::default())
+            .expect_err("an unrecorded reference is refused");
+        assert!(
+            err.contains("refused") && err.contains("/log_level"),
+            "{err}"
+        );
+        assert!(!err.contains(&home), "leaked HOME: {err}");
     }
 
-    /// A name the loaded file already uses still resolves (the IaC
+    fn running_with_log_level(value: &str) -> crate::config::EnvRefs {
+        let env = |n: &str| (n == "LOGF").then(|| value.to_string());
+        crate::config::Config::from_template_with("advanced:\n  log_level: ${env:LOGF}\n", &env)
+            .unwrap()
+            .env_refs
+    }
+
+    /// A reference at the path where the file has it still resolves (the IaC
     /// round-trip), and its value is scrubbed from error text.
     #[test]
     fn admin_doc_resolves_known_refs_and_scrubs_errors() {
-        let known: std::collections::BTreeMap<String, String> =
-            [("LOGF".to_string(), "/not/a/filter".to_string())].into();
+        let known = running_with_log_level("/not/a/filter");
         let err = parse_and_validate_yaml("log_level: \"${env:LOGF}\"\n", &known).unwrap_err();
         assert!(!err.contains("/not/a/filter"), "{err}");
         assert!(err.contains("${env:LOGF}"), "{err}");
-        let known: std::collections::BTreeMap<String, String> =
-            [("LOGF".to_string(), "debug".to_string())].into();
+        let known = running_with_log_level("debug");
         let (cfg, _) = parse_and_validate_yaml("log_level: \"${env:LOGF}\"\n", &known).unwrap();
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.env_refs.get("LOGF").map(String::as_str), Some("debug"));
+        // The same reference anywhere else is refused.
+        let err = parse_and_validate_yaml(
+            "log_level: \"${env:LOGF}\"\nconfig_sync_object_key: \"${env:LOGF}\"\n",
+            &known,
+        )
+        .unwrap_err();
+        assert!(err.contains("/config_sync_object_key"), "{err}");
     }
 }
 
@@ -1392,20 +1425,41 @@ mod review2_tests {
     /// fresh/DR instance whose boot file does not use X fails, even when the
     /// operator exports X there (the documented IaC contract).
     ///
-    /// Lead decision: S7 stays; the operator opts a name in through
-    /// DGP_CONFIG_ENV_ALLOWLIST. Without it the ref fails, and the error
-    /// names the opt-in.
+    /// The operator opts a name in through DGP_CONFIG_ENV_ALLOWLIST. The name
+    /// is then accepted as a whole value in a credential field only, never in
+    /// a field that an export shows in clear.
     #[test]
     fn review2_foreign_export_ref_resolves_when_target_sets_the_var() {
-        std::env::set_var("REVIEW2_S7_DR_LEVEL", "debug");
-        let doc = "log_level: \"${env:REVIEW2_S7_DR_LEVEL}\"\n";
+        std::env::set_var("REVIEW2_S7_DR_SECRET", "dr-secret-value-0001");
+        let doc = "access:\n  access_key_id: AKADMIN\n  secret_access_key: admin-secret\nstorage:\n  backends:\n  - name: dr\n    type: s3\n    endpoint: https://s3.example.test\n    region: eu\n    secret_access_key: \"${env:REVIEW2_S7_DR_SECRET}\"\n";
+        let elsewhere = "log_level: \"${env:REVIEW2_S7_DR_SECRET}\"\n";
         let refused = parse_and_validate_yaml(doc, &Default::default());
         std::env::set_var(crate::config::CONFIG_ENV_ALLOWLIST_VAR, "REVIEW2_S7_*");
         let r = parse_and_validate_yaml(doc, &Default::default());
+        let misplaced = parse_and_validate_yaml(elsewhere, &Default::default());
         std::env::remove_var(crate::config::CONFIG_ENV_ALLOWLIST_VAR);
-        std::env::remove_var("REVIEW2_S7_DR_LEVEL");
+        std::env::remove_var("REVIEW2_S7_DR_SECRET");
         let err = refused.expect_err("S7: not allowlisted, not resolved");
-        assert!(err.contains("DGP_CONFIG_ENV_ALLOWLIST"), "{err}");
-        assert!(r.is_ok(), "{:?}", r.err());
+        assert!(err.contains("refused"), "{err}");
+        let (cfg, _) = r.expect("allowlisted, in a backend secret");
+        assert!(
+            matches!(
+                &cfg.backends[0].backend,
+                crate::config::BackendConfig::S3 { secret_access_key, .. }
+                    if secret_access_key.as_deref() == Some("dr-secret-value-0001")
+            ),
+            "{:?}",
+            cfg.backends[0]
+        );
+        assert_eq!(
+            cfg.env_refs
+                .templates
+                .get("/backends/[dr]/secret_access_key")
+                .map(|t| t.render(crate::config::env_template::Escape::Minimal)),
+            Some("${env:REVIEW2_S7_DR_SECRET}".to_string()),
+            "the file keeps the reference, never the value"
+        );
+        let err = misplaced.expect_err("an allowlisted name stays out of a clear field");
+        assert!(err.contains("/log_level"), "{err}");
     }
 }

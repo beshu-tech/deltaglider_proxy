@@ -259,7 +259,7 @@ The re-encrypt job rewrites each stored object in place. It reads the object, se
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `deltaglider_auth_attempts_total` | Counter | `result` | Auth attempts: `success` or `failure` |
-| `deltaglider_auth_failures_total` | Counter | `reason` | Failure breakdown: `missing_header`, `invalid_presigned`, `invalid_access_key`, `user_disabled`, `signature_rejected`, `replay` (a replayed signed request), `form_post_denied` (a browser form upload that was refused) |
+| `deltaglider_auth_failures_total` | Counter | `reason` | Failure breakdown: `missing_header`, `invalid_presigned`, `sigv2_unsupported` (a request with SigV2 credentials), `invalid_access_key`, `user_disabled`, `signature_rejected`, `replay` (a replayed signed request), `form_post_denied` (a browser form upload that was refused) |
 
 Auth metrics stay at zero when SigV4 is disabled.
 

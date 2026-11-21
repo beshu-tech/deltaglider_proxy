@@ -588,7 +588,9 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         // the read below and the delete. Then the per-deltaspace lock, to
         // prevent races with concurrent store/delete operations that may
         // create or clean up the reference.
-        let _object_lock = self.lock_object_write(bucket, key).await;
+        let _object_lock = self
+            .lock_object_write(bucket, key, crate::types::WriteOrigin::Client)
+            .await;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         let Some((metadata, forms, refusal)) = self

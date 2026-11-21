@@ -54,6 +54,19 @@ const BOB: User = User {
     sk: "bob-secret-00000000000000000000000002",
 };
 
+/// An IAM user who may only read `allowed-bucket`: every other resource is
+/// denied to this key.
+const DAVE: User = User {
+    ak: "AKDAVE00000000000004",
+    sk: "dave-secret-00000000000000000000000004",
+};
+
+/// An IAM user that is disabled (right secret, refused).
+const CAROL: User = User {
+    ak: "AKCAROL0000000000003",
+    sk: "carol-secret-000000000000000000000003",
+};
+
 // ── what each side saw ──────────────────────────────────────────────────
 
 /// s3s's parsed path (`s3s::path::S3Path` is not `Clone`).
@@ -281,11 +294,38 @@ async fn harness_layers(
     middleware: crate::coordination::CoordinationStatus,
     hook: crate::coordination::CoordinationStatus,
 ) -> Harness {
+    harness_full(middleware, hook, 100).await
+}
+
+/// The harness with a brute-force limiter that locks a key out after
+/// `max_attempts` refused signatures.
+async fn harness_full(
+    middleware: crate::coordination::CoordinationStatus,
+    hook: crate::coordination::CoordinationStatus,
+    max_attempts: u32,
+) -> Harness {
     let coordination = middleware;
     use s3s::service::S3ServiceBuilder;
 
     let iam: crate::iam::SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
-        IamIndex::from_users(vec![iam_user(1, "alice", ALICE), iam_user(2, "bob", BOB)]),
+        IamIndex::from_users(vec![
+            iam_user(1, "alice", ALICE),
+            iam_user(2, "bob", BOB),
+            IamUser {
+                enabled: false,
+                ..iam_user(3, "carol", CAROL)
+            },
+            IamUser {
+                permissions: vec![Permission {
+                    id: 4,
+                    effect: "Allow".into(),
+                    actions: vec!["read".into()],
+                    resources: vec!["allowed-bucket/*".into()],
+                    conditions: None,
+                }],
+                ..iam_user(4, "dave", DAVE)
+            },
+        ]),
     )));
     let mut config = crate::config::Config::default();
     config.buckets.insert(
@@ -330,7 +370,7 @@ async fn harness_layers(
         coordination,
     });
     let rate_limiter = crate::rate_limiter::RateLimiter::new(
-        100,
+        max_attempts,
         Duration::from_secs(300),
         Duration::from_secs(600),
     );
@@ -382,6 +422,12 @@ enum Auth {
     /// SigV4 `Authorization` header, with this body hash (signed as given).
     V4Header(User, &'static str),
     V4Presigned(User),
+    /// A valid presigned query that does not sign these headers; they are
+    /// added to the wire request after signing (a link holder's headers).
+    V4PresignedUnsigned(User, &'static [(&'static str, &'static str)]),
+    /// A valid SigV4 header (empty body) that does not sign these headers;
+    /// they are added to the wire request after signing.
+    V4HeaderUnsigned(User, &'static [(&'static str, &'static str)]),
     /// A valid presigned query for the first user AND a valid header for
     /// the second.
     V4PresignedAndHeader(User, User),
@@ -389,6 +435,9 @@ enum Auth {
     DuplicateHeaders(User, User),
     V2Header(User),
     V2Presigned(User),
+    /// A SigV4 header that no secret signs (`Signature=00..`), so a request
+    /// can carry any path spelling, also one that no signer could sign.
+    Garbage(User),
     /// A SigV2 presigned query for the first user, a SigV4 header for the
     /// second.
     V2PresignedAndV4Header(User, User),
@@ -562,6 +611,11 @@ fn build(req: &RawRequest) -> Option<Request<Body>> {
             let params = sign_v4(&req.method, &pq, &headers, *u, "", true)?;
             pq = append_query(&pq, &params);
         }
+        Auth::V4HeaderUnsigned(u, _) => auth_headers = v4_header(*u, EMPTY_SHA256, &pq, &headers)?,
+        Auth::V4PresignedUnsigned(u, _) => {
+            let params = sign_v4(&req.method, &pq, &headers, *u, "", true)?;
+            pq = append_query(&pq, &params);
+        }
         Auth::V4PresignedAndHeader(q, h) => {
             let params = sign_v4(&req.method, &pq, &headers, *q, "", true)?;
             pq = append_query(&pq, &params);
@@ -572,6 +626,23 @@ fn build(req: &RawRequest) -> Option<Request<Body>> {
             let second = v4_header(*b, EMPTY_SHA256, &pq, &headers)?;
             auth_headers = first;
             auth_headers.extend(second.into_iter().filter(|(k, _)| k == "authorization"));
+        }
+        Auth::Garbage(u) => {
+            let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let day = &stamp[..8];
+            auth_headers = vec![
+                ("x-amz-date".into(), stamp.clone()),
+                ("x-amz-content-sha256".into(), EMPTY_SHA256.into()),
+                (
+                    "authorization".into(),
+                    format!(
+                        "AWS4-HMAC-SHA256 Credential={}/{day}/us-east-1/s3/aws4_request, \
+                         SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={}",
+                        u.ak,
+                        "00".repeat(32)
+                    ),
+                ),
+            ];
         }
         Auth::V2Header(u) => {
             let date = httpdate(SystemTime::now());
@@ -597,6 +668,9 @@ fn build(req: &RawRequest) -> Option<Request<Body>> {
                 auth_headers = v4_header(*h, EMPTY_SHA256, &pq, &headers)?;
             }
         }
+    }
+    if let Auth::V4PresignedUnsigned(_, extra) | Auth::V4HeaderUnsigned(_, extra) = &req.auth {
+        auth_headers.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     }
     let mut builder = Request::builder().method(req.method.clone()).uri(&pq);
     for (k, v) in headers.iter().chain(auth_headers.iter()) {
@@ -989,6 +1063,116 @@ fn table() -> Vec<(&'static str, RawRequest, Expect)> {
             get("/alpha-bucket/k.txt", Auth::V4Presigned(ALICE)),
             Served,
         ),
+        // A presigned link signs `host` only. Any other `x-amz-*` header is
+        // the link holder's: it turns a PutObject into a CopyObject, an
+        // UploadPart into an UploadPartCopy, and sets metadata unsigned.
+        (
+            "presigned put + unsigned copy source",
+            req(
+                Method::PUT,
+                "/alpha-bucket/dst",
+                &[],
+                Auth::V4PresignedUnsigned(ALICE, &[("x-amz-copy-source", "/alpha-bucket/src")]),
+            ),
+            Refused,
+        ),
+        (
+            "presigned upload part + unsigned copy source",
+            req(
+                Method::PUT,
+                "/alpha-bucket/dst?partNumber=1&uploadId=u1",
+                &[],
+                Auth::V4PresignedUnsigned(ALICE, &[("x-amz-copy-source", "/alpha-bucket/src")]),
+            ),
+            Refused,
+        ),
+        (
+            "presigned put + unsigned metadata",
+            req(
+                Method::PUT,
+                "/alpha-bucket/dst",
+                &[],
+                Auth::V4PresignedUnsigned(ALICE, &[("x-amz-meta-owner", "mallory")]),
+            ),
+            Refused,
+        ),
+        // The same rule on header auth: an `x-amz-*` header outside
+        // `SignedHeaders=` is the caller's, not the signer's. s3s does not
+        // check it (`signature.rs`: "FIXME: throw error if any signed header
+        // is not in the request").
+        (
+            "header put + unsigned copy source",
+            req(
+                Method::PUT,
+                "/alpha-bucket/dst",
+                &[],
+                Auth::V4HeaderUnsigned(ALICE, &[("x-amz-copy-source", "/alpha-bucket/src")]),
+            ),
+            Refused,
+        ),
+        (
+            "header put + unsigned metadata",
+            req(
+                Method::PUT,
+                "/alpha-bucket/dst",
+                &[],
+                Auth::V4HeaderUnsigned(ALICE, &[("x-amz-meta-owner", "mallory")]),
+            ),
+            Refused,
+        ),
+        (
+            "header put + signed metadata",
+            req(
+                Method::PUT,
+                "/alpha-bucket/dst",
+                &[("x-amz-meta-owner", "alice")],
+                v4(ALICE),
+            ),
+            Served,
+        ),
+        (
+            "header put + unsigned content type",
+            req(
+                Method::PUT,
+                "/alpha-bucket/dst",
+                &[],
+                Auth::V4HeaderUnsigned(ALICE, &[("content-type", "text/plain")]),
+            ),
+            Served,
+        ),
+        // CloudFront adds this header to every forwarded request; it has no
+        // S3 meaning, so it may stay unsigned (and is the only such header).
+        (
+            "header get + unsigned cloudfront id",
+            req(
+                Method::GET,
+                "/alpha-bucket/k",
+                &[],
+                Auth::V4HeaderUnsigned(ALICE, &[("x-amz-cf-id", "abc")]),
+            ),
+            Served,
+        ),
+        (
+            "presigned get + unsigned cloudfront id",
+            req(
+                Method::GET,
+                "/alpha-bucket/k",
+                &[],
+                Auth::V4PresignedUnsigned(ALICE, &[("x-amz-cf-id", "abc")]),
+            ),
+            Served,
+        ),
+        // Headers that AWS lets stay unsigned on a presigned request.
+        (
+            "presigned put + unsigned content type",
+            req(
+                Method::PUT,
+                "/alpha-bucket/dst",
+                &[],
+                Auth::V4PresignedUnsigned(ALICE, &[("content-type", "text/plain")]),
+            ),
+            Served,
+        ),
         (
             "presigned encoded",
             get("/alpha-bucket/secre%74.txt", Auth::V4Presigned(ALICE)),
@@ -1014,19 +1198,33 @@ fn table() -> Vec<(&'static str, RawRequest, Expect)> {
             get("/alpha-bucket/k", Auth::DuplicateHeaders(ALICE, ALICE)),
             Refused,
         ),
+        // SigV2 is not supported: every shape is refused before s3s.
         (
             "sigv2 header",
             get("/alpha-bucket/k", Auth::V2Header(ALICE)),
-            Any,
+            Refused,
         ),
         (
             "sigv2 presigned",
             get("/alpha-bucket/k", Auth::V2Presigned(ALICE)),
-            Any,
+            Refused,
         ),
         (
             "sigv2 presigned + v4 header",
             get("/alpha-bucket/k", Auth::V2PresignedAndV4Header(BOB, ALICE)),
+            Refused,
+        ),
+        (
+            "sigv2 presigned + junk v4 header",
+            req(
+                Method::GET,
+                "/alpha-bucket/k",
+                &[(
+                    "authorization",
+                    "AWS4-HMAC-SHA256 Credential=AKALICE0000000000001/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=00",
+                )],
+                Auth::V2Presigned(ALICE),
+            ),
             Refused,
         ),
         (
@@ -1035,7 +1233,7 @@ fn table() -> Vec<(&'static str, RawRequest, Expect)> {
                 &format!("/{PUBLIC_BUCKET}/{PUBLIC_PREFIX}k"),
                 Auth::V2Presigned(BOB),
             ),
-            Any,
+            Refused,
         ),
         (
             "anonymous public read",
@@ -1054,6 +1252,98 @@ fn table() -> Vec<(&'static str, RawRequest, Expect)> {
                 Auth::None,
             ),
             Any,
+        ),
+        // The anonymous principal runs only GetObject, HeadObject,
+        // ListObjects and ListObjectsV2, by the s3s operation.
+        (
+            "anonymous public list v1",
+            get(&format!("/{PUBLIC_BUCKET}?prefix={PUBLIC_PREFIX}"), Auth::None),
+            Served,
+        ),
+        (
+            "anonymous public list v2",
+            get(
+                &format!("/{PUBLIC_BUCKET}?list-type=2&prefix={PUBLIC_PREFIX}"),
+                Auth::None,
+            ),
+            Served,
+        ),
+        (
+            "anonymous public head object",
+            req(
+                Method::HEAD,
+                &format!("/{PUBLIC_BUCKET}/{PUBLIC_PREFIX}k"),
+                &[],
+                Auth::None,
+            ),
+            Served,
+        ),
+        (
+            "anonymous list multipart uploads",
+            get(
+                &format!("/{PUBLIC_BUCKET}?uploads&prefix={PUBLIC_PREFIX}"),
+                Auth::None,
+            ),
+            Refused,
+        ),
+        (
+            "anonymous list parts",
+            get(
+                &format!("/{PUBLIC_BUCKET}/{PUBLIC_PREFIX}k?uploadId=u1"),
+                Auth::None,
+            ),
+            Refused,
+        ),
+        (
+            "anonymous bucket acl",
+            get(&format!("/{PUBLIC_BUCKET}?acl"), Auth::None),
+            Refused,
+        ),
+        (
+            "anonymous bucket versioning",
+            get(&format!("/{PUBLIC_BUCKET}?versioning"), Auth::None),
+            Refused,
+        ),
+        (
+            "anonymous bucket location",
+            get(&format!("/{PUBLIC_BUCKET}?location"), Auth::None),
+            Refused,
+        ),
+        (
+            "anonymous object tagging",
+            get(
+                &format!("/{PUBLIC_BUCKET}/{PUBLIC_PREFIX}k?tagging"),
+                Auth::None,
+            ),
+            Refused,
+        ),
+        (
+            "anonymous object acl",
+            get(
+                &format!("/{PUBLIC_BUCKET}/{PUBLIC_PREFIX}k?acl"),
+                Auth::None,
+            ),
+            Refused,
+        ),
+        (
+            "anonymous object attributes",
+            req(
+                Method::GET,
+                &format!("/{PUBLIC_BUCKET}/{PUBLIC_PREFIX}k?attributes"),
+                &[("x-amz-object-attributes", "ETag")],
+                Auth::None,
+            ),
+            Refused,
+        ),
+        (
+            "anonymous head bucket",
+            req(
+                Method::HEAD,
+                &format!("/{PUBLIC_BUCKET}"),
+                &[],
+                Auth::None,
+            ),
+            Refused,
         ),
         (
             "anonymous private",
@@ -1270,6 +1560,359 @@ async fn table_cases_honour_the_contract() {
         "contract violations:\n{}",
         failures.join("\n")
     );
+}
+
+// ── unknown access keys ─────────────────────────────────────────────────
+
+/// A response with the per-request values taken out: status, header names
+/// and values (but the request id, the date and the length) and the body.
+async fn answer(
+    router: &Router,
+    raw: &RawRequest,
+    peer: Option<std::net::SocketAddr>,
+) -> (StatusCode, Vec<(String, String)>, String) {
+    let mut request = build(raw).expect("a request");
+    if let Some(peer) = peer {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+    }
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter(|(k, _)| !["x-amz-request-id", "date", "content-length"].contains(&k.as_str()))
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    headers.sort();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let mut body = String::from_utf8_lossy(&body).to_string();
+    for tag in ["RequestId", "HostId", "Resource"] {
+        while let (Some(a), Some(b)) = (
+            body.find(&format!("<{tag}>")),
+            body.find(&format!("</{tag}>")),
+        ) {
+            body.replace_range(a..b + tag.len() + 3, "");
+        }
+    }
+    (status, headers, body)
+}
+
+const NOBODY: User = User {
+    ak: "AKNOBODY00000000009",
+    sk: "nobody-secret-0000000000000000000000009",
+};
+
+/// An unknown or disabled access key id gets the answer of a known key with
+/// a wrong secret, so the answer does not tell which key ids exist.
+#[tokio::test]
+async fn an_unknown_key_gets_the_answer_of_a_wrong_secret() {
+    let h = harness().await;
+    let wrong_secret = User {
+        sk: "not-alice-secret",
+        ..ALICE
+    };
+    type Sign = fn(User) -> Auth;
+    let shapes: [(&str, Sign); 2] = [("header", v4), ("presigned", Auth::V4Presigned)];
+    for (shape, auth) in shapes {
+        let path = "/alpha-bucket/k.txt";
+        let reference = answer(&h.prod, &get(path, auth(wrong_secret)), None).await;
+        assert_eq!(reference.0, StatusCode::FORBIDDEN, "{shape}");
+        assert!(
+            reference.2.contains("SignatureDoesNotMatch"),
+            "{shape}: {}",
+            reference.2
+        );
+        for (who, user) in [("unknown", NOBODY), ("disabled", CAROL)] {
+            let got = answer(&h.prod, &get(path, auth(user)), None).await;
+            assert_eq!(got, reference, "{shape}: {who} key answers differently");
+        }
+    }
+}
+
+/// A request that the path or query decoder refuses gets one answer for
+/// every caller whose signature does not verify: a known id (enabled, or
+/// with a narrow policy), a disabled id and an unknown id alike, byte for
+/// byte. Before the fix a known id got its own 400 from the authorization
+/// middleware, and an unknown id the 400 of s3s: the answer told which key
+/// ids exist.
+#[tokio::test]
+async fn a_malformed_request_gets_one_answer_for_every_unverified_caller() {
+    let long_key = format!("/anybucket/{}", "a".repeat(1100));
+    let paths = [
+        "/anybucket/%FF".to_string(),
+        "/anybucket/%C3%28".to_string(),
+        "/anybucket/a%00b".to_string(),
+        long_key,
+        "/anybucket/a/../b".to_string(),
+        "/anybucket/%2e%2e/b".to_string(),
+        "//key".to_string(),
+        "/%FF".to_string(),
+        "/anybucket?prefix=%FF".to_string(),
+        "/anybucket?%FF=1".to_string(),
+        "/anybucket/k?versionId=%GG".to_string(),
+        "/anybucket/k?partNumber=%FF&uploadId=x".to_string(),
+    ];
+    let h = harness().await;
+    let mut failures = Vec::new();
+    for method in [Method::GET, Method::PUT, Method::DELETE] {
+        for path in &paths {
+            let at = |u: User| req(method.clone(), path, &[], Auth::Garbage(u));
+            let reference = answer(&h.prod, &at(NOBODY), None).await;
+            for (who, user) in [
+                ("alice", ALICE),
+                ("dave (narrow policy)", DAVE),
+                ("bob", BOB),
+                ("disabled carol", CAROL),
+            ] {
+                let got = answer(&h.prod, &at(user), None).await;
+                if got != reference {
+                    failures.push(format!(
+                        "{method} {path:.60}: {who} gets {:?} {:?}, an unknown id gets {:?} {:?}",
+                        got.0, got.2, reference.0, reference.2
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Failed signatures count per (client address, access key id as sent),
+/// whether the id exists or not. A locked-out id is that address's alone and
+/// never refuses another id, so a real key is never locked out by guesses.
+#[tokio::test]
+async fn failed_signatures_are_counted_per_address_and_key_id_as_sent() {
+    let h = harness_full(Default::default(), Default::default(), 3).await;
+    let a: std::net::SocketAddr = "10.0.0.1:4000".parse().unwrap();
+    let b: std::net::SocketAddr = "10.0.0.2:4000".parse().unwrap();
+    let guess = |n: usize| {
+        let ak: &'static str = Box::leak(format!("AKGUESS{n:013}").into_boxed_str());
+        get("/alpha-bucket/k.txt", v4(User { ak, ..NOBODY }))
+    };
+    for n in 0..3 {
+        let (status, ..) = answer(&h.prod, &guess(0), Some(a)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "guess {n}");
+    }
+    let (status, ..) = answer(&h.prod, &guess(0), Some(a)).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the id is not limited"
+    );
+    // Another id at this address has its own count.
+    let (status, ..) = answer(&h.prod, &guess(1), Some(a)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "one id limited another");
+    // A real key from the same address is served (501: NopS3 got it).
+    let real = get("/alpha-bucket/k.txt", v4(ALICE));
+    let (status, ..) = answer(&h.prod, &real, Some(a)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "a real key was locked out"
+    );
+    // The same id at another address is not limited.
+    let (status, ..) = answer(&h.prod, &guess(0), Some(b)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the lockout crossed addresses"
+    );
+}
+
+/// The same request sequence gets the same answers, the same delay and the
+/// same lockout whether the access key id exists (wrong secret) or not.
+#[tokio::test]
+async fn a_known_and_an_unknown_key_id_get_the_same_answers_delays_and_lockout() {
+    const GUESSES: [usize; 5] = [0, 3, 14, 15, 105];
+    let wrong_secret = User {
+        sk: "not-alice-secret",
+        ..ALICE
+    };
+    // One rig per (candidate, guess count): the limiter state is the only
+    // difference between runs.
+    let mut rigs = Vec::new();
+    for guesses in GUESSES {
+        for known in [true, false] {
+            let h = harness_full(Default::default(), Default::default(), 100).await;
+            rigs.push((guesses, known, h));
+        }
+    }
+    tokio::time::pause();
+    let peer: std::net::SocketAddr = "10.0.0.1:4000".parse().unwrap();
+    type Answered = (StatusCode, Vec<(String, String)>, String, Duration);
+    let mut seen: std::collections::HashMap<usize, Vec<Answered>> = Default::default();
+    for (guesses, known, h) in &rigs {
+        // Bad guesses at other, unknown key ids from the same address.
+        for n in 0..*guesses {
+            let ak: &'static str = Box::leak(format!("AKGUESS{n:013}").into_boxed_str());
+            let raw = get("/alpha-bucket/k.txt", v4(User { ak, ..NOBODY }));
+            answer(&h.prod, &raw, Some(peer)).await;
+        }
+        // Then the candidate: an existing id with a wrong secret, or not.
+        let candidate = if *known { wrong_secret } else { NOBODY };
+        let started = tokio::time::Instant::now();
+        let (status, headers, body) = answer(
+            &h.prod,
+            &get("/alpha-bucket/k.txt", v4(candidate)),
+            Some(peer),
+        )
+        .await;
+        seen.entry(*guesses)
+            .or_default()
+            .push((status, headers, body, started.elapsed()));
+    }
+    for (guesses, answers) in seen {
+        assert_eq!(
+            answers[0], answers[1],
+            "after {guesses} bad guesses an existing and a missing key id differ \
+             (answer or delay)"
+        );
+    }
+}
+
+/// Through the whole lockout, an existing key id with a wrong secret and a
+/// missing key id get the same answers and the same delays, request for
+/// request. After the lockout, the existing id with its right secret is
+/// served (501: the stand-in handler got it), without delay.
+#[tokio::test]
+async fn a_known_and_an_unknown_key_id_answer_alike_through_a_lockout() {
+    let wrong_secret = User {
+        sk: "not-alice-secret",
+        ..ALICE
+    };
+    let mut rigs = Vec::new();
+    for known in [true, false] {
+        rigs.push((
+            known,
+            harness_full(Default::default(), Default::default(), 20).await,
+        ));
+    }
+    tokio::time::pause();
+    let peer: std::net::SocketAddr = "10.0.0.1:4000".parse().unwrap();
+    type Answered = (StatusCode, Vec<(String, String)>, String, Duration);
+    let mut seen: Vec<Vec<Answered>> = Vec::new();
+    for (known, h) in &rigs {
+        let candidate = if *known { wrong_secret } else { NOBODY };
+        let mut answers = Vec::new();
+        for _ in 0..24 {
+            let started = tokio::time::Instant::now();
+            let (status, headers, body) = answer(
+                &h.prod,
+                &get("/alpha-bucket/k.txt", v4(candidate)),
+                Some(peer),
+            )
+            .await;
+            answers.push((status, headers, body, started.elapsed()));
+        }
+        if *known {
+            let started = tokio::time::Instant::now();
+            let (status, ..) =
+                answer(&h.prod, &get("/alpha-bucket/k.txt", v4(ALICE)), Some(peer)).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "a verified request was refused during the lockout"
+            );
+            assert_eq!(
+                started.elapsed(),
+                Duration::ZERO,
+                "a verified request was delayed"
+            );
+        }
+        seen.push(answers);
+    }
+    for (n, (a, b)) in seen[0].iter().zip(&seen[1]).enumerate() {
+        assert_eq!(a, b, "request {n}: a known and a missing key id differ");
+    }
+    assert_eq!(seen[0][23].0, StatusCode::SERVICE_UNAVAILABLE, "locked out");
+}
+
+/// No authorization verdict reaches a caller whose signature is not
+/// verified: a denied resource answers a wrong secret and an unknown key id
+/// alike, and only the right secret learns `AccessDenied`.
+#[tokio::test]
+async fn a_denied_resource_is_shown_only_after_the_signature_verifies() {
+    let h = harness().await;
+    let wrong_secret = User {
+        sk: "not-dave-secret",
+        ..DAVE
+    };
+    type Sign = fn(User) -> Auth;
+    let shapes: [(&str, Sign); 2] = [("header", v4), ("presigned", Auth::V4Presigned)];
+    for (shape, auth) in shapes {
+        for path in [
+            "/secret-bucket/k.txt",
+            "/secret-bucket?list-type=2",
+            "/other-bucket/x/y.txt",
+        ] {
+            let unknown = answer(&h.prod, &get(path, auth(NOBODY)), None).await;
+            assert_eq!(unknown.0, StatusCode::FORBIDDEN, "{shape} {path}");
+            assert!(unknown.2.contains("SignatureDoesNotMatch"), "{}", unknown.2);
+            let known = answer(&h.prod, &get(path, auth(wrong_secret)), None).await;
+            assert_eq!(
+                known, unknown,
+                "{shape} {path}: a known key id answers differently"
+            );
+            let right = answer(&h.prod, &get(path, auth(DAVE)), None).await;
+            assert_eq!(right.0, StatusCode::FORBIDDEN, "{shape} {path}");
+            assert!(
+                right.2.contains("AccessDenied"),
+                "{shape} {path}: {}",
+                right.2
+            );
+        }
+    }
+}
+
+/// Our parser and s3s read different identities (two `Authorization`
+/// headers: s3s sees none): the answer is the one of a wrong secret.
+#[tokio::test]
+async fn an_identity_that_s3s_did_not_verify_answers_a_wrong_secret() {
+    let h = harness().await;
+    let raw = get("/alpha-bucket/k.txt", Auth::DuplicateHeaders(ALICE, BOB));
+    let (status, _, body) = answer(&h.prod, &raw, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("SignatureDoesNotMatch"), "{body}");
+}
+
+/// A denied write is refused at the access hook: the PutObject handler never
+/// runs, so it never reads the body.
+#[tokio::test]
+async fn a_denied_write_never_reaches_the_handler_or_reads_its_body() {
+    let h = harness().await;
+    for (what, user) in [
+        ("right secret", DAVE),
+        (
+            "wrong secret",
+            User {
+                sk: "not-dave-secret",
+                ..DAVE
+            },
+        ),
+    ] {
+        let raw = RawRequest {
+            method: Method::PUT,
+            path_and_query: "/secret-bucket/k.txt".into(),
+            headers: vec![],
+            body: vec![7u8; 1 << 20],
+            auth: Auth::V4Header(user, "UNSIGNED-PAYLOAD"),
+        };
+        let out = run(&h, &raw).await.expect("a request");
+        assert_eq!(out.status, StatusCode::FORBIDDEN, "{what}");
+        assert!(
+            out.seen.as_ref().is_none_or(|s| s.put.is_none()),
+            "{what}: the PutObject handler ran: {:?}",
+            out.seen
+        );
+        assert!(
+            !out.seen.as_ref().is_some_and(|s| s.hook_admitted),
+            "{what}: the hook admitted a denied write"
+        );
+    }
 }
 
 // ── the payload-hash shapes ─────────────────────────────────────────────

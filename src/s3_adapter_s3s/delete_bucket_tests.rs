@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::storage::DynStorageBackend;
+use std::sync::Mutex;
 
 /// Forwards to the engine and counts its listing requests.
 struct Recording<'a> {

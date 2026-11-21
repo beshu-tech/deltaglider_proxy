@@ -201,6 +201,20 @@ pub fn request_principal(ext: &axum::http::Extensions) -> Option<&Arc<Authentica
     ext.get::<Arc<AuthenticatedUser>>()
 }
 
+/// Who a per-principal share counts: the access key id of a signed
+/// principal, the reserved name of the anonymous one, and one shared name
+/// for open access (no principal at all).
+pub fn principal_id(user: Option<&AuthenticatedUser>) -> String {
+    match user {
+        Some(u) if !u.access_key_id.is_empty() => u.access_key_id.clone(),
+        Some(u) => u.name.clone(),
+        None => OPEN_ACCESS_PRINCIPAL.to_string(),
+    }
+}
+
+/// The [`principal_id`] of every request in open access mode.
+pub const OPEN_ACCESS_PRINCIPAL: &str = "$open";
+
 /// Put the resolved principal into the request's extensions (one `Arc`
 /// clone, no copy). THE writer of the slot that [`request_principal`] reads.
 pub fn insert_request_principal(ext: &mut axum::http::Extensions, user: Arc<AuthenticatedUser>) {

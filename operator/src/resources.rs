@@ -56,7 +56,21 @@ fn fnv1a_hex(s: &str) -> String {
 /// so every request touching one delta prefix — all keys in it, all multipart parts —
 /// lands on the same proxy pod, keeping the in-process reference lock sufficient.
 /// Admin UI traffic (/_/) is source-IP sticky because sessions are in-memory.
-pub fn haproxy_cfg(cr_name: &str, namespace: &str, proxy_replicas: i32) -> String {
+/// Unless `trust_client_forwarded`, the client's own X-Forwarded-For, Forwarded and
+/// X-Real-IP headers are deleted before `option forwardfor` adds the router's line.
+pub fn haproxy_cfg(
+    cr_name: &str,
+    namespace: &str,
+    proxy_replicas: i32,
+    trust_client_forwarded: bool,
+) -> String {
+    // The router is the only writer of the client address, unless a trusted hop sets it.
+    let forwarding = if trust_client_forwarded {
+        ""
+    } else {
+        "  http-request del-header X-Forwarded-For\n  http-request del-header Forwarded\n  \
+         http-request del-header X-Real-IP\n"
+    };
     let mut servers = String::new();
     let mut admin_servers = String::new();
     for i in 0..proxy_replicas {
@@ -93,7 +107,7 @@ resolvers kube
 
 frontend dgp
   bind :{PROXY_PORT}
-  acl is_admin path_beg /_/
+{forwarding}  acl is_admin path_beg /_/
   use_backend admin if is_admin
   default_backend s3
 
@@ -136,7 +150,7 @@ pub fn router_configmap(cr: &DeltaGliderProxy, proxy_replicas: i32) -> Value {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": meta(cr, &name, "router"),
-        "data": { "haproxy.cfg": haproxy_cfg(&cr_name(cr), &ns, proxy_replicas) },
+        "data": { "haproxy.cfg": haproxy_cfg(&cr_name(cr), &ns, proxy_replicas, cr.trust_client_forwarded_for()) },
     })
 }
 
@@ -394,7 +408,12 @@ pub fn router_deployment(cr: &DeltaGliderProxy, proxy_replicas: i32) -> Value {
     let router_name = format!("{name}-router");
     let ns = cr.meta().namespace.clone().unwrap_or_default();
     let mut pod_labels = labels(&name, "router");
-    pod_labels["dgp.beshu.tech/ring"] = json!(fnv1a_hex(&haproxy_cfg(&name, &ns, proxy_replicas)));
+    pod_labels["dgp.beshu.tech/ring"] = json!(fnv1a_hex(&haproxy_cfg(
+        &name,
+        &ns,
+        proxy_replicas,
+        cr.trust_client_forwarded_for(),
+    )));
     json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -521,6 +540,7 @@ mod tests {
                     replicas: Some(2),
                     image: None,
                     trusted_proxy_cidrs: None,
+                    trust_client_forwarded_for: None,
                     network_policy: None,
                 }),
                 service: None,
@@ -535,7 +555,7 @@ mod tests {
 
     #[test]
     fn haproxy_cfg_pins_by_path_and_lists_stable_pod_dns() {
-        let cfg = haproxy_cfg("dgp", "dgp-ns", 3);
+        let cfg = haproxy_cfg("dgp", "dgp-ns", 3, false);
         assert!(
             cfg.contains("balance hash path,regsub([^/]*$,x)"),
             "S3 backend must hash by path DIRECTORY: the deltaspace reference lock is \
@@ -574,9 +594,49 @@ mod tests {
         assert!(!cfg.contains("dgp-3."), "no server beyond replica count");
     }
 
+    /// The router is the only writer of the client-address headers.
+    #[test]
+    fn haproxy_cfg_deletes_client_forwarding_headers_by_default() {
+        let cfg = haproxy_cfg("dgp", "ns", 2, false);
+        for header in ["X-Forwarded-For", "Forwarded", "X-Real-IP"] {
+            assert!(
+                cfg.lines()
+                    .any(|l| l.trim() == format!("http-request del-header {header}")),
+                "missing del-header {header}:\n{cfg}"
+            );
+        }
+    }
+
+    /// A trusted layer-7 hop in front of the router keeps its own headers.
+    #[test]
+    fn haproxy_cfg_keeps_client_headers_when_a_trusted_hop_sets_them() {
+        let cfg = haproxy_cfg("dgp", "ns", 2, true);
+        assert!(!cfg.contains("del-header"), "{cfg}");
+        assert!(cfg.contains("option forwardfor"));
+        let deleted = haproxy_cfg("dgp", "ns", 2, false);
+        assert_ne!(
+            fnv1a_hex(&cfg),
+            fnv1a_hex(&deleted),
+            "a flag change rolls the routers through the ring label"
+        );
+    }
+
+    #[test]
+    fn the_flag_defaults_to_false_and_reads_the_spec() {
+        let mut c = cr(2);
+        assert!(!c.trust_client_forwarded_for());
+        c.spec.router.as_mut().unwrap().trust_client_forwarded_for = Some(true);
+        assert!(c.trust_client_forwarded_for());
+        c.spec.router = None;
+        assert!(!c.trust_client_forwarded_for());
+    }
+
     #[test]
     fn haproxy_cfg_is_deterministic_across_routers() {
-        assert_eq!(haproxy_cfg("dgp", "ns", 4), haproxy_cfg("dgp", "ns", 4));
+        assert_eq!(
+            haproxy_cfg("dgp", "ns", 4, false),
+            haproxy_cfg("dgp", "ns", 4, false)
+        );
     }
 
     #[test]
@@ -778,7 +838,7 @@ mod tests {
         let cr = cr(3);
         let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, 1)).unwrap();
         assert_eq!(sts.spec.unwrap().replicas, Some(1));
-        let ring = haproxy_cfg("dgp", "dgp-ns", 1);
+        let ring = haproxy_cfg("dgp", "dgp-ns", 1, false);
         assert_eq!(
             ring.matches("server dgp0 ").count(),
             2,

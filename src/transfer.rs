@@ -118,6 +118,10 @@ pub(crate) struct ObjectTransferRequest<'a> {
     /// ([`admitted`] sets it); `None` = a client copy or a maintenance job.
     /// Required in every literal: a commit point cannot skip the decision.
     pub commit_count: &'a crate::maintenance::gate::Counted,
+    /// Who makes the copy: a client (admin bulk copy or move, a new key) or a
+    /// background job that copies a key that already exists. It picks the
+    /// write gate of the destination key. Required in every literal.
+    pub origin: crate::types::WriteOrigin,
 }
 
 /// How one object was physically moved source→dest. Surfaced to the
@@ -231,9 +235,11 @@ where
     let crate::maintenance::gate::Counted::By(count) = count else {
         return pinned.await;
     };
+    // The spawned task reads (the source of a copy) as the caller does.
+    let context = crate::deltaglider::spool::capture_context();
     let task = tokio::spawn(async move {
         let _count = count;
-        pinned.await
+        crate::deltaglider::spool::in_context(context, pinned).await
     });
     match task.await {
         Ok(out) => out,
@@ -522,7 +528,11 @@ async fn copy_attempt(
     let lock: CopyLock = Arc::new(match overwrite {
         Overwrite::Allowed => {
             engine
-                .lock_object_write(request.destination_bucket, request.destination_key)
+                .lock_object_write(
+                    request.destination_bucket,
+                    request.destination_key,
+                    request.origin,
+                )
                 .await
         }
         Overwrite::Refused => engine
@@ -533,6 +543,7 @@ async fn copy_attempt(
                     if_match: None,
                     if_none_match: Some(s3s::dto::ETagCondition::Any),
                 },
+                request.origin,
             )
             .await
             .map_err(|e| match e {
@@ -1009,7 +1020,7 @@ async fn fetch_part_once(
         )
         .await
         .map_err(|e| CopyError::engine("ranged retrieve failed", e))?;
-    let (stream, content_length, _meta) = ranged.ok_or_else(|| {
+    let (stream, content_length, _meta, _held) = ranged.ok_or_else(|| {
         // None means the object isn't natively range-able (delta/unmanaged).
         // The caller only enters the streaming path for passthrough objects,
         // so this is a genuine error (concurrent strategy flip).
@@ -1304,6 +1315,22 @@ impl std::fmt::Display for CopyError {
 }
 
 impl std::error::Error for CopyError {}
+
+impl CopyError {
+    /// The destination refused the KEY NAME: it collides with a name that the
+    /// destination backend keeps for its own files. About this key only; a
+    /// retry never helps, and a job records the key and goes on.
+    pub(crate) fn key_refused(&self) -> bool {
+        use crate::deltaglider::EngineError as E;
+        use crate::storage::StorageError as S;
+        matches!(
+            self.cause.as_deref(),
+            Some(CopyCause::Engine(
+                E::KeyRefused(_) | E::Storage(S::InvalidKey(_))
+            )) | Some(CopyCause::Storage(S::InvalidKey(_)))
+        )
+    }
+}
 
 impl CopyError {
     pub(crate) fn new(class: CopyClass, message: impl Into<String>) -> Self {
@@ -1792,6 +1819,7 @@ pub(crate) async fn client_delta_copy(
         upload_concurrency: None,
         keep_created_at: false,
         commit_count,
+        origin: crate::types::WriteOrigin::Client,
     };
     let fields = DestinationFields {
         content_type,
@@ -1865,6 +1893,10 @@ async fn delta_passthrough_copy(
     read_ahead: bool,
 ) -> Result<Option<ShippedDelta>, CopyError> {
     use crate::types::{ObjectKey, StorageInfo};
+
+    // A destination key that its origin's write gate refuses fails the copy
+    // before any read; the raw writers below ask for the proof again.
+    engine.gate_write(lock)?;
 
     // Source delta facts. `ref_sha256` comes from the HEAD; recover it via
     // delta_meta if a lite-list stub left it empty.
@@ -1946,7 +1978,6 @@ async fn delta_passthrough_copy(
     let dest_bucket = request.destination_bucket.to_string();
     let src_bucket = request.source_bucket.to_string();
     let dest_prefix2 = dest_prefix.clone();
-    let dest_filename2 = dest_filename.clone();
     let engine2 = engine.clone();
     // The shipped delta's metadata, for the heal after the lock (the
     // original moves into the closure).
@@ -2053,6 +2084,7 @@ async fn delta_passthrough_copy(
                                 None => return Ok(None),
                             },
                         };
+                        let gate = engine2.gate_write(lock)?;
                         let mut seeded = 0;
                         if seed {
                             // The seed moves the reference through the proxy and writes
@@ -2073,8 +2105,7 @@ async fn delta_passthrough_copy(
                             engine2
                                 .put_reference_raw(
                                     ticket,
-                                    &dest_bucket,
-                                    &dest_prefix2,
+                                    &gate,
                                     crate::storage::PutBody::Bytes(Bytes::from(ref_data)),
                                     &ref_meta,
                                 )
@@ -2086,10 +2117,7 @@ async fn delta_passthrough_copy(
                         engine2
                             .put_delta_raw(
                                 ticket,
-                                lock,
-                                &dest_bucket,
-                                &dest_prefix2,
-                                &dest_filename2,
+                                &gate,
                                 crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
                                 &meta,
                                 &counter_prior,
@@ -2207,13 +2235,17 @@ async fn heal_stripped_dest_delta(
                             return;
                         }
                     };
+                    let gate = match engine.gate_write(lock) {
+                        Ok(gate) => gate,
+                        Err(e) => {
+                            warn!("heal: dest key {bucket}/{key} is refused: {e}");
+                            return;
+                        }
+                    };
                     match engine
                         .put_delta_raw(
                             ticket,
-                            lock,
-                            bucket,
-                            &dest_key.prefix,
-                            &dest_key.filename,
+                            &gate,
                             crate::storage::PutBody::Bytes(Bytes::from(delta_bytes)),
                             meta,
                             // A re-stamp of a stored delta: no read says the
@@ -2258,14 +2290,21 @@ async fn spooled_copy(
         .retrieve_stream(request.source_bucket, request.source_key)
         .await
         .map_err(|e| CopyError::engine("source retrieve_stream failed", e))?;
-    let (stream, meta) = match resp {
+    let (stream, meta, held_spool) = match resp {
         crate::deltaglider::RetrieveResponse::Streamed {
-            stream, metadata, ..
-        } => (stream, metadata),
+            stream,
+            metadata,
+            held_spool,
+            ..
+        } => (stream, metadata, held_spool),
         crate::deltaglider::RetrieveResponse::Buffered { data, metadata, .. } => {
             let once: crate::storage::ByteStream =
                 Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) }));
-            (once, metadata)
+            (
+                once,
+                metadata,
+                crate::deltaglider::spool::HeldSpool::NOTHING,
+            )
         }
     };
 
@@ -2296,7 +2335,7 @@ async fn spooled_copy(
         // The stored source sets the size; the store applies its limits.
         limit: u64::MAX,
         sha256: ingest::Sha256Need::Compute,
-        held_spool: engine.stream_held_spool(&meta),
+        held_spool,
         strict_length: true,
         destination: ingest::Destination::Object,
     };
@@ -2469,6 +2508,7 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: true,
             commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
+            origin: crate::types::WriteOrigin::Job,
         };
 
         let outcome = copy_object_with_retries(&engine, request).await.unwrap();
@@ -2510,10 +2550,15 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
             commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
+            origin: crate::types::WriteOrigin::Job,
         };
         let lock = Arc::new(
             engine
-                .lock_object_write(request.destination_bucket, request.destination_key)
+                .lock_object_write(
+                    request.destination_bucket,
+                    request.destination_key,
+                    request.origin,
+                )
                 .await,
         );
         match spooled_copy(&engine, &lock, &request, &stale, stale.file_size).await {
@@ -2658,10 +2703,15 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
             commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
+            origin: crate::types::WriteOrigin::Job,
         };
         let lock = Arc::new(
             engine
-                .lock_object_write(request.destination_bucket, request.destination_key)
+                .lock_object_write(
+                    request.destination_bucket,
+                    request.destination_key,
+                    request.origin,
+                )
                 .await,
         );
         let result = delta_passthrough_copy(
@@ -2784,12 +2834,17 @@ mod tests {
             upload_concurrency: None,
             keep_created_at: false,
             commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
+            origin: crate::types::WriteOrigin::Job,
         };
         let _ = delta_passthrough_copy(
             &engine,
             &Arc::new(
                 engine
-                    .lock_object_write(request.destination_bucket, request.destination_key)
+                    .lock_object_write(
+                        request.destination_bucket,
+                        request.destination_key,
+                        request.origin,
+                    )
                     .await,
             ),
             request,
@@ -2883,10 +2938,15 @@ mod tests {
                 upload_concurrency: None,
                 keep_created_at: false,
                 commit_count: &count,
+                origin: crate::types::WriteOrigin::Job,
             };
             let lock = Arc::new(
-                eng.lock_object_write(request.destination_bucket, request.destination_key)
-                    .await,
+                eng.lock_object_write(
+                    request.destination_bucket,
+                    request.destination_key,
+                    request.origin,
+                )
+                .await,
             );
             heal_stripped_dest_delta(&eng, &lock, request, &head, size, None).await;
         });
@@ -2976,10 +3036,15 @@ mod tests {
                 upload_concurrency: None,
                 keep_created_at: false,
                 commit_count: &count,
+                origin: crate::types::WriteOrigin::Job,
             };
             let lock = Arc::new(
-                eng.lock_object_write(request.destination_bucket, request.destination_key)
-                    .await,
+                eng.lock_object_write(
+                    request.destination_bucket,
+                    request.destination_key,
+                    request.origin,
+                )
+                .await,
             );
             let fields = DestinationFields::of_transfer(&request, &head);
             delta_passthrough_copy(&eng, &lock, request, &head, None, fields, true).await
@@ -3050,6 +3115,25 @@ mod tests {
         assert_eq!(
             verify_size_verdict(400, 1000, None, None, None),
             Err(VerifyReject::Size { found: 400 })
+        );
+    }
+
+    /// A refusal of the key name is told by the typed error, never by the text.
+    #[test]
+    fn a_key_refusal_is_told_by_the_typed_error() {
+        use crate::deltaglider::EngineError as E;
+        use crate::storage::StorageError as S;
+        let engine = |e: E| CopyError::engine("destination store failed", e);
+        assert!(engine(E::KeyRefused("x".into())).key_refused());
+        assert!(engine(E::Storage(S::InvalidKey("x".into()))).key_refused());
+        assert!(CopyError::storage("put", S::InvalidKey("x".into())).key_refused());
+        // The same words in another error, or an unrelated fault, are no refusal.
+        assert!(!engine(E::InvalidArgument("key is refused".into())).key_refused());
+        assert!(!engine(E::Storage(S::Unavailable("key is refused".into()))).key_refused());
+        assert!(!CopyError::new(CopyClass::Permanent, "key is refused").key_refused());
+        assert_eq!(
+            engine(E::KeyRefused("x".into())).class,
+            CopyClass::Permanent
         );
     }
 
@@ -4032,6 +4116,7 @@ mod multipart_abort_tests {
             upload_concurrency: Some(2),
             keep_created_at: false,
             commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
+            origin: crate::types::WriteOrigin::Job,
         }
     }
 
@@ -4045,7 +4130,7 @@ mod multipart_abort_tests {
         let req = copy_request();
         let lock = Arc::new(
             engine
-                .lock_object_write(req.destination_bucket, req.destination_key)
+                .lock_object_write(req.destination_bucket, req.destination_key, req.origin)
                 .await,
         );
         let res = stream_copy_passthrough(&engine, &lock, req, &meta).await;
@@ -4067,7 +4152,7 @@ mod multipart_abort_tests {
         let req = copy_request();
         let lock = Arc::new(
             engine
-                .lock_object_write(req.destination_bucket, req.destination_key)
+                .lock_object_write(req.destination_bucket, req.destination_key, req.origin)
                 .await,
         );
         let res = stream_copy_passthrough(&engine, &lock, req, &meta).await;
@@ -4090,7 +4175,7 @@ mod multipart_abort_tests {
         let task = tokio::spawn(async move {
             let req = copy_request();
             let lock = Arc::new(
-                eng.lock_object_write(req.destination_bucket, req.destination_key)
+                eng.lock_object_write(req.destination_bucket, req.destination_key, req.origin)
                     .await,
             );
             let _ = stream_copy_passthrough(&eng, &lock, req, &meta).await;
@@ -4137,7 +4222,7 @@ mod multipart_abort_tests {
         let task = tokio::spawn(async move {
             let req = copy_request();
             let lock = Arc::new(
-                eng.lock_object_write(req.destination_bucket, req.destination_key)
+                eng.lock_object_write(req.destination_bucket, req.destination_key, req.origin)
                     .await,
             );
             let _ = stream_copy_passthrough(&eng, &lock, req, &meta).await;
@@ -4186,7 +4271,7 @@ mod multipart_abort_tests {
             };
             let lock = Arc::new(
                 engine
-                    .lock_object_write(req.destination_bucket, req.destination_key)
+                    .lock_object_write(req.destination_bucket, req.destination_key, req.origin)
                     .await,
             );
             let copy = stream_copy_passthrough(&engine, &lock, req, &meta);
@@ -4258,7 +4343,7 @@ mod multipart_abort_tests {
             };
             let lock = Arc::new(
                 engine
-                    .lock_object_write(req.destination_bucket, req.destination_key)
+                    .lock_object_write(req.destination_bucket, req.destination_key, req.origin)
                     .await,
             );
             stream_copy_passthrough(&engine, &lock, req, &meta).await
@@ -4349,6 +4434,7 @@ mod request_count_tests {
             upload_concurrency: None,
             keep_created_at: true,
             commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
+            origin: crate::types::WriteOrigin::Job,
         }
     }
 

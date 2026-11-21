@@ -508,6 +508,20 @@ pub async fn start_migrate(
         // and is not gated again.
         let mut flipped = cfg.clone();
         crate::maintenance::migrate::apply_flip(&mut flipped, &bucket_key, &target_backend, None);
+        // The job's two config edits must pass the frozen set, as the config
+        // transition will judge them: a refusal at the flip would come after
+        // the whole copy.
+        let transient_key = pick_transient_key(&bucket_key, &|k| cfg.buckets.contains_key(k));
+        let mut staged = cfg.clone();
+        crate::maintenance::migrate::insert_route(
+            &mut staged,
+            &transient_key,
+            &bucket_key,
+            &target_backend,
+        );
+        for edited in [&staged, &flipped] {
+            super::config::frozen_check(&cfg, edited, true).map_err(AdminError::conflict)?;
+        }
         let confirmed = crate::config::confirmed_downgrades(Some(&headers));
         let downgrades = flipped.unconfirmed_encryption_downgrades(&cfg, Some(&confirmed));
         if !downgrades.is_empty() {
@@ -517,7 +531,7 @@ pub async fn start_migrate(
             disk_wait: false,
             target_backend,
             delete_source: body.delete_source,
-            transient_key: pick_transient_key(&bucket_key, &|k| cfg.buckets.contains_key(k)),
+            transient_key,
             from_backend,
             target: body.target,
         }
@@ -847,7 +861,7 @@ mod delete_view_tests {
     fn may_cancel_follows_the_stored_principal_not_the_label() {
         let jobs = || {
             vec![
-                delete_job(1, Principal::Admin, "admin"),
+                delete_job(1, Principal::bootstrap_admin(), "admin"),
                 delete_job(2, user("AKDANA"), "dana"),
                 delete_job(3, user("AKDANA"), "renamed"),
             ]
@@ -858,7 +872,7 @@ mod delete_view_tests {
                 .map(|v| v.may_cancel)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(flags(Principal::Admin), [Some(true); 3]);
+        assert_eq!(flags(Principal::bootstrap_admin()), [Some(true); 3]);
         assert_eq!(flags(user("AKDANA")), [Some(false), Some(true), Some(true)]);
         // A user named `admin`: the label of job 1 says `admin`, the
         // principal says otherwise.
@@ -866,7 +880,9 @@ mod delete_view_tests {
             flags(user("AKNAMEDADMIN")),
             [Some(false), Some(false), Some(false)]
         );
-        let json = serde_json::to_value(&delete_job_views(jobs(), &Principal::Admin)[0]).unwrap();
+        let json =
+            serde_json::to_value(&delete_job_views(jobs(), &Principal::bootstrap_admin())[0])
+                .unwrap();
         assert_eq!(json["may_cancel"], true);
     }
 }

@@ -11,6 +11,8 @@ mod effective_backend_tests;
 #[cfg(test)]
 mod encryption_site_guard_tests;
 #[cfg(test)]
+mod env_copy_tests;
+#[cfg(test)]
 mod env_ref_roundtrip_tests;
 #[cfg(test)]
 mod env_ref_typing_tests;

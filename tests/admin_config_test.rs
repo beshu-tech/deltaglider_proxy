@@ -2056,6 +2056,8 @@ async fn config_other_surfaces_answer_as_the_golden_file() {
     record(&mut out, "sync_now_404", r, true).await;
     let r = admin.get(url("/sync")).send().await.unwrap();
     record(&mut out, "sync_status_404", r, true).await;
+    let r = admin.post(url("/sync-floor/reset")).send().await.unwrap();
+    record(&mut out, "sync_floor_reset_404", r, true).await;
 
     let r = admin.delete(url("/bootstrap-credentials")).send().await;
     record(&mut out, "remove_bootstrap_409", r.unwrap(), true).await;
@@ -2340,7 +2342,7 @@ async fn auto_limits_follow_the_free_space_and_show_their_source() {
     assert_eq!(l["spool_budget"]["bytes"], 40 * GIB, "{l}");
     assert_eq!(l["per_upload"]["bytes"], 20 * GIB, "{l}");
     assert_eq!(l["total_multipart"]["bytes"], 20 * GIB, "{l}");
-    assert_eq!(l["max_object_size"]["bytes"], 20 * GIB, "{l}");
+    assert_eq!(l["max_object_size"]["bytes"], 15 * GIB, "{l}");
     for name in [
         "spool_budget",
         "per_upload",
@@ -2351,13 +2353,13 @@ async fn auto_limits_follow_the_free_space_and_show_their_source() {
     }
     assert_eq!(l["free_bytes"], 80 * GIB);
     assert_eq!(l["warnings"], json!([]), "{l}");
-    assert_eq!(cfg["max_object_size"], 20 * GIB, "the effective value");
+    assert_eq!(cfg["max_object_size"], 15 * GIB, "the effective value");
     let out = limit_log_lines(&server).await;
     for needle in [
         "spool budget 40 GiB",
         "50% of 80 GiB free on",
         "per-upload limit 20 GiB",
-        "max_object_size auto = 20 GiB",
+        "max_object_size auto = 15 GiB",
     ] {
         assert!(out.contains(needle), "{needle} not in the boot log:\n{out}");
     }
@@ -2378,7 +2380,7 @@ async fn a_test_server_sizes_its_limits_from_the_harness_not_the_host() {
     let l = &cfg["limits"];
     assert_eq!(l["free_bytes"], 80 * GIB, "{l}");
     assert_eq!(l["spool_budget"]["bytes"], 40 * GIB, "{l}");
-    assert_eq!(l["max_object_size"]["bytes"], 20 * GIB, "{l}");
+    assert_eq!(l["max_object_size"]["bytes"], 15 * GIB, "{l}");
 }
 
 /// An explicit value always wins, `GET /config` says where it came from, and
@@ -2521,7 +2523,7 @@ async fn a_config_apply_keeps_the_limits_and_takes_a_new_max_object_size() {
     put(json!({ "max_delta_ratio": 0.5 })).await;
     let l = get_limits(&server).await["limits"].clone();
     assert_eq!(l["spool_budget"]["bytes"], 40 * GIB, "{l}");
-    assert_eq!(l["max_object_size"]["bytes"], 20 * GIB, "{l}");
+    assert_eq!(l["max_object_size"]["bytes"], 15 * GIB, "{l}");
     assert_eq!(l["max_object_size"]["source"], "auto", "{l}");
 
     // An apply that sets `max_object_size`: explicit wins, the budget stays.

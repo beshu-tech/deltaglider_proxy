@@ -169,7 +169,7 @@ pub(crate) async fn store_client_delta_copy(
             let (sb, sk, db, dk, head, precondition) = owned;
             let guard = std::sync::Arc::new(
                 engine
-                    .lock_and_check(&db, &dk, &precondition)
+                    .lock_and_check(&db, &dk, &precondition, crate::types::WriteOrigin::Client)
                     .await
                     .map_err(S3Error::from)?,
             );
@@ -229,7 +229,12 @@ pub(crate) async fn store_client_server_copy(
     check_quota_for_write(state, copy.bucket, copy.key, size).await?;
     let result = {
         let guard = engine
-            .lock_and_check(copy.bucket, copy.key, copy.precondition)
+            .lock_and_check(
+                copy.bucket,
+                copy.key,
+                copy.precondition,
+                crate::types::WriteOrigin::Client,
+            )
             .await?;
         let guard = Arc::new(guard);
         let (engine, lock) = (engine.clone(), guard.clone());
@@ -302,7 +307,7 @@ pub(crate) async fn store_client_multipart_admit(
     Ok(state
         .engine
         .load()
-        .lock_and_check(bucket, key, precondition)
+        .lock_and_check(bucket, key, precondition, crate::types::WriteOrigin::Client)
         .await?)
 }
 
@@ -381,6 +386,15 @@ pub(crate) async fn check_client_write_allowed(
         return Err(S3Error::AccessDeniedReason(reason));
     }
     Ok(())
+}
+
+/// The key rule of a client write (`WriteOrigin::Client`), asked before the
+/// body is read, so a refused key costs no upload. The store asks it again at
+/// the write gate. A folder-marker key passes: only the store judges its body.
+pub(crate) fn check_client_key(bucket: &str, key: &str) -> Result<(), S3Error> {
+    crate::types::ObjectKey::parse(bucket, key)
+        .validate_ingest(crate::types::WriteOrigin::Client)
+        .map_err(|e| crate::deltaglider::EngineError::KeyRefused(e.to_string()).into())
 }
 
 /// [`check_client_write_allowed`] for a request that STORES bytes (PutObject,

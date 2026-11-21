@@ -331,6 +331,11 @@ mod tests {
             ),
             (
                 "src/api/admin/auth.rs",
+                "bulk_principal",
+                "names the spool principal of a session that the gate admitted; judges no credential",
+            ),
+            (
+                "src/api/admin/auth.rs",
                 "session_actor_label",
                 "an audit label of an admitted session",
             ),

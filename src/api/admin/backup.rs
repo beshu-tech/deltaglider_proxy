@@ -39,17 +39,19 @@
 
 use crate::api::admin::extract::AdminQuery;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::config::{BackendConfig, Config};
 
+use super::config::password::BootstrapAuthority;
 use super::users::rebuild_iam_index;
 use super::{audit_log, trigger_config_sync, AdminError, AdminState};
 
@@ -509,6 +511,22 @@ async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, AdminErr
     })
 }
 
+/// Blank the IAM-database copy of every secret that the config file gives to
+/// the environment (the frozen set); `iam.json` would hold the resolved value.
+fn without_frozen_secrets(cfg: &Config, iam: &mut IamBackup) {
+    let frozen = &cfg.env_refs.frozen;
+    for p in &mut iam.auth_providers {
+        if frozen.holds_item("auth_providers", &p.name, "client_secret") {
+            p.client_secret = None;
+        }
+    }
+    for u in &mut iam.users {
+        if frozen.holds_item("iam_users", &u.name, "secret_access_key") {
+            u.secret_access_key.clear();
+        }
+    }
+}
+
 /// GET /api/admin/backup[?format=zip|json]
 ///
 /// Default is **zip** (contains config.yaml + iam.json +
@@ -520,7 +538,8 @@ pub async fn export_backup(
     AdminQuery(q): AdminQuery<ExportQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, AdminError> {
-    let iam = build_iam_backup(&state).await?;
+    let mut iam = build_iam_backup(&state).await?;
+    without_frozen_secrets(&*state.config.read().await, &mut iam);
 
     let format = q.format.as_deref().unwrap_or("zip");
     // Both formats carry live secrets (user keys; zip adds backend creds), so
@@ -682,6 +701,7 @@ async fn export_zip(
 ///     legacy IAM-only flow (same shape as v0.8.0).
 pub async fn import_backup(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     AdminQuery(query): AdminQuery<ImportQuery>,
     headers: HeaderMap,
     body: Bytes,
@@ -697,7 +717,13 @@ pub async fn import_backup(
         .to_ascii_lowercase();
 
     if ct == "application/zip" || ct == "application/x-zip-compressed" {
-        return import_zip_full_backup(state, headers, body, query.mode, query.iam).await;
+        let client_ip = crate::rate_limiter::extract_client_ip_with_peer(
+            &headers,
+            connect_info.as_ref().map(|ci| ci.0.ip()),
+        );
+        let authority = BootstrapAuthority::of_request(&state, &headers, client_ip);
+        return import_zip_full_backup(state, headers, body, query.mode, query.iam, authority)
+            .await;
     }
 
     if query.mode == ImportMode::ConfigOnly {
@@ -876,7 +902,7 @@ fn unzip_bounded(
 /// value belongs to the host's environment, never to a backup file.
 fn literal(v: &Option<String>) -> Option<String> {
     v.clone()
-        .filter(|s| !s.is_empty() && !crate::config::is_env_ref(s))
+        .filter(|s| !s.is_empty() && !crate::config::holds_env_ref(s))
 }
 
 fn harvest_config_secrets(
@@ -884,7 +910,9 @@ fn harvest_config_secrets(
 ) -> Result<BackupSecrets, crate::config::ConfigError> {
     // The file TEXT view: an env-sourced slot holds its `${env:…}` ref, the
     // same text config.yaml carries.
-    let file = runtime.file_view()?.with_env_refs_reinserted();
+    let file = runtime
+        .file_view()?
+        .with_file_text(crate::config::env_template::Escape::None);
     let cfg = &file;
     let mut s = BackupSecrets {
         bootstrap_password_hash: cfg.bootstrap_password_hash.clone(),
@@ -964,7 +992,7 @@ fn harvest_config_secrets(
     let headers: std::collections::BTreeMap<String, String> = ed
         .webhook_headers
         .iter()
-        .filter(|(_, v)| !crate::config::is_env_ref(v))
+        .filter(|(_, v)| !crate::config::holds_env_ref(v))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let url = literal(&ed.webhook_url);
@@ -990,21 +1018,11 @@ fn harvest_config_secrets(
 /// keeps the DB's key, so the DB can be its only home). A `${env:NAME}` ref
 /// stays in config.yaml, so it needs no copy here.
 fn harvest_iam_secrets(cfg: &Config, iam: &IamBackup, s: &mut BackupSecrets) {
-    // A declarative provider whose YAML secret is a `${env:…}` ref keeps it
-    // in config.yaml: its DB copy (the resolved value) stays out (A11).
-    let file = cfg.with_env_refs_reinserted();
-    let from_env: std::collections::HashSet<&str> = file
-        .auth_providers
-        .iter()
-        .filter(|p| {
-            p.client_secret
-                .as_deref()
-                .is_some_and(crate::config::is_env_ref)
-        })
-        .map(|p| p.name.as_str())
-        .collect();
+    // A provider or user whose secret the frozen set holds keeps its DB copy
+    // out of the backup, whatever the file says now.
+    let frozen = &cfg.env_refs.frozen;
     for p in &iam.auth_providers {
-        if from_env.contains(p.name.as_str()) {
+        if frozen.holds_item("auth_providers", &p.name, "client_secret") {
             continue;
         }
         if let Some(cs) = &p.client_secret {
@@ -1012,8 +1030,13 @@ fn harvest_iam_secrets(cfg: &Config, iam: &IamBackup, s: &mut BackupSecrets) {
         }
     }
     // No env var sets an IAM user, so the running config is the file view.
-    for u in &cfg.with_env_refs_reinserted().iam_users {
-        if crate::config::is_env_ref(&u.secret_access_key) {
+    for u in &cfg
+        .with_file_text(crate::config::env_template::Escape::None)
+        .iam_users
+    {
+        if frozen.holds_item("iam_users", &u.name, "secret_access_key")
+            || crate::config::holds_env_ref(&u.secret_access_key)
+        {
             continue;
         }
         let secret = Some(u.secret_access_key.as_str())
@@ -1041,37 +1064,35 @@ fn hydrate_config_secrets(
             cfg.bootstrap_password_hash = Some(h.clone());
         }
     }
-    // A slot whose running file text is a `${env:…}` ref keeps it: a
-    // backup's value never replaces this host's env (review NEW-1).
-    let file = cfg.with_env_refs_reinserted();
-    let from_env = |v: &Option<String>| v.as_deref().is_some_and(crate::config::is_env_ref);
+    // A slot that the file gave to the environment keeps its reference (NEW-1);
+    // it is judged by path, because the write pipeline's view holds a placeholder.
+    let refs = cfg.env_refs.clone();
+    let from_env = |label: &str| refs.template_at(label).is_some();
     if let Some(a) = &secrets.access {
         if let Some(ak) = a
             .access_key_id
             .as_ref()
-            .filter(|_| !from_env(&file.access_key_id))
+            .filter(|_| !from_env("/access_key_id"))
         {
             cfg.access_key_id = Some(ak.clone());
         }
         if let Some(sk) = a
             .secret_access_key
             .as_ref()
-            .filter(|_| !from_env(&file.secret_access_key))
+            .filter(|_| !from_env("/secret_access_key"))
         {
             cfg.secret_access_key = Some(sk.clone());
         }
     }
     if let Some(s) = &secrets.storage {
-        if !s3_creds_from_env(&file.backend) {
+        if !from_env("/backend/access_key_id") && !from_env("/backend/secret_access_key") {
             hydrate_s3_backend_credentials(&mut cfg.backend, s);
         }
     }
     for named in &mut cfg.backends {
-        let env_sourced = file
-            .backends
+        let env_sourced = ["access_key_id", "secret_access_key"]
             .iter()
-            .find(|b| b.name == named.name)
-            .is_some_and(|b| s3_creds_from_env(&b.backend));
+            .any(|field| from_env(&format!("/backends/[{}]/{field}", named.name)));
         if let Some(s) = secrets
             .storage_backends
             .get(&named.name)
@@ -1080,14 +1101,6 @@ fn hydrate_config_secrets(
             hydrate_s3_backend_credentials(&mut named.backend, s);
         }
     }
-}
-
-/// Whether this backend's S3 credentials come from `${env:…}` refs.
-fn s3_creds_from_env(backend: &BackendConfig) -> bool {
-    matches!(backend, BackendConfig::S3 { access_key_id, secret_access_key, .. }
-        if [access_key_id, secret_access_key]
-            .iter()
-            .any(|v| v.as_deref().is_some_and(crate::config::is_env_ref)))
 }
 
 /// R2 of the restore (review NEW-1): fill a slot only where the export
@@ -1202,10 +1215,19 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
         }
         // A list this cannot align keeps its mask: the document write's
         // preserve step then tries the running config, and refuses by name.
-        let _ = super::config::restore_masked_list(
-            &mut cfg.event_delivery.webhook_urls,
-            &ed.webhook_urls,
-        );
+        // The saved entries are file text (a template stays a template); the
+        // config holds values, so the templates are expanded to compare.
+        let saved: Vec<String> = ed
+            .webhook_urls
+            .iter()
+            .map(|u| {
+                crate::config::env_template::Template::parse(u)
+                    .ok()
+                    .and_then(|t| t.expand(|n| cfg.env_refs.get(n).cloned()).ok())
+                    .unwrap_or_else(|| u.clone())
+            })
+            .collect();
+        let _ = super::config::restore_masked_list(&mut cfg.event_delivery.webhook_urls, &saved);
     }
 }
 
@@ -1215,47 +1237,65 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
 fn config_yaml_hydrated_for_restore(
     yaml_str: &str,
     secrets: Option<&BackupSecrets>,
+    running: &crate::config::EnvRefs,
 ) -> Result<String, String> {
-    hydrate_restore_doc(yaml_str, secrets, &|_| None).map(|(yaml, _)| yaml)
+    hydrate_restore_doc(yaml_str, secrets, &|_| None, running).map(|(yaml, _)| yaml)
 }
 
 /// The backup's config.yaml with its secrets.json values put back, ready for
-/// the apply pipeline, plus the `${env:NAME}` refs it now carries.
+/// the apply pipeline, plus the `${env:NAME}` provenance it now carries.
 ///
-/// A hydrated value that a secret env var of this host already supplies
-/// (the normal DR setup: the AES key comes from
-/// `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`) becomes a `${env:NAME}` ref, so the
-/// file never holds the env's secret and the restore is not refused. The
-/// returned map (`name → value`) lets the apply pipeline resolve exactly
-/// those refs: each value is one the backup itself carried, so no other env
-/// value becomes readable (S7).
+/// The backup's text is judged like any admin document (S7): a reference in
+/// it stands only where the running config (`running`) has the same one. A
+/// hydrated value that a secret env var of this host already supplies (the
+/// normal DR setup: the AES key comes from
+/// `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`) becomes a `${env:NAME}` template at
+/// its field, so the file never holds the env's secret and the restore is
+/// not refused. The returned provenance lets the apply pipeline resolve
+/// exactly those references: each value is one the backup itself carried,
+/// so no other env value becomes readable.
 fn hydrate_restore_doc(
     yaml_str: &str,
     secrets: Option<&BackupSecrets>,
     env: crate::config::EnvLookup,
-) -> Result<(String, std::collections::BTreeMap<String, String>), String> {
-    let mut cfg = Config::from_yaml_str(yaml_str)
+    running: &crate::config::EnvRefs,
+) -> Result<(String, crate::config::EnvRefs), String> {
+    let allowed = crate::config::admin_env_allowed;
+    let (tree, added) =
+        crate::config::env_template::admit_document(yaml_str, running, &allowed, env)
+            .map_err(|e| format!("config.yaml: {e}"))?;
+    let text = serde_yaml::to_string(&tree)
+        .map_err(|e| format!("config.yaml could not be re-serialized: {e}"))?;
+    let mut cfg = Config::from_yaml_str(&text)
         .map_err(|e| format!("config.yaml could not be parsed for secret hydration: {e}"))?;
+    cfg.env_refs = running.clone();
+    cfg.env_refs.merge(added);
     if let Some(secrets) = secrets {
         hydrate_config_with_backup_secrets(&mut cfg, secrets);
     }
-    let tree = serde_yaml::to_value(&cfg)
+    let flat = serde_yaml::to_value(&cfg)
         .map_err(|e| format!("config.yaml could not be re-serialized: {e}"))?;
-    let mut refs = std::collections::BTreeMap::new();
+    let mut restore = crate::config::EnvRefs::default();
     for (name, value) in crate::config::env_overrides::secret_env_values(&cfg, env) {
-        if value.len() >= 4 && crate::config::tree_has_string(&tree, &value) {
-            refs.insert(name, value);
+        if value.len() >= 4 && crate::config::tree_has_string(&flat, &value) {
+            crate::config::env_template::record_secret_env_templates(
+                &flat,
+                &name,
+                &value,
+                &mut restore,
+            );
+            restore.insert(name, value);
         }
     }
-    cfg.env_refs.extend(refs.clone());
-    cfg.record_env_ref_paths();
+    cfg.env_refs.merge(restore.clone());
     // The persist serializer, not the export one: export strips the AES keys
-    // just hydrated (D13). It also escapes `$`, so apply's env pass returns
-    // the hydrated values unchanged (only the refs above expand).
+    // just hydrated (D13). It writes a template where the config has one and
+    // escapes every other `$`, so apply's pass returns the hydrated values
+    // unchanged (only those references expand).
     let yaml = cfg.to_canonical_yaml_for_persist_with(env).map_err(|e| {
         format!("config.yaml could not be re-serialized after secret hydration: {e}")
     })?;
-    Ok((yaml, refs))
+    Ok((yaml, restore))
 }
 
 /// What a full/config-only restore does with the backup's bootstrap hash.
@@ -1271,6 +1311,28 @@ enum BootstrapRestore {
     /// so the restored hash would be lost on restart: keep the running one
     /// (env wins, like every env-controlled field) and say so.
     EnvPinned(&'static str),
+    /// The session did not log in with the bootstrap password, so it may not
+    /// replace that password: keep the running hash and say so.
+    NotAuthorised,
+}
+
+impl BootstrapRestore {
+    /// The sentence for the import answer when the backup's hash was kept.
+    fn note(&self) -> Option<String> {
+        match self {
+            BootstrapRestore::Keep | BootstrapRestore::Adopt(_) => None,
+            BootstrapRestore::EnvPinned(var) => Some(format!(
+                "The bootstrap password was kept: {var} sets it at every start."
+            )),
+            BootstrapRestore::NotAuthorised => Some(
+                "The bootstrap password was kept: only a session that logged in with the \
+                 bootstrap password may replace it, and this session did not. To restore the \
+                 bootstrap password of the backup, import the backup again from a session \
+                 that logged in with the bootstrap password."
+                    .to_string(),
+            ),
+        }
+    }
 }
 
 /// Pure restore decision for the bootstrap hash.
@@ -1278,11 +1340,13 @@ fn plan_bootstrap_restore(
     current: Option<&str>,
     backup: Option<&str>,
     env_pinned: Option<&'static str>,
+    authorised: bool,
 ) -> BootstrapRestore {
     match backup {
         None => BootstrapRestore::Keep,
         Some(b) if Some(b) == current => BootstrapRestore::Keep,
         Some(_) if env_pinned.is_some() => BootstrapRestore::EnvPinned(env_pinned.unwrap()),
+        Some(_) if !authorised => BootstrapRestore::NotAuthorised,
         Some(b) => BootstrapRestore::Adopt(b.to_string()),
     }
 }
@@ -1319,37 +1383,40 @@ impl RestoreSnapshot {
     /// pipeline), the admin password, and the IAM DB when the restore
     /// switched it to declarative. Best effort: every step runs, the first
     /// error is returned.
-    async fn roll_back(self, state: &Arc<AdminState>, headers: &HeaderMap) -> Result<(), String> {
+    async fn roll_back(
+        self,
+        state: &Arc<AdminState>,
+        headers: &HeaderMap,
+        authority: Option<&BootstrapAuthority>,
+    ) -> Result<(), String> {
         let mut first_err: Option<String> = None;
         let now_declarative = matches!(
             state.config.read().await.iam_mode,
             crate::config_sections::IamMode::Declarative
         );
-        let config = self.config;
-        let applied = crate::api::admin::config::run_internal(
-            state,
-            headers,
-            crate::api::admin::config::RESTORE_ROLLBACK_ACTION,
-            "config",
-            |cfg| *cfg = config,
-        )
-        .await;
-        match applied {
-            Ok(a) => {
-                if let Err((path, e)) = a.persist {
-                    first_err.get_or_insert(format!("config file {path} not restored: {e}"));
-                }
-            }
-            Err(e) => {
-                first_err.get_or_insert(format!("config not restored: {e}"));
-            }
+        if let Err(e) =
+            crate::api::admin::config::put_back_config(state, headers, self.config).await
+        {
+            first_err.get_or_insert(e);
         }
         if *state.password_hash.read() != self.password_hash {
-            if let Err(e) =
-                super::config::password::install_bootstrap_hash(state, &self.password_hash, headers)
+            // The hash changed only if this import held the authority.
+            match authority {
+                Some(authority) => {
+                    if let Err(e) = super::config::password::install_bootstrap_hash(
+                        state,
+                        &self.password_hash,
+                        headers,
+                        authority,
+                    )
                     .await
-            {
-                first_err.get_or_insert(format!("admin password not restored: {e}"));
+                    {
+                        first_err.get_or_insert(format!("admin password not restored: {e}"));
+                    }
+                }
+                None => {
+                    first_err.get_or_insert("admin password not restored: no authority".into());
+                }
             }
         }
         if let Some(iam) = self.iam.filter(|_| now_declarative) {
@@ -1400,6 +1467,7 @@ async fn import_zip_full_backup(
     body: Bytes,
     mode: ImportMode,
     iam_mode: IamRestoreMode,
+    authority: Option<BootstrapAuthority>,
 ) -> Result<Json<ImportResult>, BackupImportError> {
     tracing::info!(
         bytes = body.len(),
@@ -1457,23 +1525,41 @@ async fn import_zip_full_backup(
     } else {
         None
     };
-    let applied = async {
+    let applied: Result<Json<ImportResult>, BackupImportError> = async {
         apply_backup_config(&state, &headers, mode, parts.yaml, parts.secrets.as_ref()).await?;
-        apply_backup_secrets(&state, &headers, mode, parts.secrets.as_ref()).await?;
-        apply_backup_iam(&state, &headers, mode, parts.iam, iam_mode).await
+        let note = apply_backup_secrets(
+            &state,
+            &headers,
+            mode,
+            parts.secrets.as_ref(),
+            authority.as_ref(),
+        )
+        .await?;
+        let mut result = apply_backup_iam(&state, &headers, mode, parts.iam, iam_mode).await?;
+        result.0.bootstrap_password = note;
+        Ok(result)
     }
     .await;
     let iam_result = match applied {
         Ok(r) => r,
         Err(mut e) => {
             if let Some(snapshot) = snapshot {
-                if let Err(rb) = snapshot.roll_back(&state, &headers).await {
-                    tracing::error!("Full-backup import: rollback incomplete: {rb}");
-                    e.detail = Some(sanitize_error_detail(format!(
-                        "{}; the rollback of the earlier phases failed too: {rb}",
-                        e.detail.as_deref().unwrap_or("restore failed")
-                    )));
-                }
+                let was = e.detail.as_deref().unwrap_or("restore failed");
+                e.detail = Some(sanitize_error_detail(
+                    match snapshot
+                        .roll_back(&state, &headers, authority.as_ref())
+                        .await
+                    {
+                        Ok(()) => format!(
+                            "{was}; the restore was rolled back: the config, the admin password \
+                             and the IAM database are as they were before it"
+                        ),
+                        Err(rb) => {
+                            tracing::error!("Full-backup import: rollback incomplete: {rb}");
+                            format!("{was}; the rollback of the earlier phases failed too: {rb}")
+                        }
+                    },
+                ));
             }
             return Err(e);
         }
@@ -1674,17 +1760,18 @@ async fn apply_backup_config(
             // Exporters always emit at least `storage:` so this only
             // fires on deliberate-empty zips.
             if !yaml_str.trim().is_empty() {
+                // Taken first: a `&dyn Fn` held across an await is not `Send`.
+                let running = state.config.read().await.env_refs.clone();
                 let (yaml_str, restore_refs) =
-                    hydrate_restore_doc(&yaml_str, secrets, &crate::config::process_env).map_err(
-                        |e| {
+                    hydrate_restore_doc(&yaml_str, secrets, &crate::config::process_env, &running)
+                        .map_err(|e| {
                             import_fail(
                                 StatusCode::BAD_REQUEST,
                                 "parse_config_yaml",
                                 "config.yaml",
                                 e,
                             )
-                        },
-                    )?;
+                        })?;
                 tracing::info!(
                     bytes = yaml_str.len(),
                     "Full-backup import: applying config.yaml"
@@ -1738,7 +1825,8 @@ async fn apply_backup_secrets(
     headers: &HeaderMap,
     mode: ImportMode,
     secrets: Option<&BackupSecrets>,
-) -> Result<(), BackupImportError> {
+    authority: Option<&BootstrapAuthority>,
+) -> Result<Option<String>, BackupImportError> {
     // ── Phase B.2: apply secrets.json BEFORE iam import. Storage
     //       creds need to be in place before a subsequent import of
     //       a v0.8.3+ iam.json fires an S3 sync push. Bootstrap
@@ -1753,17 +1841,21 @@ async fn apply_backup_secrets(
                 oauth_client_secret_count = secrets.oauth_client_secrets.len(),
                 "Full-backup import: applying secrets.json"
             );
-            apply_secrets(state, secrets, mode.restores_bootstrap(), headers)
-                .await
-                .map_err(|err| {
-                    import_fail(err.status, "apply_secrets", "secrets.json", err.detail)
-                })?;
+            let note = apply_secrets(
+                state,
+                secrets,
+                mode.restores_bootstrap().then_some(authority),
+                headers,
+            )
+            .await
+            .map_err(|err| import_fail(err.status, "apply_secrets", "secrets.json", err.detail))?;
             tracing::info!("Full-backup import: secrets.json applied");
+            return Ok(note);
         }
     } else {
         tracing::info!("Full-backup import: skipping secrets.json for IAM-only restore");
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Phase B.3 of [`import_zip_full_backup`]: apply iam.json.
@@ -1831,9 +1923,9 @@ async fn apply_backup_iam(
 async fn apply_secrets(
     state: &Arc<AdminState>,
     secrets: &BackupSecrets,
-    restore_bootstrap_hash: bool,
+    bootstrap: Option<Option<&BootstrapAuthority>>,
     headers: &HeaderMap,
-) -> Result<(), BackupSecretApplyError> {
+) -> Result<Option<String>, BackupSecretApplyError> {
     // The config write pipeline (THE path of every config write): env
     // re-apply, check_all + rule gates, transition, persist, audit, under
     // the config write lock, swapped in only after the transition succeeds.
@@ -1848,11 +1940,12 @@ async fn apply_secrets(
         "restore_backup_secrets",
         "secrets.json",
         |cfg| {
-            if restore_bootstrap_hash {
+            if let Some(authority) = bootstrap {
                 hash_plan = plan_bootstrap_restore(
                     cfg.bootstrap_password_hash.as_deref(),
                     secrets.bootstrap_password_hash.as_deref(),
                     cfg.tuning.bootstrap_hash_env,
+                    authority.is_some(),
                 );
             }
             hydrate_config_secrets(cfg, secrets, false);
@@ -1898,8 +1991,9 @@ async fn apply_secrets(
         );
     }
 
-    if let BootstrapRestore::Adopt(hash) = &hash_plan {
-        if let Err(e) = super::config::password::install_bootstrap_hash(state, hash, headers).await
+    if let (BootstrapRestore::Adopt(hash), Some(Some(authority))) = (&hash_plan, bootstrap) {
+        if let Err(e) =
+            super::config::password::install_bootstrap_hash(state, hash, headers, authority).await
         {
             tracing::error!("Full-backup import: bootstrap hash not restored: {e}");
             return Err(BackupSecretApplyError::new(
@@ -1910,7 +2004,7 @@ async fn apply_secrets(
         super::audit_log("restore_bootstrap_password", "admin", "bootstrap", headers);
     }
 
-    Ok(())
+    Ok(hash_plan.note())
 }
 
 /// Phase B.4 of [`import_zip_full_backup`]: the OAuth client secret of
@@ -2076,13 +2170,16 @@ mod tests {
         // The backup's config.yaml is the redacted export.
         let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
         assert!(!exported.contains(K1));
-        let restored = config_yaml_hydrated_for_restore(&exported, Some(&secrets)).unwrap();
+        let restored =
+            config_yaml_hydrated_for_restore(&exported, Some(&secrets), &cfg.env_refs).unwrap();
         for k in [K1, K2, K3] {
             assert!(restored.contains(k), "restore lost a key:\n{restored}");
         }
         // Old secrets.json (no key fields) still parses.
         let old: BackupSecrets = serde_json::from_str("{}").unwrap();
-        assert!(config_yaml_hydrated_for_restore(&exported, Some(&old)).is_ok());
+        assert!(
+            config_yaml_hydrated_for_restore(&exported, Some(&old), &Default::default()).is_ok()
+        );
     }
 
     /// Issue #116: a bucket override's key and legacy key ride in
@@ -2102,7 +2199,8 @@ mod tests {
             !exported.contains(K4) && !exported.contains(K5),
             "{exported}"
         );
-        let restored = config_yaml_hydrated_for_restore(&exported, Some(&secrets)).unwrap();
+        let restored =
+            config_yaml_hydrated_for_restore(&exported, Some(&secrets), &cfg.env_refs).unwrap();
         for k in [K4, K5] {
             assert!(
                 restored.contains(k),
@@ -2125,7 +2223,8 @@ mod tests {
         let secrets = harvest_config_secrets(&cfg).unwrap();
         let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
         assert!(!exported.contains("SECRET0001"), "export did not mask");
-        let restored = config_yaml_hydrated_for_restore(&exported, Some(&secrets)).unwrap();
+        let restored =
+            config_yaml_hydrated_for_restore(&exported, Some(&secrets), &cfg.env_refs).unwrap();
         assert!(
             restored.contains(URL),
             "restore lost webhook_url:\n{restored}"
@@ -2141,20 +2240,22 @@ mod tests {
     /// value over the ref; a masked literal is filled back, also in a list
     /// that mixes a ref and a masked entry.
     fn env_sourced_fixture() -> Config {
-        let yaml = "access:\n  access_key_id: AKBOOTSTRAP00001\n  secret_access_key: \"proxy-secret-from-env-0001\"\n\
-storage:\n  backends:\n    - name: aws-dr\n      type: s3\n      endpoint: https://s3.example.test\n      access_key_id: AKDR\n      secret_access_key: \"dr-secret-from-env-00000002\"\n\
-advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_urls:\n      - \"https://hooks.slack.com/services/T/A/FROMENV0003\"\n      - \"https://hooks.slack.com/services/T/B/LITERAL0004\"\n    webhook_headers:\n      X-From-Env: \"header-value-from-env-0005\"\n      X-Literal: \"header-literal-value-0006\"\n";
-        let mut cfg = Config::from_yaml_str(yaml).unwrap();
-        for (name, value) in [
-            ("PROXY_SK", "proxy-secret-from-env-0001"),
-            ("DR_SK", "dr-secret-from-env-00000002"),
-            ("HOOK1", "https://hooks.slack.com/services/T/A/FROMENV0003"),
-            ("HDR", "header-value-from-env-0005"),
-        ] {
-            cfg.env_refs.insert(name.into(), value.into());
-        }
-        cfg.record_env_ref_paths();
-        cfg
+        let yaml = "access:\n  access_key_id: AKBOOTSTRAP00001\n  secret_access_key: ${env:PROXY_SK}\n\
+storage:\n  backends:\n    - name: aws-dr\n      type: s3\n      endpoint: https://s3.example.test\n      access_key_id: AKDR\n      secret_access_key: ${env:DR_SK}\n\
+advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_urls:\n      - \"${env:HOOK1}\"\n      - \"https://hooks.slack.com/services/T/B/LITERAL0004\"\n    webhook_headers:\n      X-From-Env: \"${env:HDR}\"\n      X-Literal: \"header-literal-value-0006\"\n";
+        let env = |name: &str| {
+            Some(
+                match name {
+                    "PROXY_SK" => "proxy-secret-from-env-0001",
+                    "DR_SK" => "dr-secret-from-env-00000002",
+                    "HOOK1" => "https://hooks.slack.com/services/T/A/FROMENV0003",
+                    "HDR" => "header-value-from-env-0005",
+                    _ => return None,
+                }
+                .to_string(),
+            )
+        };
+        Config::from_template_with(yaml, &env).unwrap()
     }
 
     #[test]
@@ -2178,12 +2279,90 @@ advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_
         );
     }
 
+    /// An allowlisted name lands only in a field that no read path returns: the
+    /// export, sections, file, backup secrets and views hold the reference, never the value.
+    #[test]
+    fn an_allowlisted_backend_secret_and_key_reach_no_read_path() {
+        const SK: &str = "allowlisted-backend-secret-0001";
+        const KEY: &str = "7777777777777777777777777777777777777777777777777777777777777777";
+        let yaml = "storage:\n  backends:\n  - name: hz\n    type: s3\n    endpoint: https://s3.example.test\n    region: eu\n    access_key_id: AKLITERAL\n    secret_access_key: ${env:ALLOW_SK}\n    encryption:\n      mode: aes256-gcm-proxy\n      key: ${env:ALLOW_KEY}\n";
+        let env = |n: &str| match n {
+            "ALLOW_SK" => Some(SK.to_string()),
+            "ALLOW_KEY" => Some(KEY.to_string()),
+            _ => None,
+        };
+        let (tree, added) = crate::config::env_template::admit_document(
+            yaml,
+            &Default::default(),
+            &|n| n.starts_with("ALLOW_"),
+            &env,
+        )
+        .expect("both slots take the allowlisted names");
+        let mut cfg =
+            crate::config::Config::from_yaml_str(&serde_yaml::to_string(&tree).unwrap()).unwrap();
+        cfg.env_refs = added;
+        let mut reads = vec![
+            cfg.redact_all_secrets().to_canonical_yaml().unwrap(),
+            cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap(),
+            serde_json::to_string(&harvest_config_secrets(&cfg).unwrap()).unwrap(),
+            serde_json::to_string(&crate::api::admin::config::BackendInfoResponse::from(
+                &cfg.backends[0],
+            ))
+            .unwrap(),
+        ];
+        let sectioned =
+            crate::config_sections::SectionedConfig::from_flat(&cfg.redact_all_secrets());
+        reads.push(serde_json::to_string(&sectioned).unwrap());
+        reads.push(
+            serde_json::to_string(
+                &crate::api::admin::bucket_encryption_view::effective_encryption(
+                    &cfg,
+                    "releases",
+                    Some("hz"),
+                ),
+            )
+            .unwrap(),
+        );
+        for (i, read) in reads.iter().enumerate() {
+            assert!(
+                !read.contains(SK) && !read.contains(KEY),
+                "read path {i}: {read}"
+            );
+        }
+        // The file keeps the references, so a restart finds the variables.
+        assert!(
+            reads[1].contains("${env:ALLOW_SK}") && reads[1].contains("${env:ALLOW_KEY}"),
+            "{}",
+            reads[1]
+        );
+    }
+
+    /// The restore's hydration judges a slot by its path: a slot of the environment
+    /// keeps its value even when the config in hand holds a placeholder there.
+    #[test]
+    fn hydration_leaves_a_slot_of_the_environment_alone_whatever_it_holds() {
+        let mut cfg = env_sourced_fixture();
+        cfg.secret_access_key = Some("placeholder-in-the-view".into());
+        let other = crate::config::Config::from_yaml_str(
+            "access:\n  access_key_id: AKOTHER\n  secret_access_key: from-the-backup-0001\n",
+        )
+        .unwrap();
+        let secrets = harvest_config_secrets(&other).unwrap();
+        hydrate_config_secrets(&mut cfg, &secrets, false);
+        assert_eq!(
+            cfg.secret_access_key.as_deref(),
+            Some("placeholder-in-the-view"),
+            "the backup's value replaced a slot of the environment"
+        );
+    }
+
     #[test]
     fn restore_keeps_env_refs_and_fills_only_masks() {
         let cfg = env_sourced_fixture();
         let secrets = harvest_config_secrets(&cfg).unwrap();
         let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
-        let (restored, _) = hydrate_restore_doc(&exported, Some(&secrets), &|_| None).unwrap();
+        let (restored, _) =
+            hydrate_restore_doc(&exported, Some(&secrets), &|_| None, &cfg.env_refs).unwrap();
         for want in [
             "${env:PROXY_SK}",
             "${env:DR_SK}",
@@ -2209,7 +2388,8 @@ advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_
             access_key_id: Some("AKBOOTSTRAP00001".into()),
             secret_access_key: Some("proxy-secret-from-env-0001".into()),
         });
-        let (restored, _) = hydrate_restore_doc(&exported, Some(&old), &|_| None).unwrap();
+        let (restored, _) =
+            hydrate_restore_doc(&exported, Some(&old), &|_| None, &cfg.env_refs).unwrap();
         assert!(
             restored.contains("${env:PROXY_SK}"),
             "an old backup's value replaced the ref:\n{restored}"
@@ -2231,12 +2411,11 @@ advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_
         const CLIENT_SECRET: &str = "oidc-client-secret-0003";
         const DB_ONLY_SK: &str = "dana-secret-in-db-only-0004";
         let yaml = format!(
-            "access:\n  iam_mode: declarative\n  iam_users:\n    - name: ci-uploader\n      access_key_id: AKCIUPLOADER\n      secret_access_key: \"{USER_SK}\"\n    - name: backup-bot\n      access_key_id: AKBACKUPBOT\n      secret_access_key: \"{REF_SK}\"\n    - name: dana\n      access_key_id: AKDANA\n  auth_providers:\n    - name: corp-oidc\n      provider_type: oidc\n      client_id: dgp\n      client_secret: \"{CLIENT_SECRET}\"\n      issuer_url: https://id.example.com\n"
+            "access:\n  iam_mode: declarative\n  iam_users:\n    - name: ci-uploader\n      access_key_id: AKCIUPLOADER\n      secret_access_key: \"{USER_SK}\"\n    - name: backup-bot\n      access_key_id: AKBACKUPBOT\n      secret_access_key: ${{env:BACKUP_BOT_SK}}\n    - name: dana\n      access_key_id: AKDANA\n  auth_providers:\n    - name: corp-oidc\n      provider_type: oidc\n      client_id: dgp\n      client_secret: \"{CLIENT_SECRET}\"\n      issuer_url: https://id.example.com\n"
         );
-        let mut cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
-        // backup-bot's key came from `${env:BACKUP_BOT_SK}` at load.
-        cfg.env_refs
-            .insert("BACKUP_BOT_SK".to_string(), REF_SK.to_string());
+        // backup-bot's key comes from `${env:BACKUP_BOT_SK}` at load.
+        let env = |n: &str| (n == "BACKUP_BOT_SK").then(|| REF_SK.to_string());
+        let cfg = crate::config::Config::from_template_with(&yaml, &env).unwrap();
         // The DB after the reconcile; dana's YAML secret is blank (a
         // declarative apply with a blank secret keeps the DB's key).
         let iam: IamBackup = serde_json::from_value(serde_json::json!({
@@ -2265,7 +2444,8 @@ advanced:\n  event_delivery:\n    enabled: true\n    format: slack\n    webhook_
 
         let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
         assert!(!exported.contains(USER_SK) && !exported.contains(CLIENT_SECRET));
-        let restored = config_yaml_hydrated_for_restore(&exported, Some(&secrets)).unwrap();
+        let restored =
+            config_yaml_hydrated_for_restore(&exported, Some(&secrets), &cfg.env_refs).unwrap();
         let back = crate::config::Config::from_yaml_str(&restored).unwrap();
         let sk = |n: &str| {
             back.iam_users
@@ -2374,7 +2554,8 @@ storage:
             ..BackupSecrets::default()
         };
 
-        let hydrated = config_yaml_hydrated_for_restore(yaml, Some(&secrets)).unwrap();
+        let hydrated =
+            config_yaml_hydrated_for_restore(yaml, Some(&secrets), &Default::default()).unwrap();
         let cfg = Config::from_yaml_str(&hydrated).unwrap();
         let prod = cfg
             .backends
@@ -2426,7 +2607,8 @@ storage:
             ..Default::default()
         };
 
-        let hydrated = config_yaml_hydrated_for_restore(yaml, Some(&secrets)).unwrap();
+        let hydrated =
+            config_yaml_hydrated_for_restore(yaml, Some(&secrets), &Default::default()).unwrap();
         let cfg = Config::from_yaml_str(&hydrated).unwrap();
         let a = cfg.backends.iter().find(|b| b.name == "a").unwrap();
         let b = cfg.backends.iter().find(|b| b.name == "b").unwrap();
@@ -2457,7 +2639,7 @@ storage:
     #[test]
     fn bootstrap_restore_truth_table() {
         use BootstrapRestore::*;
-        let f = plan_bootstrap_restore;
+        let f = |c, b, e| plan_bootstrap_restore(c, b, e, true);
         assert_eq!(f(Some("$2b$a"), None, None), Keep);
         assert_eq!(f(Some("$2b$a"), Some("$2b$a"), None), Keep);
         assert_eq!(f(Some("$2b$a"), Some("$2b$b"), None), Adopt("$2b$b".into()));
@@ -2479,6 +2661,21 @@ storage:
             ),
             Keep
         );
+    }
+
+    /// Only a session with the bootstrap authority adopts another hash; any
+    /// other session keeps the running one and the answer says why.
+    #[test]
+    fn a_session_without_authority_keeps_the_bootstrap_hash() {
+        use BootstrapRestore::*;
+        let f = |c, b, e| plan_bootstrap_restore(c, b, e, false);
+        assert_eq!(f(Some("$2b$a"), Some("$2b$b"), None), NotAuthorised);
+        assert_eq!(f(None, Some("$2b$b"), None), NotAuthorised);
+        // Nothing to keep, nothing to say.
+        assert_eq!(f(Some("$2b$a"), Some("$2b$a"), None), Keep);
+        assert_eq!(f(Some("$2b$a"), None, None), Keep);
+        assert!(NotAuthorised.note().unwrap().contains("bootstrap password"));
+        assert!(Keep.note().is_none() && Adopt("x".into()).note().is_none());
     }
 
     #[test]
@@ -2796,7 +2993,7 @@ mod review2_tests {
         // The DR host's env, injected (the process env is shared by every test).
         let dr_env =
             |n: &str| (n == "DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY").then(|| K.to_string());
-        let r = hydrate_restore_doc(&exported, Some(&secrets), &dr_env);
+        let r = hydrate_restore_doc(&exported, Some(&secrets), &dr_env, &Default::default());
         assert!(r.is_ok(), "{r:?}");
         // The file holds the ref, never the key; the apply pass resolves it.
         let (yaml, refs) = r.unwrap();
@@ -2805,7 +3002,10 @@ mod review2_tests {
             yaml.contains("${env:DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY}"),
             "{yaml}"
         );
-        let (expanded, _) = crate::config::expand_env_admin(&yaml, &refs).unwrap();
+        let (tree, _) =
+            crate::config::env_template::admit_document(&yaml, &refs, &|_| false, &|_| None)
+                .unwrap();
+        let expanded = serde_yaml::to_string(&tree).unwrap();
         assert!(expanded.contains(K), "{expanded}");
     }
 }

@@ -298,14 +298,23 @@ pub(crate) const USER_OF_JOB_GONE: &str = "AccessDenied: the user who started th
     disabled or gone (a backup restore or an IAM sync can also give a user a new id; start \
     the job again as that user)";
 
+/// The reason a delete job stops when the admin who started it is no longer
+/// an enabled admin (disabled, deleted, or removed from the admin group).
+pub(crate) const ADMIN_OF_JOB_GONE: &str = "AccessDenied: the admin who started this job is \
+    no longer an enabled admin (start the job again as an admin)";
+
 /// Who a bulk request acts as.
 pub(crate) enum BulkActor {
     /// Admin GUI or open mode: no per-key check.
     Unrestricted,
-    /// A browser session's IAM user and the request's policy context.
+    /// A browser session's IAM user and the request's policy context, and
+    /// the admission rules of the chain (an admin GUI session, which edits
+    /// the chain, is not held to it).
     User {
         user: std::sync::Arc<AuthenticatedUser>,
         context: Box<iam_rs::Context>,
+        rules: Option<crate::admission::ResourceRules>,
+        client_ip: Option<std::net::IpAddr>,
     },
 }
 
@@ -317,7 +326,7 @@ impl BulkActor {
         session: &BulkSession,
     ) -> Result<Self, AdminError> {
         let (access_key_id, client_ip) = match session {
-            BulkSession::AdminGui | BulkSession::Open => return Ok(Self::Unrestricted),
+            BulkSession::AdminGui { .. } | BulkSession::Open => return Ok(Self::Unrestricted),
             BulkSession::IamUser {
                 access_key_id,
                 client_ip,
@@ -328,7 +337,34 @@ impl BulkActor {
         let view = state.credential_view(&iam).map_err(|_| {
             AdminError::forbidden("AccessDenied: the credential store is not ready")
         })?;
-        Self::for_user(view, access_key_id, client_ip).map_err(AdminError::forbidden)
+        Self::for_user(view, access_key_id, client_ip)
+            .map(|actor| actor.with_admission(&state.admission_chain.load_full()))
+            .map_err(AdminError::forbidden)
+    }
+
+    /// The actor held to the admission rules of `chain`: every key it reads,
+    /// writes or deletes meets them, as a request of that user would; the
+    /// effect of the key's action is what a rule's `method` names.
+    pub(crate) fn with_admission(
+        mut self,
+        chain: &std::sync::Arc<crate::admission::AdmissionChain>,
+    ) -> Self {
+        if let Self::User {
+            rules, client_ip, ..
+        } = &mut self
+        {
+            // The admin endpoints have no S3 request line: only the effect counts.
+            *rules = crate::admission::ResourceRules::new(chain.clone(), "", *client_ip, true);
+        }
+        self
+    }
+
+    /// The admission rules the S3 LIST of this actor applies.
+    pub(crate) fn rules(&self) -> Option<&crate::admission::ResourceRules> {
+        match self {
+            Self::Unrestricted => None,
+            Self::User { rules, .. } => rules.as_ref(),
+        }
     }
 
     /// The actor of a stored principal (a delete job), against the IAM
@@ -340,7 +376,19 @@ impl BulkActor {
     ) -> Result<Self, String> {
         use crate::maintenance::delete::Principal;
         match principal {
-            Principal::Admin => Ok(Self::Unrestricted),
+            Principal::Admin { who, client_ip } => {
+                // THE admin rule of a session, judged on every page: a
+                // disabled or demoted admin stops the job.
+                if crate::api::admin::auth::session_principal_is_admin(
+                    &who.session_method(),
+                    iam,
+                    *client_ip,
+                ) {
+                    Ok(Self::Unrestricted)
+                } else {
+                    Err(ADMIN_OF_JOB_GONE.to_string())
+                }
+            }
             Principal::Open => match iam {
                 crate::iam::IamState::Disabled => Ok(Self::Unrestricted),
                 _ => Err("AccessDenied: open access is off".to_string()),
@@ -389,6 +437,8 @@ impl BulkActor {
         Ok(Self::User {
             user,
             context: Box::new(context),
+            rules: None,
+            client_ip,
         })
     }
 
@@ -397,7 +447,22 @@ impl BulkActor {
     fn check(&self, action: S3Action, bucket: &str, key: &str) -> Result<(), String> {
         match self {
             Self::Unrestricted => Ok(()),
-            Self::User { user, context } => {
+            Self::User {
+                user,
+                context,
+                rules,
+                ..
+            } => {
+                if let Some(refusal) = rules.as_ref().and_then(|r| {
+                    r.refusal(crate::admission::Effect::of_action(action), bucket, key)
+                }) {
+                    return Err(format!(
+                        "AccessDenied: {} may not {} {bucket}/{key}: {}",
+                        user.name,
+                        action.as_str(),
+                        refusal.message()
+                    ));
+                }
                 if user.can_with_context(action, bucket, key, context) {
                     Ok(())
                 } else {
@@ -415,7 +480,20 @@ impl BulkActor {
     fn may_list(&self, bucket: &str, prefix: &str) -> bool {
         match self {
             Self::Unrestricted => true,
-            Self::User { user, context } => {
+            Self::User {
+                user,
+                context,
+                rules,
+                ..
+            } => {
+                // An admission rule that covers every key below the prefix refuses it, as for an S3 LIST.
+                if rules
+                    .as_ref()
+                    .and_then(|r| r.list_refusal(bucket, prefix))
+                    .is_some()
+                {
+                    return false;
+                }
                 let mut ctx = (**context).clone();
                 ctx.insert(
                     "s3:prefix".to_string(),
@@ -432,7 +510,7 @@ impl BulkActor {
     pub(crate) fn list_scope(&self) -> Option<crate::iam::ListScope> {
         match self {
             Self::Unrestricted => None,
-            Self::User { user, context } => Some(crate::iam::ListScope::Filtered {
+            Self::User { user, context, .. } => Some(crate::iam::ListScope::Filtered {
                 user: user.clone(),
                 context: context.clone(),
             }),
@@ -857,6 +935,7 @@ async fn copy_one(
                 upload_concurrency: None,
                 keep_created_at: false,
                 commit_count: &inner,
+                origin: crate::types::WriteOrigin::Client,
             };
             // `no_overwrite`: the existence check runs inside the transfer's own
             // lock hold, so nothing can land between the check and the write.
@@ -1884,6 +1963,9 @@ pub async fn download_zip(
     );
     let requested = parsed.len();
     let open_engine = engine.clone();
+    // The body streams after this handler returned: the entries that it opens
+    // later read as the same principal.
+    let spool_context = crate::deltaglider::spool::capture_context();
     let stream = crate::zip_stream::stream_archive(
         crate::zip_stream::Limits::ZIP,
         entries.into(),
@@ -1891,10 +1973,14 @@ pub async fn download_zip(
         move |(bucket, key): &(String, String)| {
             let engine = open_engine.clone();
             let (bucket, key) = (bucket.clone(), key.clone());
+            let context = spool_context.clone();
             async move {
-                open_zip_entry(&engine, &bucket, &key)
-                    .await
-                    .map_err(|e| e.to_string())
+                crate::deltaglider::spool::in_context(
+                    context,
+                    open_zip_entry(&engine, &bucket, &key),
+                )
+                .await
+                .map_err(|e| e.to_string())
             }
         },
         move |written: &[String], skipped: &[(String, String)]| {
@@ -1936,8 +2022,20 @@ async fn open_zip_entry(
     use futures::{StreamExt, TryStreamExt};
     let (body, metadata) = match engine.retrieve_stream(bucket, key).await? {
         RetrieveResponse::Streamed {
-            stream, metadata, ..
-        } => (stream.map_err(std::io::Error::other).boxed(), metadata),
+            stream,
+            metadata,
+            held_spool,
+            ..
+        } => {
+            // A client that stops reading the ZIP must not pin the spool file.
+            let policy = crate::deltaglider::stall_guard::StallPolicy::for_body(
+                held_spool,
+                engine.tuning().response_stall_secs,
+                engine.tuning().response_max_hold_secs,
+            );
+            let stream = crate::deltaglider::stall_guard::StallGuard::new(stream, policy);
+            (stream.map_err(std::io::Error::other).boxed(), metadata)
+        }
         RetrieveResponse::Buffered { data, metadata, .. } => {
             (crate::zip_stream::in_memory_body(data), metadata)
         }
@@ -2106,6 +2204,7 @@ pub async fn list_all(
         &bucket,
         &q.prefix,
         scope.as_ref(),
+        actor.rules(),
         q.start_after.as_deref(),
         MAX_BULK_OBJECTS,
         budget,
@@ -2132,6 +2231,100 @@ pub async fn list_all(
 
 #[cfg(test)]
 mod tests {
+    /// An operator `deny` + `path_glob` refuses the key for a user session
+    /// of the admin bulk endpoints (copy, move, delete, zip, delete jobs);
+    /// an admin session is not held to the admission chain.
+    #[test]
+    fn a_bulk_actor_meets_the_admission_rules_per_key() {
+        use super::BulkActor;
+        use crate::admission::spec::{ActionSpec, AdmissionBlockSpec, MatchSpec, SimpleAction};
+        use crate::iam::{EmptyIamOutcome, IamIndex, IamUser, Permission, S3Action};
+        let user = IamUser {
+            id: 1,
+            name: "dana".into(),
+            access_key_id: "AKDANA".into(),
+            secret_access_key: "s".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+                conditions: None,
+            }],
+            group_ids: vec![],
+            auth_source: "local".into(),
+            iam_policies: vec![],
+        };
+        let iam = IamIndex::build_iam_state(vec![user], vec![], EmptyIamOutcome::DenyAll);
+        let chain = std::sync::Arc::new(crate::admission::AdmissionChain::from_config_parts(
+            &Default::default(),
+            &[AdmissionBlockSpec {
+                name: "no-secret".into(),
+                match_: MatchSpec {
+                    bucket: Some("releases".into()),
+                    path_glob: Some("secret/**".into()),
+                    ..Default::default()
+                },
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+        ));
+        let actor = BulkActor::for_user(&iam, "AKDANA", None)
+            .expect("dana")
+            .with_admission(&chain);
+        for action in [S3Action::Read, S3Action::Write, S3Action::Delete] {
+            let err = actor.check(action, "releases", "secret/a.txt").unwrap_err();
+            assert!(err.contains("no-secret"), "{err}");
+            assert!(actor.check(action, "releases", "team/a.txt").is_ok());
+            assert!(actor.check(action, "downloads", "secret/a.txt").is_ok());
+        }
+        // The listing the bulk endpoints walk drops the key too.
+        assert!(actor
+            .rules()
+            .is_some_and(|r| !r.lists_key("releases", "secret/a.txt")));
+        // A prefix that the rule covers entirely is refused for a LIST too.
+        assert!(!actor.may_list("releases", "secret/"));
+        assert!(actor.may_list("releases", "team/"));
+        assert!(actor.may_list("downloads", "secret/"));
+        // A `method` in a rule is the effect on the key.
+        let delete_only = std::sync::Arc::new(crate::admission::AdmissionChain::from_config_parts(
+            &Default::default(),
+            &[AdmissionBlockSpec {
+                name: "no-delete".into(),
+                match_: MatchSpec {
+                    bucket: Some("releases".into()),
+                    path_glob: Some("secret/**".into()),
+                    method: Some(vec!["DELETE".into()]),
+                    ..Default::default()
+                },
+                action: ActionSpec::Simple(SimpleAction::Deny),
+            }],
+        ));
+        let actor_d = BulkActor::for_user(&iam, "AKDANA", None)
+            .expect("dana")
+            .with_admission(&delete_only);
+        assert!(actor_d
+            .check(S3Action::Delete, "releases", "secret/a.txt")
+            .is_err());
+        assert!(actor_d
+            .check(S3Action::Read, "releases", "secret/a.txt")
+            .is_ok());
+        assert!(actor_d
+            .check(S3Action::Write, "releases", "secret/a.txt")
+            .is_ok());
+        // Without the chain nothing changes (the unrestricted admin actor
+        // has no rules at all).
+        let plain = BulkActor::for_user(&iam, "AKDANA", None).expect("dana");
+        assert!(plain
+            .check(S3Action::Read, "releases", "secret/a.txt")
+            .is_ok());
+        assert!(BulkActor::Unrestricted.rules().is_none());
+        assert!(BulkActor::Unrestricted
+            .check(S3Action::Read, "releases", "secret/a.txt")
+            .is_ok());
+    }
+
     /// A2 (#171): a delete job acts as the user it names by id, with the
     /// user's permissions of now, after a key rotation. A user who is gone
     /// (or disabled) stops it with a message that names the cause, also when
@@ -2205,6 +2398,72 @@ mod tests {
             BulkActor::for_principal(&iam(user("AKNEW", 7, true, "releases/*")), &job(None))
                 .is_err()
         );
+    }
+
+    /// A delete job of an admin is judged by the live admin rule on every
+    /// page: a disabled, demoted or deleted admin stops it; the bootstrap
+    /// admin never stops.
+    #[test]
+    fn an_admin_delete_job_follows_the_live_admin_rule() {
+        use super::{BulkActor, ADMIN_OF_JOB_GONE};
+        use crate::iam::{EmptyIamOutcome, IamIndex, IamUser, Permission};
+        use crate::maintenance::delete::{AdminWho, Principal};
+        let user = |ak: &str, id: i64, enabled: bool, resource: &str| IamUser {
+            id,
+            name: format!("user-{id}"),
+            access_key_id: ak.into(),
+            secret_access_key: "s".into(),
+            enabled,
+            created_at: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec![resource.into()],
+                conditions: None,
+            }],
+            group_ids: vec![],
+            auth_source: "local".into(),
+            iam_policies: vec![],
+        };
+        let iam = |u: IamUser| IamIndex::build_iam_state(vec![u], vec![], EmptyIamOutcome::DenyAll);
+        let by_key = |ak: &str| Principal::Admin {
+            who: AdminWho::IamKey {
+                access_key_id: ak.into(),
+            },
+            client_ip: None,
+        };
+        let by_id = |id: i64| Principal::Admin {
+            who: AdminWho::User { user_id: id },
+            client_ip: None,
+        };
+        let ok = |i: &crate::iam::IamState, p: &Principal| {
+            matches!(BulkActor::for_principal(i, p), Ok(BulkActor::Unrestricted))
+        };
+        let admin = iam(user("AKADM", 1, true, "*"));
+        assert!(ok(&admin, &by_key("AKADM")) && ok(&admin, &by_id(1)));
+        // Disabled.
+        let off = iam(user("AKADM", 1, false, "*"));
+        assert!(!ok(&off, &by_key("AKADM")) && !ok(&off, &by_id(1)));
+        // Demoted: still enabled, but no longer an admin.
+        let demoted = iam(user("AKADM", 1, true, "releases/*"));
+        assert_eq!(
+            BulkActor::for_principal(&demoted, &by_key("AKADM"))
+                .err()
+                .as_deref(),
+            Some(ADMIN_OF_JOB_GONE)
+        );
+        assert!(!ok(&demoted, &by_id(1)));
+        // Deleted: nobody holds the key or the id.
+        let other = iam(user("AKOTHER", 2, true, "*"));
+        assert!(!ok(&other, &by_key("AKADM")) && !ok(&other, &by_id(1)));
+        // IAM off: only the bootstrap admin is still an admin.
+        let off_iam = crate::iam::IamState::Disabled;
+        assert!(!ok(&off_iam, &by_key("AKADM")));
+        // The bootstrap admin cannot be demoted.
+        for state in [&admin, &off, &demoted, &other, &off_iam] {
+            assert!(ok(state, &Principal::bootstrap_admin()));
+        }
     }
 
     fn names(items: &[(&str, &str)]) -> Vec<String> {

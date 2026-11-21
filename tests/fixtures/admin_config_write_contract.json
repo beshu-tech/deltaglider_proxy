@@ -149,7 +149,7 @@
       "requires_restart": true,
       "success": true,
       "warnings": [
-        "Invalid log_level 'not==valid': error parsing level filter: expected one of \"off\", \"error\", \"warn\", \"info\", \"debug\", \"trace\", or a number 0-5 — keeping current value",
+        "Invalid log_level: it is not a valid log filter — keeping current value",
         "listen_addr changed to 0.0.0.0:9999 — restart required"
       ]
     },

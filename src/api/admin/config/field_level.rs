@@ -790,10 +790,11 @@ fn build_patch(
         // document apply.
         match level_str.parse::<tracing_subscriber::EnvFilter>() {
             Ok(_) => cfg.log_level = level_str.clone(),
-            Err(e) => warnings.push(format!(
-                "Invalid log_level '{}': {} — keeping current value",
-                level_str, e
-            )),
+            // The message never repeats the value: a response must not echo input.
+            Err(_) => warnings.push(
+                "Invalid log_level: it is not a valid log filter — keeping current value"
+                    .to_string(),
+            ),
         }
     }
 

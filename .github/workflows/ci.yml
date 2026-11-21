@@ -314,6 +314,7 @@ jobs:
         include:
           - group: 1
             filters: >-
+              admin_env_ref_test::
               admin_login_as_test::
               auth_integration_test::
               aws_chunked_upload_test::
@@ -334,6 +335,7 @@ jobs:
               list_truncation_test::
               mismatch_boot_test::
               parity_test::
+              principal_shares_test::
               quota_test::
               race_conditions_test::
               reference_lock_race_test::

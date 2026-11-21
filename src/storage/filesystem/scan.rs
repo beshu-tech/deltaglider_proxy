@@ -210,6 +210,8 @@ pub(super) struct SortedDir {
     next: usize,
     /// Entries remain after the chunk.
     more: bool,
+    /// How the root names the proxy's own files.
+    names: super::Names,
 }
 
 impl SortedDir {
@@ -220,10 +222,11 @@ impl SortedDir {
         key: String,
         keep: Keep<'_>,
         held_by_ancestors: usize,
+        names: super::Names,
     ) -> Result<Option<Self>, StorageError> {
         let limit = chunk_size();
         let max_chunk = level_cap(chunk_max(), held_by_ancestors, limit);
-        let Some((chunk, more)) = read_chunk(path, &key, None, limit, keep).await? else {
+        let Some((chunk, more)) = read_chunk(path, &key, None, limit, keep, names).await? else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -234,6 +237,7 @@ impl SortedDir {
             max_chunk,
             next: 0,
             more,
+            names,
         }))
     }
 
@@ -246,7 +250,7 @@ impl SortedDir {
         if self.next >= self.chunk.len() && self.more {
             let after = self.chunk.last().map(WalkEntry::order);
             let limit = self.chunk_limit;
-            match read_chunk(&self.path, &self.key, after, limit, keep).await? {
+            match read_chunk(&self.path, &self.key, after, limit, keep, self.names).await? {
                 Some((chunk, more)) => {
                     self.chunk = chunk;
                     self.more = more;
@@ -280,6 +284,7 @@ async fn read_chunk(
     after: Option<Order>,
     limit: usize,
     keep: Keep<'_>,
+    names: super::Names,
 ) -> Result<Option<(Vec<WalkEntry>, bool)>, StorageError> {
     #[cfg(test)]
     READ_DIR_PASSES.with(|c| c.set(c.get() + 1));
@@ -299,13 +304,13 @@ async fn read_chunk(
             Err(e) => return Err(io_to_storage_error(e)),
         };
         // The proxy's own `.dg` entry is no key and holds none.
-        if super::is_internal_dir_name(&name) {
+        if super::is_internal_dir_name(&name, names) {
             continue;
         }
         let (key_name, is_delta) = if is_dir {
             (name.clone(), false)
         } else {
-            match stored_name(&name) {
+            match stored_name(&name, names) {
                 StoredName::Object {
                     key_filename,
                     variant,
@@ -402,6 +407,7 @@ pub(super) struct FlatWalk<'a> {
     delimiter: Option<&'a str>,
     /// The last common prefix yielded (see [`flat_keep`]).
     skip: Option<String>,
+    names: super::Names,
 }
 
 impl<'a> FlatWalk<'a> {
@@ -412,9 +418,10 @@ impl<'a> FlatWalk<'a> {
         prefix: &'a str,
         token: &'a str,
         delimiter: Option<&'a str>,
+        names: super::Names,
     ) -> Result<Option<Self>, StorageError> {
         let keep = |d: &str, e: &WalkEntry| flat_keep(prefix, token, None, d, e);
-        let Some(root) = SortedDir::open(root, root_key, &keep, 0).await? else {
+        let Some(root) = SortedDir::open(root, root_key, &keep, 0, names).await? else {
             return Ok(None);
         };
         Ok(Some(Self {
@@ -423,6 +430,7 @@ impl<'a> FlatWalk<'a> {
             token,
             delimiter,
             skip: None,
+            names,
         }))
     }
 
@@ -460,7 +468,7 @@ impl<'a> FlatWalk<'a> {
             if let Some(cp) = delimiter.and_then(|d| collapse_key(&below, prefix, d)) {
                 // Every key below collapses to `cp`: no need to read them,
                 // only to know that one is there.
-                if FilesystemBackend::dir_has_visible_data_recursive(&path).await? {
+                if FilesystemBackend::dir_has_visible_data_recursive(&path, self.names).await? {
                     self.skip = Some(cp.clone());
                     return Ok(Some(WalkStep::Collapsed(cp)));
                 }
@@ -469,7 +477,7 @@ impl<'a> FlatWalk<'a> {
             // What the open directories hold now: the child's share of the
             // request's budget is what is left.
             let held: usize = self.stack.iter().map(SortedDir::held).sum();
-            if let Some(sub) = SortedDir::open(&path, key, &keep, held).await? {
+            if let Some(sub) = SortedDir::open(&path, key, &keep, held, self.names).await? {
                 self.stack.push(sub);
                 note_held(self.stack.iter().map(SortedDir::held).sum());
             }

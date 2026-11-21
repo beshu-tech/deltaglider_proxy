@@ -47,9 +47,47 @@ fn password_err(status: StatusCode, msg: impl Into<String>) -> axum::response::R
 #[cfg(test)]
 use crate::config::tuning::env_pinned_hash_var;
 
+/// Proof that a caller may install a new bootstrap hash: it proved the
+/// current password, or it holds a live session that logged in with the
+/// bootstrap password. The field is private to this module, and so are the
+/// constructors: only [`Self::of_request`] and [`Self::prove_current_password`]
+/// make one, and [`install_bootstrap_hash`] needs one.
+pub(crate) struct BootstrapAuthority(());
+
+impl BootstrapAuthority {
+    /// Runs `bcrypt::verify` of `candidate` against the live hash itself:
+    /// `Some` when it matches. It takes the caller's rate-limit guard, so a
+    /// password oracle without a lockout does not compile (a source guard
+    /// checks the same for every `bcrypt::verify`).
+    pub(crate) fn prove_current_password(
+        _guard: &crate::rate_limiter::RateLimitGuard<'_>,
+        current_hash: &str,
+        candidate: &str,
+    ) -> Result<Option<Self>, bcrypt::BcryptError> {
+        bcrypt::verify(candidate, current_hash).map(|ok| ok.then_some(Self(())))
+    }
+
+    /// Pure: `Some` for a session that logged in with the bootstrap password.
+    fn from_session_method(method: Option<&crate::session::AuthMethod>) -> Option<Self> {
+        matches!(method, Some(crate::session::AuthMethod::Bootstrap)).then_some(Self(()))
+    }
+
+    /// The authority of the admin session that sent `headers`.
+    pub(crate) fn of_request(
+        state: &AdminState,
+        headers: &HeaderMap,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Option<Self> {
+        let token = super::super::auth::extract_session_token(&state.sessions, headers)?;
+        let method = state.sessions.admin_gui_auth_method(&token, client_ip);
+        Self::from_session_method(method.as_ref())
+    }
+}
+
 /// Make `hash` the bootstrap hash: the state file first (the next boot
 /// reads it), then the in-memory login verifier and the config. Shared by
-/// the password change and the backup restore.
+/// the password change and the backup restore, and only with a
+/// [`BootstrapAuthority`].
 ///
 /// THE place where a hash is installed, so THE place where the sessions of
 /// the old password end: every bootstrap session except the one in
@@ -59,6 +97,7 @@ pub(crate) async fn install_bootstrap_hash(
     state: &AdminState,
     hash: &str,
     headers: &HeaderMap,
+    _authority: &BootstrapAuthority,
 ) -> std::io::Result<usize> {
     let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
     crate::config::write_bootstrap_hash_file(state_file, hash)?;
@@ -110,8 +149,12 @@ pub async fn change_password(
         Err(blocked) => return blocked.into_response(),
     };
     let current_hash = state.password_hash.read().clone();
-    let valid = match bcrypt::verify(&body.current_password, &current_hash) {
-        Ok(v) => v,
+    let proof = match BootstrapAuthority::prove_current_password(
+        &guard,
+        &current_hash,
+        &body.current_password,
+    ) {
+        Ok(p) => p,
         Err(e) => {
             tracing::error!("bcrypt verify failed (corrupted hash?): {}", e);
             return password_err(
@@ -121,12 +164,12 @@ pub async fn change_password(
         }
     };
 
-    if !valid {
+    let Some(authority) = proof else {
         guard.record_failure();
         tracing::warn!("Failed password change from {}", guard.ip());
         audit_log("change_password_failed", "bootstrap", "", &headers);
         return password_err(StatusCode::FORBIDDEN, "Current password is incorrect");
-    }
+    };
     guard.record_proven();
 
     // Validate new password quality
@@ -145,7 +188,7 @@ pub async fn change_password(
     };
 
     // Installing the hash ends the other sessions; the caller's stays.
-    let ended = match install_bootstrap_hash(&state, &new_hash, &headers).await {
+    let ended = match install_bootstrap_hash(&state, &new_hash, &headers, &authority).await {
         Ok(n) => n,
         Err(e) => {
             tracing::error!("Failed to persist new admin hash to disk: {}", e);
@@ -364,6 +407,22 @@ fn write_recovery_temp(
 
 #[cfg(test)]
 mod tests {
+    use super::BootstrapAuthority;
+    use crate::session::AuthMethod;
+
+    /// Only a session that logged in with the bootstrap password holds the
+    /// authority; no other kind of admin session does.
+    #[test]
+    fn only_a_bootstrap_session_is_an_authority() {
+        assert!(BootstrapAuthority::from_session_method(Some(&AuthMethod::Bootstrap)).is_some());
+        let login_as = AuthMethod::IamLoginAs {
+            access_key_id: "AKADMIN".into(),
+        };
+        for other in [Some(&login_as), Some(&AuthMethod::OpenLift), None] {
+            assert!(BootstrapAuthority::from_session_method(other).is_none());
+        }
+    }
+
     /// SEC F-05: the recovery copy is a private temp file next to the DB,
     /// and it is gone when its handle drops.
     #[test]

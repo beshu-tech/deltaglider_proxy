@@ -3618,3 +3618,190 @@ async fn test_run_now_at_a_full_destination_disk_deletes_and_defers_the_copy() {
         .await;
     assert!(copied.is_err(), "the copy waited for space");
 }
+
+const LEGACY_NAMES_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: legacy-names-rule
+      enabled: true
+      source:
+        bucket: lg-src
+        prefix: \"\"
+      destination:
+        bucket: lg-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+";
+
+/// Plant `key` (a file in the deltaspace directory) as an earlier release stored it.
+fn plant_legacy_key(data_dir: &std::path::Path, bucket: &str, prefix: &str, name: &str) {
+    let dir = data_dir.join(bucket).join("deltaspaces").join(prefix);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(name), format!("legacy {prefix}/{name}")).unwrap();
+}
+
+/// A key that an earlier release stored, whose name is a case variant of a
+/// reserved name, replicates: a copy of an existing key is judged by the
+/// destination backend's own rule, not by the strict rule of a client write.
+#[tokio::test]
+async fn test_replication_copies_keys_with_a_legacy_reserved_name() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(LEGACY_NAMES_RULE_YAML)
+        .build()
+        .await;
+    let data_dir = server.data_dir().expect("filesystem backend").to_path_buf();
+    let probe = data_dir.join(".case-probe");
+    std::fs::write(&probe, b"").unwrap();
+    let insensitive = data_dir.join(".CASE-PROBE").exists();
+    std::fs::remove_file(&probe).unwrap();
+    if insensitive {
+        eprintln!("skipping: the data directory is case-insensitive");
+        return;
+    }
+    let s3 = server.s3_client().await;
+    for b in ["lg-src", "lg-dst"] {
+        s3.create_bucket().bucket(b).send().await.ok();
+    }
+    plant_legacy_key(&data_dir, "lg-src", "logs", "run.DELTA");
+    plant_legacy_key(&data_dir, "lg-src", "", "Reference.Bin");
+    plant_legacy_key(&data_dir, "lg-src", "a/.Dg", "x");
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/replication:legacy-names-rule/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let run = wait_for_latest_run(&admin, &server.endpoint(), "legacy-names-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "run: {run}");
+    assert_eq!(run["errors"].as_i64().unwrap_or(0), 0, "run: {run}");
+    assert_eq!(run["objects_processed"].as_i64(), Some(3), "run: {run}");
+    for (key, want) in [
+        ("logs/run.DELTA", "legacy logs/run.DELTA"),
+        ("Reference.Bin", "legacy /Reference.Bin"),
+        ("a/.Dg/x", "legacy a/.Dg/x"),
+    ] {
+        let got = s3
+            .get_object()
+            .bucket("lg-dst")
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{key} did not arrive: {e:?}"))
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(&got[..], want.as_bytes(), "{key}");
+    }
+}
+
+const LEGACY_FOLDERS_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: legacy-folders-rule
+      enabled: true
+      source:
+        bucket: lf-src
+        prefix: \"\"
+      destination:
+        bucket: lf-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+";
+
+/// A key of the source that has a folder named like a baseline, a delta, a
+/// temp file or a folder marker (an earlier release stored it) is refused by
+/// a filesystem destination: its own files would collide with that folder.
+/// The run records the key and copies the others, and the folders of the
+/// destination still take deltas.
+#[tokio::test]
+async fn test_replication_refuses_keys_whose_folder_collides_on_a_filesystem_destination() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(LEGACY_FOLDERS_RULE_YAML)
+        .build()
+        .await;
+    let data_dir = server.data_dir().expect("filesystem backend").to_path_buf();
+    let s3 = server.s3_client().await;
+    for b in ["lf-src", "lf-dst"] {
+        s3.create_bucket().bucket(b).send().await.ok();
+    }
+    let refused = [
+        ("a/reference.bin", "x"),
+        ("a/b.delta", "y"),
+        ("a/.dg-tmp.z", "w"),
+        ("a/.dg-folder-marker", "m"),
+    ];
+    for (prefix, name) in refused {
+        plant_legacy_key(&data_dir, "lf-src", prefix, name);
+    }
+    plant_legacy_key(&data_dir, "lf-src", "a", "fine.txt");
+    plant_legacy_key(&data_dir, "lf-src", "k", "ok.txt");
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/replication:legacy-folders-rule/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 202);
+    let run = wait_for_latest_run(&admin, &server.endpoint(), "legacy-folders-rule").await;
+    assert_eq!(run["errors"].as_i64(), Some(4), "run: {run}");
+    for key in ["a/fine.txt", "k/ok.txt"] {
+        s3.head_object()
+            .bucket("lf-dst")
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{key} did not arrive: {e:?}"));
+    }
+    let dst = data_dir.join("lf-dst").join("deltaspaces").join("a");
+    for name in ["reference.bin", "b.delta", ".dg-tmp.z", ".dg-folder-marker"] {
+        assert!(!dst.join(name).exists(), "{name} must not be a folder");
+    }
+    let failures: Value = admin
+        .get(format!(
+            "{}/_/api/admin/jobs/replication:legacy-folders-rule/failures",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let text = failures.to_string();
+    for key in ["a/reference.bin/x", "a/b.delta/y", "a/.dg-tmp.z/w"] {
+        assert!(text.contains(key), "{key} is recorded: {failures}");
+    }
+    // The destination folder `a` still stores a delta.
+    let base = common::generate_binary(100_000, 5);
+    let variant = common::mutate_binary(&base, 0.01);
+    for (name, body) in [("app-1.zip", base), ("app-2.zip", variant)] {
+        s3.put_object()
+            .bucket("lf-dst")
+            .key(format!("a/{name}"))
+            .body(ByteStream::from(body))
+            .content_type("application/zip")
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("PUT a/{name}: {e:?}"));
+    }
+    assert!(dst.join("app-2.zip.delta").is_file());
+}

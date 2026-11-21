@@ -76,6 +76,32 @@ use super::worker::{
 };
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
+
+/// `Some(message)` when `new` creates, changes or removes a `__dgmigrate_*` route
+/// of `old`. Such a route is the migrate job's own: no request touches one, and a
+/// request that leaves it as it is (a save while the job runs) is no change.
+pub(crate) fn reserved_route_change(
+    old: &crate::config::Config,
+    new: &crate::config::Config,
+) -> Option<String> {
+    let routes = |c: &crate::config::Config| {
+        c.buckets
+            .iter()
+            .filter(|(name, _)| name.starts_with(TRANSIENT_PREFIX))
+            .map(|(name, policy)| (name.clone(), policy.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let (before, after) = (routes(old), routes(new));
+    let touched = after
+        .iter()
+        .find(|(name, policy)| before.get(*name) != Some(*policy))
+        .map(|(name, _)| name)
+        .or_else(|| before.keys().find(|name| !after.contains_key(*name)))?;
+    Some(format!(
+        "`/buckets/{touched}`: a `{TRANSIENT_PREFIX}*` route belongs to a migrate job: no \
+         request can create, change or remove it"
+    ))
+}
 const PAGE_SIZE: u32 = 1000;
 
 /// What the migrate does with objects that already sit in the destination
@@ -640,25 +666,44 @@ async fn ensure_route(
     bucket: &str,
     context: &str,
 ) -> Result<(), String> {
-    let (present, route) = {
+    let present = {
         let cfg = mutator.read().await;
         let real = real_bucket_name(&cfg.buckets, bucket).to_string();
         let route = route_policy(cfg.buckets.get(bucket), backend, &real);
-        let present = cfg
-            .buckets
+        cfg.buckets
             .get(route_key)
-            .is_some_and(|p| same_route(p, &route));
-        (present, route)
+            .is_some_and(|p| same_route(p, &route))
     };
     if present {
         return Ok(());
     }
-    let route_key = route_key.to_string();
+    let (route_key, bucket, backend) = (
+        route_key.to_string(),
+        bucket.to_string(),
+        backend.to_string(),
+    );
     mutator
         .mutate_and_apply(context, move |cfg| {
-            cfg.buckets.insert(route_key, route);
+            insert_route(cfg, &route_key, &bucket, &backend)
         })
         .await
+}
+
+/// THE staging-route edit: the route `route_key` to the real bucket of `bucket` on
+/// `backend`. It declares the copy of the encryption block; the job start tries it first.
+pub(crate) fn insert_route(
+    cfg: &mut crate::config::Config,
+    route_key: &str,
+    bucket: &str,
+    backend: &str,
+) {
+    let real = real_bucket_name(&cfg.buckets, bucket).to_string();
+    let route = route_policy(cfg.buckets.get(bucket), backend, &real);
+    cfg.env_refs.derive_templates(
+        &format!("/buckets/{bucket}/encryption"),
+        &format!("/buckets/{route_key}/encryption"),
+    );
+    cfg.buckets.insert(route_key.to_string(), route);
 }
 
 /// Pure: the policy of a route to the real bucket `alias` on `backend`.
@@ -708,6 +753,7 @@ async fn remove_routes(mutator: &ConfigMutator, keys: &[String], context: &str) 
         .mutate_and_apply(context, move |cfg| {
             for k in &keys {
                 cfg.buckets.remove(k);
+                cfg.env_refs.drop_templates_under(&format!("/buckets/{k}"));
             }
         })
         .await
@@ -800,6 +846,8 @@ pub(crate) fn apply_flip(
     cfg.buckets.insert(bucket_key.to_string(), policy);
     if let Some(transient) = transient {
         cfg.buckets.remove(transient);
+        cfg.env_refs
+            .drop_templates_under(&format!("/buckets/{transient}"));
     }
 }
 
@@ -1156,6 +1204,7 @@ impl MigrateRun<'_> {
             desired: None,
             marker,
             writes_plaintext,
+            refused: Vec::new(),
         };
         paged_phase(
             self.ctx(),
@@ -1175,7 +1224,14 @@ impl MigrateRun<'_> {
             &mut step,
         )
         .await?;
-        // A failed copy stops the phase, so every object is copied or skipped.
+        // A refused key never reaches the verify and the flip: its object
+        // would be lost there. Every other object is copied or skipped.
+        if step.c.failed > 0 {
+            return Err(PhaseStop::Failed(refused_copies_message(
+                step.c.failed,
+                &step.refused,
+            )));
+        }
         c.total = Some(c.done + c.skipped);
         self.checkpoint("verify", c, None).await
     }
@@ -1482,6 +1538,31 @@ struct CopyStep<'a, 'r> {
     /// The source bucket writes plaintext (its unsealed objects are its
     /// own: never an adoption).
     writes_plaintext: bool,
+    /// The first keys that the destination refused (named in the stop message).
+    refused: Vec<String>,
+}
+
+/// How many refused keys the stop message names; the job's failures list all.
+const REFUSED_KEYS_NAMED: usize = 10;
+
+/// Pure: why a migration stops before the verify when the destination refused
+/// `count` keys. Names the first `keys`.
+fn refused_copies_message(count: i64, keys: &[String]) -> String {
+    let named = keys
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if (keys.len() as i64) < count {
+        ", and more (the failures of the job list every key)"
+    } else {
+        ""
+    };
+    format!(
+        "{count} object(s) were not copied because the destination backend refuses their key \
+         names: {named}{more}. Nothing was switched, and the source stays authoritative. \
+         Rename or delete these keys on the source, then start the migration again."
+    )
 }
 
 impl CopyStep<'_, '_> {
@@ -1505,6 +1586,12 @@ enum CopyDone {
     },
     Failed {
         transient: bool,
+        message: String,
+    },
+    /// The destination backend refuses the key name (it collides with a name
+    /// that the backend keeps). Recorded; the phase goes on and the migration
+    /// stops before the verify and the flip ([`refused_copies_message`]).
+    Refused {
         message: String,
     },
     /// The object needs a spool file and the spool disk is at level high or
@@ -1635,6 +1722,7 @@ impl PageStep for CopyStep<'_, '_> {
             upload_concurrency: None,
             keep_created_at: true,
             commit_count: &no_gate,
+            origin: crate::types::WriteOrigin::Job,
         };
         // No per-object fsync: `checkpoint` flushes the copies before any
         // progress that counts on them is saved.
@@ -1646,6 +1734,9 @@ impl PageStep for CopyStep<'_, '_> {
             Ok(outcome) => CopyDone::Copied {
                 bytes: outcome.bytes_copied as i64,
                 adopted,
+            },
+            Err(e) if e.key_refused() => CopyDone::Refused {
+                message: e.to_string(),
             },
             Err(e) => copy_error_done(
                 e.class == crate::transfer::CopyClass::Busy,
@@ -1659,6 +1750,8 @@ impl PageStep for CopyStep<'_, '_> {
     fn stops(done: &CopyDone) -> bool {
         matches!(done, CopyDone::Failed { .. } | CopyDone::Deferred(_))
     }
+
+    // A refused key does not stop the walk: see `CopyDone::Refused`.
 
     async fn settle(&mut self, key: &str, done: CopyDone) -> Result<(), PhaseStop> {
         let m = self.m;
@@ -1681,6 +1774,13 @@ impl PageStep for CopyStep<'_, '_> {
             // The job waits for the spool disk; nothing is recorded, and the
             // page is not saved (the copies of it are idempotent).
             CopyDone::Deferred(why) => return Err(PhaseStop::Deferred(why)),
+            CopyDone::Refused { message } => {
+                record_failure(m.db, m.job.id, key, &message).await?;
+                self.c.failed += 1;
+                if self.refused.len() < REFUSED_KEYS_NAMED {
+                    self.refused.push(key.to_string());
+                }
+            }
             CopyDone::Failed { transient, message } => {
                 record_failure(m.db, m.job.id, key, &message).await?;
                 self.c.failed += 1;
@@ -1926,6 +2026,26 @@ mod tests {
         assert!(refuse(Some("")).is_none());
         let msg = refuse(Some("dgp-sync")).expect("refused");
         assert!(msg.contains("dgp-sync") && msg.contains(super::MIGRATE_DOC_URL));
+    }
+
+    /// The stop message names the refused keys and says what to do.
+    #[test]
+    fn the_message_of_refused_copies_names_the_keys() {
+        let keys = vec!["logs/a".to_string(), "b".to_string()];
+        let msg = super::refused_copies_message(2, &keys);
+        assert!(
+            msg.contains("2 object(s)") && msg.contains("'logs/a', 'b'"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Nothing was switched") && !msg.contains("and more"),
+            "{msg}"
+        );
+        let msg = super::refused_copies_message(40, &keys);
+        assert!(
+            msg.contains("40 object(s)") && msg.contains("and more"),
+            "{msg}"
+        );
     }
 
     use super::RecopyScope;

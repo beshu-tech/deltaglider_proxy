@@ -296,9 +296,27 @@ async fn section_write(
         let invalid = |e: String| Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, e);
         // Project → replace one slice → collapse back. The body is "the new
         // non-secret state of this section"; the pipeline merges secrets.
+        // S7: every string of the body is judged, then expanded, before it
+        // meets the running section.
+        let allowed = crate::config::admin_env_allowed;
+        let (patch, added) = crate::config::env_template::admit_section_body(
+            section.as_str(),
+            body,
+            &old.env_refs,
+            &allowed,
+            &crate::config::admin_env_lookup,
+        )
+        .map_err(|e| {
+            Rejection::new(
+                Stage::EnvResolve,
+                StatusCode::BAD_REQUEST,
+                format!("env reference refused: {e}"),
+            )
+        })?;
         let mut sectioned = SectionedConfig::from_flat(old);
-        merge_patch_section(&mut sectioned, section, body).map_err(invalid)?;
-        let incoming = sectioned.into_flat().map_err(invalid)?;
+        merge_patch_section(&mut sectioned, section, &patch).map_err(invalid)?;
+        let mut incoming = sectioned.into_flat().map_err(invalid)?;
+        incoming.env_refs = added;
         Ok(Built {
             incoming,
             warnings: Vec::new(),
@@ -430,9 +448,7 @@ impl ScrubEnv for SectionApplyResponse {
                 .chain(&mut self.error),
             refs,
         );
-        if let Some(diff) = self.diff.as_mut() {
-            diff.scrub_env(refs);
-        }
+        // The diff is not scrubbed: it shows templates by path (`compute_section_diff`).
     }
 }
 
@@ -836,8 +852,13 @@ pub(super) fn compute_section_diff(
     //   * rotations surface as a readable `fp:a→fp:b` swap.
     //   * neither side leaks key material (one-way hash truncated
     //     to 8 hex chars, matching the pre-refactor behaviour).
-    let old_fp = fingerprint_secrets_for_diff(old_cfg);
-    let new_fp = fingerprint_secrets_for_diff(new_cfg);
+    // A field with a template shows the template, by PATH, as the export does: the
+    // diff echoes request text, so no value of a secret may decide what it shows.
+    let shown = |c: &crate::config::Config| {
+        fingerprint_secrets_for_diff(&c.with_file_text(crate::config::env_template::Escape::None))
+    };
+    let old_fp = shown(old_cfg);
+    let new_fp = shown(new_cfg);
 
     let old_sectioned = SectionedConfig::from_flat(&old_fp);
     let new_sectioned = SectionedConfig::from_flat(&new_fp);
@@ -1050,7 +1071,7 @@ pub(crate) fn preserve_backend_encryption_secrets(
     new: &mut crate::config::BackendEncryptionConfig,
     old: &crate::config::BackendEncryptionConfig,
     probe: BackendKeyPresence,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     preserve_encryption_secrets(
         crate::config::KeyScope::Backend(backend_name),
         &format!("backend '{backend_name}'"),
@@ -1063,13 +1084,14 @@ pub(crate) fn preserve_backend_encryption_secrets(
 /// [`preserve_backend_encryption_secrets`] for any encryption site:
 /// `scope` gives the key-id rules (config::resolve_site_keys), `owner`
 /// names the site in the messages (`backend 'x'`, `bucket 'y'`).
+/// `Ok(true)`: the old primary key moved into the `legacy_key` slot.
 fn preserve_encryption_secrets(
     scope: crate::config::KeyScope<'_>,
     owner: &str,
     new: &mut crate::config::BackendEncryptionConfig,
     old: &crate::config::BackendEncryptionConfig,
     probe: BackendKeyPresence,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     use crate::config::BackendEncryptionConfig as E;
     // H8: validate hex during preservation. If the old config landed
     // in memory with malformed hex (e.g. a pre-existing pathological
@@ -1166,7 +1188,7 @@ fn preserve_encryption_secrets(
                     *slot = Some(old_primary.clone());
                 }
                 set_legacy_key_id(new, Some(old_kid));
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -1183,7 +1205,7 @@ fn preserve_encryption_secrets(
             set_legacy_key_id(new, old.legacy_key_id().map(str::to_string));
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// [`preserve_backend_encryption_secrets`] over every encryption site of
@@ -1198,6 +1220,7 @@ pub(crate) fn preserve_all_backend_encryption(
     probe: &BackendEncryptionKeyProbe,
 ) -> Result<(), String> {
     use crate::config::EncryptionSite as S;
+    let mut promotions = Vec::new();
     for (site, new_enc) in new_cfg.encryption_sites_mut() {
         let Some(old_enc) = old_cfg.encryption_at(&site) else {
             continue;
@@ -1207,14 +1230,30 @@ pub(crate) fn preserve_all_backend_encryption(
             S::Backend(name) => crate::config::KeyScope::Backend(name),
             S::Bucket(name) => crate::config::KeyScope::Bucket(name),
         };
-        preserve_encryption_secrets(
+        let promoted = preserve_encryption_secrets(
             scope,
             &site.label(),
             new_enc,
             old_enc,
             probe.for_site(&site),
         )?;
+        // The key that moved to `legacy_key` came from the environment where
+        // the old config had a reference: the copy keeps the reference.
+        if promoted {
+            promotions.push(site.template_path());
+        }
     }
+    let mut copies = old_cfg.env_refs.clone();
+    let before = copies.templates.clone();
+    for prefix in promotions {
+        copies.derive_templates(&format!("{prefix}/key"), &format!("{prefix}/legacy_key"));
+    }
+    new_cfg.env_refs.templates.extend(
+        copies
+            .templates
+            .into_iter()
+            .filter(|(path, t)| before.get(path) != Some(t)),
+    );
     Ok(())
 }
 

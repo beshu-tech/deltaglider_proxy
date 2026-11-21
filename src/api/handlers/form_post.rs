@@ -169,8 +169,8 @@ fn count_field(count: &mut usize, name: &str, budget: &mut u64) -> Result<(), S3
     Ok(())
 }
 
-/// The form up to its file part: the fields before the file, and what
-/// the file part's headers say (its file name and content type).
+/// The form up to its file part: the fields before the file, and the file
+/// name from the file part's headers.
 #[derive(Debug)]
 struct FormHead {
     key_field: String,
@@ -385,6 +385,23 @@ pub fn form_post_bucket(
     }
     let target = crate::api::request_target::RequestTarget::from_uri(uri).ok()?;
     target.bucket_only().map(str::to_string)
+}
+
+/// Pure: a `multipart/form-data` POST of any shape, by a loose read of every
+/// `Content-Type` header (wider than s3s' own parse). The router refuses such
+/// a request unless [`form_post_bucket`] names it: s3s treats every one as
+/// `PostObject`, buffers its file in memory, and our adapter has no
+/// `post_object`.
+pub fn is_multipart_post(method: &axum::http::Method, headers: &HeaderMap) -> bool {
+    method == axum::http::Method::POST
+        && headers
+            .get_all(axum::http::header::CONTENT_TYPE)
+            .iter()
+            .any(|v| {
+                String::from_utf8_lossy(v.as_bytes())
+                    .to_ascii_lowercase()
+                    .contains("multipart/form-data")
+            })
 }
 
 fn derive_v4_signing_key(secret_access_key: &str, date: &str, region: &str) -> [u8; 32] {
@@ -815,7 +832,7 @@ fn validate_form_post_policy(
 
 /// Read the form up to its file part: the fields before it (each read
 /// under [`FORM_FIELD_MAX`]), then the file part's headers, which give
-/// `${filename}` and the file's content type. No byte of the file is read.
+/// `${filename}`. No byte of the file is read.
 /// The checks that need only these fields run here, in the order of the
 /// collected parser before: metadata size, `key`, the resolved key, the
 /// stored header fields, then the file part itself.
@@ -858,19 +875,16 @@ async fn read_form_head(
         .to_string();
     let file_name = file.as_ref().and_then(|f| f.file_name());
     let resolved_key = resolve_form_key(&key_field, file_name)?;
+    crate::api::input_limits::check_key(&resolved_key)?;
     if resolved_key.is_empty() {
         return Err(S3Error::InvalidArgument(
             "POST form upload resolved object key is empty".into(),
         ));
     }
 
-    let file_content_type = file
-        .as_ref()
-        .and_then(|f| f.content_type())
-        .map(|ct| ct.to_string());
-    let content_type = lookup_form_field(&fields_ci, "content-type")
-        .map(str::to_string)
-        .or(file_content_type);
+    // Only a `Content-Type` field sets the type: the policy covers fields, not
+    // the file part's own header.
+    let content_type = lookup_form_field(&fields_ci, "content-type").map(str::to_string);
     super::object_helpers::stored_header_fields_check(&user_metadata, content_type.as_deref())
         .map_err(S3Error::InvalidArgument)?;
     let file = file.ok_or_else(|| {
@@ -1003,27 +1017,29 @@ fn authenticate_form_post(
         return Err(S3Error::AccessDenied);
     }
 
+    // An unknown or disabled key id signs against a secret nobody has, so it
+    // fails like a wrong secret and the answer does not tell which ids exist.
     let (secret_access_key, auth_user) = match snapshot.as_ref() {
         IamState::Disabled => unreachable!("checked above"),
         IamState::Legacy(auth) => {
             // Constant-time, like the SigV4 path: a plain `!=` leaks how many
             // leading bytes of the bootstrap key a guess got right.
-            if !crate::security::secret_eq(access_key.as_bytes(), auth.access_key_id.as_bytes()) {
-                return Err(S3Error::AccessDenied);
+            if crate::security::secret_eq(access_key.as_bytes(), auth.access_key_id.as_bytes()) {
+                (
+                    auth.secret_access_key.clone(),
+                    Some(AuthenticatedUser::bootstrap_shared(&auth.access_key_id)),
+                )
+            } else {
+                (crate::security::unmatchable_secret().to_string(), None)
             }
-            (
-                auth.secret_access_key.clone(),
-                AuthenticatedUser::bootstrap_shared(&auth.access_key_id),
-            )
         }
-        IamState::Iam(index) => {
-            let user = index
-                .get(access_key)
-                .filter(|u| u.enabled)
-                .ok_or(S3Error::AccessDenied)?;
-            let principal = index.principal(access_key).ok_or(S3Error::AccessDenied)?;
-            (user.secret_access_key.clone(), principal.clone())
-        }
+        IamState::Iam(index) => match index.get(access_key).filter(|u| u.enabled) {
+            Some(user) => (
+                user.secret_access_key.clone(),
+                index.principal(access_key).cloned(),
+            ),
+            None => (crate::security::unmatchable_secret().to_string(), None),
+        },
     };
 
     // Validate the supplied signature's SHAPE before any timing-sensitive work.
@@ -1061,6 +1077,9 @@ fn authenticate_form_post(
         );
         return Err(S3Error::SignatureDoesNotMatch);
     }
+    // No principal: the signature used the unmatchable secret and cannot
+    // have matched; refuse the same way if it somehow did.
+    let auth_user = auth_user.ok_or(S3Error::SignatureDoesNotMatch)?;
 
     let policy_bytes = base64::engine::general_purpose::STANDARD
         .decode(policy_b64.as_bytes())
@@ -1171,12 +1190,41 @@ where
                 return Err(e);
             }
         };
+    // The signature of the form is verified: a later refusal reads the rest
+    // of the body first (`drain_after_refusal`), so the client gets its answer.
+    // Open access has no signer: such a form is never drained.
+    if let (Some(_), Some(outcome)) = (
+        &auth.user,
+        extensions.get::<crate::api::auth::AuthOutcome>(),
+    ) {
+        outcome.mark_verified();
+        outcome.mark_identified();
+    }
+    // The key of the form is a resource the request line does not name:
+    // an admission `deny` / `reject` on it applies here.
+    if let Some(refusal) = extensions
+        .get::<crate::admission::ResourceRules>()
+        .and_then(|rules| {
+            rules.refusal(crate::admission::Effect::Write, bucket, &head.resolved_key)
+        })
+    {
+        audit_log_s3(
+            "s3_post_denied",
+            "$form_post",
+            headers,
+            bucket,
+            &head.resolved_key,
+        );
+        return Err(S3Error::from(&refusal));
+    }
     // The client-write gate (a replication_target_only bucket, a read-only
     // encrypted bucket), after the signature check: its 403 names the
     // bucket's configuration and backend, which an unverified caller must
     // not learn (S23). Still before any backend I/O (403-before-404 parity
     // with the PUT path, commit b1b2249).
     check_client_store_allowed(state, bucket).await?;
+    // A refused key fails before the file is read, as at PutObject.
+    super::object_helpers::check_client_key(bucket, &head.resolved_key)?;
     // Only now, with the policy signature verified: the gates' 503 names a
     // busy bucket or a backend's state.
     crate::maintenance::gate::check_verified_request(
@@ -1245,6 +1293,7 @@ where
         .into_response();
     let writer = crate::s3_adapter_s3s::Reader::for_form_writer(
         auth.user.as_deref(),
+        extensions.get::<crate::admission::ResourceRules>(),
         bucket,
         &head.resolved_key,
     );
@@ -1261,6 +1310,39 @@ mod stream_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The form head of a body with these parts (`(name, part content type)`
+    /// before the file; the file part is `file` with `file_type`).
+    async fn head_of(fields: &[(&str, &str)], file_type: &str) -> FormHead {
+        let mut body = String::new();
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--XB\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(&format!(
+            "--XB\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.txt\"\r\n\
+             Content-Type: {file_type}\r\n\r\nhello\r\n--XB--\r\n"
+        ));
+        let stream =
+            futures::stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(body)) });
+        let mut multipart = multer::Multipart::new(stream, "XB");
+        read_form_head(&mut multipart).await.unwrap().0
+    }
+
+    /// The file part's own `Content-Type` is not covered by the policy, so
+    /// it never sets the stored type; only a `Content-Type` field does.
+    #[tokio::test]
+    async fn the_stored_content_type_comes_only_from_the_form_field() {
+        let head = head_of(&[("key", "k.txt")], "text/html").await;
+        assert_eq!(head.content_type, None, "the file part sets no type");
+        let head = head_of(
+            &[("key", "k.txt"), ("Content-Type", "text/plain")],
+            "text/html",
+        )
+        .await;
+        assert_eq!(head.content_type.as_deref(), Some("text/plain"));
+    }
 
     /// A form's checksum field is checked like the PUT header.
     #[test]

@@ -46,12 +46,61 @@ pub const MAX_KEYS: usize = 10_000;
 /// The most folders one job may name.
 pub const MAX_PREFIXES: usize = 1_000;
 
+/// Which admin started a job: what `session_principal_is_admin` needs to
+/// judge the admin again on every page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AdminWho {
+    /// The holder of the bootstrap password: it cannot be demoted.
+    Bootstrap,
+    /// An IAM admin who signed in with an access key.
+    IamKey { access_key_id: String },
+    /// An admin who signed in through OAuth/OIDC: the user's database id.
+    User { user_id: i64 },
+}
+
+impl AdminWho {
+    /// Who an admin session is; `None` for a session that is never admin.
+    pub fn of_session(method: &crate::session::AuthMethod) -> Option<Self> {
+        use crate::session::AuthMethod;
+        match method {
+            AuthMethod::Bootstrap => Some(Self::Bootstrap),
+            AuthMethod::IamLoginAs { access_key_id } => Some(Self::IamKey {
+                access_key_id: access_key_id.clone(),
+            }),
+            AuthMethod::External { user_id, .. } => Some(Self::User { user_id: *user_id }),
+            AuthMethod::IamBrowserLift { .. } | AuthMethod::OpenLift => None,
+        }
+    }
+
+    /// The session method that the admin rule judges.
+    pub fn session_method(&self) -> crate::session::AuthMethod {
+        use crate::session::AuthMethod;
+        match self {
+            Self::Bootstrap => AuthMethod::Bootstrap,
+            Self::IamKey { access_key_id } => AuthMethod::IamLoginAs {
+                access_key_id: access_key_id.clone(),
+            },
+            Self::User { user_id } => AuthMethod::External {
+                provider_name: String::new(),
+                user_id: *user_id,
+            },
+        }
+    }
+}
+
 /// Who started the job; the job acts with this principal's permissions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Principal {
-    /// An admin session: no per-key check.
-    Admin,
+    /// An admin session: no per-key check, but the admin must still be an
+    /// enabled admin on every page. `client_ip` is the session's address
+    /// (`aws:SourceIp` of the admin rule). A row of an older release has no
+    /// `who`: it does not parse and the job fails (`parse_params`).
+    Admin {
+        who: AdminWho,
+        client_ip: Option<IpAddr>,
+    },
     /// Open access: no per-key check while IAM stays off.
     Open,
     /// An IAM user, and the address its session came from (`aws:SourceIp`).
@@ -65,6 +114,16 @@ pub enum Principal {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_id: Option<i64>,
     },
+}
+
+#[cfg(test)]
+impl Principal {
+    pub(crate) fn bootstrap_admin() -> Self {
+        Principal::Admin {
+            who: AdminWho::Bootstrap,
+            client_ip: None,
+        }
+    }
 }
 
 /// The job row's params.
@@ -83,7 +142,15 @@ pub struct DeleteParams {
 
 /// Parse the job row's params JSON.
 pub fn parse_params(json: &str) -> Result<DeleteParams, String> {
-    serde_json::from_str(json).map_err(|e| format!("invalid delete params: {e}"))
+    serde_json::from_str(json).map_err(|e| {
+        if e.to_string().contains("missing field `who`") {
+            "this delete job was started by an older release that did not record which admin \
+             started it, so it does not run; start the delete again"
+                .to_string()
+        } else {
+            format!("invalid delete params: {e}")
+        }
+    })
 }
 
 /// Pure: may `session` cancel a job that `job_params` (the job row's params
@@ -95,7 +162,7 @@ pub fn parse_params(json: &str) -> Result<DeleteParams, String> {
 /// text. An unreadable row denies a user.
 pub fn may_cancel(session: &Principal, job_params: Option<&str>) -> bool {
     match session {
-        Principal::Admin | Principal::Open => true,
+        Principal::Admin { .. } | Principal::Open => true,
         Principal::User {
             access_key_id,
             user_id,
@@ -145,6 +212,8 @@ impl Cursor {
 pub struct DeleteDeps {
     pub iam: crate::iam::SharedIamState,
     pub savings: Arc<crate::api::admin::SavingsCache>,
+    /// The admission chain of now: a job acting as a user meets its per-resource rules.
+    pub admission: crate::admission::SharedAdmissionChain,
 }
 
 /// One page of keys and the cursor after it; `None` when every stage is done.
@@ -182,6 +251,7 @@ async fn next_page(
         bucket,
         prefix,
         scope.as_ref(),
+        actor.rules(),
         cursor.after.as_deref(),
         PAGE_KEYS,
         budget,
@@ -249,7 +319,8 @@ pub(crate) async fn execute_delete_phases(
             .coordination
             .credential_view(&iam)
             .map_err(|_| PhaseStop::Deferred("the credential store is not ready".into()))?;
-        let actor = BulkActor::for_principal(view, &params.principal)?;
+        let actor = BulkActor::for_principal(view, &params.principal)?
+            .with_admission(&deps.admission.load_full());
         let budget = config.read().await.filtered_list_max_engine_pages;
         let Some((keys, next)) = next_page(state, budget, bucket, &params, &actor, &cursor).await?
         else {
@@ -281,6 +352,7 @@ pub(crate) async fn execute_delete_phases(
         cursor = next;
         persist_page(db, job, &params, &mut c, &cursor).await;
         heartbeat(db, job.id, holder).await?;
+        super::paged::object_stall().await;
     }
 }
 
@@ -328,15 +400,16 @@ mod tests {
     /// F35: the cancel decision table. The display name is not an input.
     #[test]
     fn may_cancel_compares_principals() {
-        let admin_job = row(Principal::Admin);
+        let admin = Principal::bootstrap_admin();
+        let admin_job = row(admin.clone());
         let open_job = row(Principal::Open);
         let dana_job = row(user("AKDANA"));
         let bad = Some("{not json");
         #[rustfmt::skip]
         let table: [(&Principal, Option<&str>, bool, &str); 11] = [
-            (&Principal::Admin, Some(&admin_job), true, "admin cancels an admin job"),
-            (&Principal::Admin, Some(&dana_job), true, "admin cancels a user job"),
-            (&Principal::Admin, bad, true, "admin cancels an unreadable row"),
+            (&admin, Some(&admin_job), true, "admin cancels an admin job"),
+            (&admin, Some(&dana_job), true, "admin cancels a user job"),
+            (&admin, bad, true, "admin cancels an unreadable row"),
             (&Principal::Open, Some(&dana_job), true, "open cancels any"),
             (&user("AKDANA"), Some(&dana_job), true, "a user cancels its own"),
             (&user("AKOTHER"), Some(&dana_job), false, "a user cannot cancel another user's"),
@@ -383,10 +456,32 @@ mod tests {
         ));
     }
 
+    /// A row from a release that stored an admin with no identity does not
+    /// run unrestricted: it does not parse, and the message says why.
+    #[test]
+    fn an_old_admin_job_row_fails_with_a_clear_reason() {
+        let legacy = r#"{"prefixes":["a/"],"keys":[],"principal":{"type":"admin"}}"#;
+        let why = parse_params(legacy).unwrap_err();
+        assert!(
+            why.contains("older release") && why.contains("start the delete again"),
+            "{why}"
+        );
+    }
+
     #[test]
     fn params_round_trip_with_each_principal() {
         for principal in [
-            Principal::Admin,
+            Principal::bootstrap_admin(),
+            Principal::Admin {
+                who: AdminWho::IamKey {
+                    access_key_id: "AKADM".into(),
+                },
+                client_ip: Some("10.0.0.2".parse().unwrap()),
+            },
+            Principal::Admin {
+                who: AdminWho::User { user_id: 9 },
+                client_ip: None,
+            },
             Principal::Open,
             Principal::User {
                 access_key_id: "AK".into(),

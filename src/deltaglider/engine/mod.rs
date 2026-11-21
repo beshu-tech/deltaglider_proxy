@@ -32,6 +32,7 @@ mod delete;
 mod list;
 mod locking;
 mod metadata;
+mod plaintext_scan;
 mod raw;
 mod resources;
 mod retrieve;
@@ -50,6 +51,7 @@ pub(crate) use list::{collapse_by_delimiter, common_prefix_of, interleave_and_pa
 
 pub use locking::RefWriteProof;
 pub use metadata::{ListedPageForms, StoredForms};
+pub use plaintext_scan::{PlaintextScan, ScanScope};
 pub(crate) use resources::SpoolWait;
 pub use rewrite::{Rewritten, Unconditional};
 pub(crate) use usage::CounterPrior;
@@ -88,6 +90,12 @@ pub enum EngineError {
     #[error("InvalidArgument: {0}")]
     InvalidArgument(String),
 
+    /// A write refused the key by its write gate (`WriteOrigin`): a client
+    /// key with a reserved name, or a copy of an existing key whose name
+    /// really collides on the destination. The S3 answer is `InvalidArgument`.
+    #[error("InvalidArgument: {0}")]
+    KeyRefused(String),
+
     #[error("Service overloaded: {0}")]
     Overloaded(String),
 }
@@ -120,6 +128,7 @@ impl EngineError {
                 max: *max,
             },
             Self::InvalidArgument(s) => Self::InvalidArgument(s.clone()),
+            Self::KeyRefused(s) => Self::KeyRefused(s.clone()),
             Self::Overloaded(s) => Self::Overloaded(s.clone()),
         }
     }
@@ -203,6 +212,13 @@ pub enum RetrieveResponse {
         metadata: FileMetadata,
         /// Not applicable for streamed responses (no cache involved).
         cache_hit: Option<bool>,
+        /// The spool budget, in MiB, that this stream holds while it lives
+        /// (`NOTHING` for a stream of the backend). A body that holds some
+        /// is guarded against a stalled client
+        /// ([`crate::deltaglider::stall_guard`]), and a copy that reads it
+        /// passes it as its held budget, so it never waits for more
+        /// (hold-and-wait).
+        held_spool: crate::deltaglider::spool::HeldSpool,
     },
     /// Delta-reconstructed file buffered in memory.
     Buffered {
@@ -220,7 +236,9 @@ impl From<EngineError> for crate::api::S3Error {
             EngineError::TooLarge { size, max } => {
                 crate::api::S3Error::EntityTooLarge { size, max }
             }
-            EngineError::InvalidArgument(msg) => crate::api::S3Error::InvalidArgument(msg),
+            EngineError::InvalidArgument(msg) | EngineError::KeyRefused(msg) => {
+                crate::api::S3Error::InvalidArgument(msg)
+            }
             EngineError::Overloaded(msg) => crate::api::S3Error::SlowDown(msg),
             EngineError::Storage(e) => e.into(),
             EngineError::Codec(e) => e.into(),
@@ -365,6 +383,10 @@ mod store_plan_tests;
 /// the lock (delete-reclaim, sweep-reclaim, fast-path seed).
 #[cfg(test)]
 mod reference_lock_hold_tests;
+
+/// The boot scan: its page walk, baselines, retries and working set.
+#[cfg(test)]
+mod plaintext_scan_tests;
 
 /// The reference walk of the savings scans: a listing of the scope, and a
 /// HEAD only where a reference is.

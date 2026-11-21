@@ -502,7 +502,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let body = Bytes::copy_from_slice(data);
         // The one store that takes the object write lock itself: a caller
         // that holds it calls a method that asks for the guard.
-        let lock = self.lock_object_write(bucket, key).await;
+        let lock = self
+            .lock_object_write(bucket, key, crate::types::WriteOrigin::Client)
+            .await;
         self.store_inner(
             &lock,
             bucket,
@@ -599,10 +601,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<StoreResult, EngineError> {
         // The data PUT's ingest gate (reserved namespaces, `//`), minus its
         // refusal of marker keys.
+        self.gate_marker(lock)?;
         let obj_key = ObjectKey::parse(bucket, key);
-        obj_key
-            .validate_ingest()
-            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
         let deltaspace_id = obj_key.deltaspace_id();
         lock.covers(bucket, &deltaspace_id, &obj_key.filename)?;
         let prior = self.prior_or_read(bucket, key, known_prior).await;
@@ -1319,6 +1319,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                             put.deltaspace_id,
                             &ref_meta.file_sha256,
                             body,
+                            super::retrieve::Charge::None,
                         )
                     })
                     .await
@@ -2475,7 +2476,9 @@ mod counter_tests {
         tokio::fs::write(spool.path(), data).await.unwrap();
         h.engine
             .store_spooled_delta(
-                &h.engine.lock_object_write(BUCKET, key).await,
+                &h.engine
+                    .lock_object_write(BUCKET, key, crate::types::WriteOrigin::Client)
+                    .await,
                 BUCKET,
                 key,
                 &spool,
@@ -2498,7 +2501,9 @@ mod counter_tests {
         let parts: Vec<RelayPart> = paths.iter().map(|p| RelayPart::of_file(p)).collect();
         h.engine
             .store_passthrough_relayed_parts_with_multipart_etag(
-                &h.engine.lock_object_write(BUCKET, key).await,
+                &h.engine
+                    .lock_object_write(BUCKET, key, crate::types::WriteOrigin::Client)
+                    .await,
                 BUCKET,
                 key,
                 &parts,
@@ -2604,7 +2609,9 @@ mod no_delta_hint_tests {
         let r = h
             .engine
             .store_spooled_delta(
-                &h.engine.lock_object_write(BUCKET, "rel/v3.zip").await,
+                &h.engine
+                    .lock_object_write(BUCKET, "rel/v3.zip", crate::types::WriteOrigin::Client)
+                    .await,
                 BUCKET,
                 "rel/v3.zip",
                 &spool,
@@ -2744,7 +2751,9 @@ mod spool_budget_tests {
                 .await
                 .unwrap();
             tokio::fs::write(body.path(), data).await.unwrap();
-            let lock = engine.lock_object_write("b", key).await;
+            let lock = engine
+                .lock_object_write("b", key, crate::types::WriteOrigin::Client)
+                .await;
             let put = engine.store_spooled_delta(
                 &lock,
                 "b",
@@ -2803,7 +2812,9 @@ mod delta_ceiling_tests {
                 .await
                 .unwrap();
             tokio::fs::write(body.path(), data).await.unwrap();
-            let lock = engine.lock_object_write("b", key).await;
+            let lock = engine
+                .lock_object_write("b", key, crate::types::WriteOrigin::Client)
+                .await;
             engine
                 .store_spooled_delta(
                     &lock,
@@ -3073,8 +3084,12 @@ mod review2_tests {
         tokio::fs::write(body_a.path(), &v).await.unwrap();
         tokio::fs::write(body_b.path(), &v).await.unwrap();
         let (lock_a, lock_b) = (
-            engine.lock_object_write("b", "x/a.zip").await,
-            engine.lock_object_write("b", "y/b.zip").await,
+            engine
+                .lock_object_write("b", "x/a.zip", crate::types::WriteOrigin::Client)
+                .await,
+            engine
+                .lock_object_write("b", "y/b.zip", crate::types::WriteOrigin::Client)
+                .await,
         );
         let a = engine.store_spooled_delta(
             &lock_a,
@@ -3150,7 +3165,9 @@ mod review2_tests {
         {
             let (engine, size) = (&engine, v.len() as u64);
             let put = move |key: &'static str, body| async move {
-                let lock = engine.lock_object_write("b", key).await;
+                let lock = engine
+                    .lock_object_write("b", key, crate::types::WriteOrigin::Client)
+                    .await;
                 engine
                     .store_spooled_delta(
                         &lock,
@@ -3184,7 +3201,9 @@ mod review2_tests {
         tokio::fs::write(body.path(), &v).await.unwrap();
         engine
             .store_spooled_delta(
-                &engine.lock_object_write("b", "x/a.png").await,
+                &engine
+                    .lock_object_write("b", "x/a.png", crate::types::WriteOrigin::Client)
+                    .await,
                 "b",
                 "x/a.png",
                 &body,
@@ -3268,7 +3287,9 @@ mod review2_tests {
                 .await
                 .unwrap();
             tokio::fs::write(spool.path(), body).await.unwrap();
-            let lock = engine.lock_object_write("b", key).await;
+            let lock = engine
+                .lock_object_write("b", key, crate::types::WriteOrigin::Client)
+                .await;
             engine
                 .store_spooled_delta(
                     &lock,
@@ -3357,7 +3378,9 @@ mod review2_tests {
         let part = RelayPart::of_file(&path);
         let (engine_ref, part_ref, size) = (&engine, &part, v.len() as u64);
         let store = move || async move {
-            let lock = engine_ref.lock_object_write("b", "x/a.png").await;
+            let lock = engine_ref
+                .lock_object_write("b", "x/a.png", crate::types::WriteOrigin::Client)
+                .await;
             engine_ref
                 .store_passthrough_relayed_parts_with_multipart_etag(
                     &lock,
@@ -3480,7 +3503,9 @@ mod other_form_tests {
         tokio::fs::write(spool.path(), &v2).await.unwrap();
         engine
             .store_spooled_delta(
-                &engine.lock_object_write("b", "img/s.jpg").await,
+                &engine
+                    .lock_object_write("b", "img/s.jpg", crate::types::WriteOrigin::Client)
+                    .await,
                 "b",
                 "img/s.jpg",
                 &spool,
@@ -3496,7 +3521,9 @@ mod other_form_tests {
         tokio::fs::write(relay.path(), &v1).await.unwrap();
         engine
             .store_passthrough_relayed_parts_with_multipart_etag(
-                &engine.lock_object_write("b", "img/c.jpg").await,
+                &engine
+                    .lock_object_write("b", "img/c.jpg", crate::types::WriteOrigin::Client)
+                    .await,
                 "b",
                 "img/c.jpg",
                 &[RelayPart::of_file(relay.path())],

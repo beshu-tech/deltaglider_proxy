@@ -9,6 +9,9 @@ pub(super) async fn create_multipart_upload(
     svc: &DeltaGliderS3Service,
     req: s3s::S3Request<s3s::dto::CreateMultipartUploadInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateMultipartUploadOutput>> {
+    let owner = crate::iam::principal_id(
+        crate::iam::request_principal(&req.extensions).map(|u| u.as_ref()),
+    );
     let input = req.input;
     // Earliest reject: refusing at create saves the client uploading the
     // parts at all (403-before-404).
@@ -18,12 +21,13 @@ pub(super) async fn create_multipart_upload(
     // The key rule of PutObject, at create: a refused key (`.dg` segment, `//`,
     // `.delta` name, folder marker) fails here, not after all parts.
     crate::types::ObjectKey::parse(&input.bucket, &input.key)
-        .validate_data_ingest()
+        .validate_data_ingest(crate::types::WriteOrigin::Client)
         .map_err(|e| {
             s3s::S3Error::from(crate::api::errors::S3Error::InvalidArgument(e.to_string()))
         })?;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
-    let upload_id = svc.state.multipart.create(
+    let upload_id = svc.state.multipart.create_for(
+        &owner,
         &input.bucket,
         &input.key,
         input.content_type.clone(),
@@ -438,7 +442,9 @@ async fn adopt_landed_completion(
         requested_parts,
     )?;
     let engine = state.engine.load_full();
-    let _lock = engine.lock_object_write(&input.bucket, &input.key).await;
+    let _lock = engine
+        .lock_object_write(&input.bucket, &input.key, crate::types::WriteOrigin::Client)
+        .await;
     let meta = engine.head(&input.bucket, &input.key).await.ok()?;
     let own = meta.etag().trim_matches('"') == expected.trim_matches('"')
         && meta
@@ -497,7 +503,12 @@ async fn judge_joiner(
         if_none_match: input.if_none_match.clone(),
     };
     let _checked = engine
-        .lock_and_check(&input.bucket, &input.key, &precondition)
+        .lock_and_check(
+            &input.bucket,
+            &input.key,
+            &precondition,
+            crate::types::WriteOrigin::Client,
+        )
         .await
         .map_err(s3s::S3Error::from)?;
     Ok(())
@@ -522,6 +533,10 @@ pub(super) async fn list_multipart_uploads(
     req: s3s::S3Request<s3s::dto::ListMultipartUploadsInput>,
 ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListMultipartUploadsOutput>> {
     let list_scope = req.extensions.get::<ListScope>().cloned();
+    let rules = req
+        .extensions
+        .get::<crate::admission::ResourceRules>()
+        .cloned();
     let input = req.input;
     crate::api::handlers::ensure_bucket_exists(&svc.state, &input.bucket).await?;
     // `max-uploads=0` lists no upload and says 0, as `max-keys=0` does.
@@ -529,11 +544,15 @@ pub(super) async fn list_multipart_uploads(
     let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     // A bucket-level LIST like ListObjects: a Filtered caller sees only the
     // uploads of keys it may list.
-    let visible = |key: &str| match &list_scope {
-        Some(ListScope::Filtered { user, context }) => {
-            crate::iam::permissions::user_can_see_listed_key(user, &input.bucket, key, context)
-        }
-        _ => true,
+    let bucket_rules = rules.as_ref().map(|r| r.in_bucket(&input.bucket));
+    let visible = |key: &str| {
+        let by_policy = match &list_scope {
+            Some(ListScope::Filtered { user, context }) => {
+                crate::iam::permissions::user_can_see_listed_key(user, &input.bucket, key, context)
+            }
+            _ => true,
+        };
+        by_policy && bucket_rules.as_ref().is_none_or(|r| r.lists_key(key))
     };
     let (uploads, is_truncated, next_key, next_upload_id) = if max_uploads == 0 {
         (Vec::new(), false, String::new(), String::new())
@@ -882,7 +901,7 @@ mod multipart_cost_tests {
         let lock = state
             .engine
             .load()
-            .lock_object_write("b", "a/photo.jpg")
+            .lock_object_write("b", "a/photo.jpg", crate::types::WriteOrigin::Client)
             .await;
         let owner = tokio::spawn({
             let (svc, input) = (svc.clone(), input(true));
@@ -1023,7 +1042,7 @@ mod multipart_cost_tests {
         let lock = state
             .engine
             .load()
-            .lock_object_write("b", "a/photo.jpg")
+            .lock_object_write("b", "a/photo.jpg", crate::types::WriteOrigin::Client)
             .await;
         let owner = tokio::spawn({
             let (svc, input) = (svc.clone(), complete_input(&id, &etag, false));
@@ -1107,7 +1126,7 @@ mod multipart_cost_tests {
         let lock = state
             .engine
             .load()
-            .lock_object_write("b", "a/photo.jpg")
+            .lock_object_write("b", "a/photo.jpg", crate::types::WriteOrigin::Client)
             .await;
         let owner = tokio::spawn({
             let (svc, input) = (svc.clone(), complete_input(&id, &etag, false));
@@ -1335,7 +1354,9 @@ mod multipart_cost_tests {
                 let (s3s::dto::ETag::Strong(v) | s3s::dto::ETag::Weak(v)) =
                     done.output.e_tag.clone().unwrap();
                 let engine = state.engine.load_full();
-                let lock = engine.lock_object_write("b", "a/photo.jpg").await;
+                let lock = engine
+                    .lock_object_write("b", "a/photo.jpg", crate::types::WriteOrigin::Client)
+                    .await;
                 engine
                     .store_with_multipart_etag(
                         &lock,

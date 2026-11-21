@@ -8,6 +8,18 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// The bucket that a peer address counts under, THE rule of every per-peer
+/// count (the listener's connection cap, the S3 limiter by key id, the
+/// per-address admin limits): an IPv4 address, also in its IPv4-mapped IPv6
+/// form, counts by itself; an IPv6 address counts by its /64, because one
+/// IPv6 client owns a whole /64 and has a new address for each connection.
+pub fn peer_bucket(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+        v4 => v4,
+    }
+}
+
 /// Constant-time equality for secrets of unequal length.
 ///
 /// `subtle::ConstantTimeEq` on two slices short-circuits on a length
@@ -20,6 +32,20 @@ pub fn secret_eq(a: &[u8], b: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
     use subtle::ConstantTimeEq;
     Sha256::digest(a).ct_eq(&Sha256::digest(b)).into()
+}
+
+/// A secret that no client knows: random per process, never logged. The
+/// signature check of an unknown, disabled or mismatched access key id runs
+/// against it, so it fails like a wrong secret of a known key and the answer
+/// does not tell which key ids exist.
+pub fn unmatchable_secret() -> &'static str {
+    static SECRET: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use rand::Rng;
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill(&mut bytes);
+        hex::encode(bytes)
+    });
+    SECRET.as_str()
 }
 
 /// What an outbound URL is going to be used for. Drives policy:
@@ -769,6 +795,22 @@ pub fn redact_uri_for_log(uri: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn peers_count_by_address_and_by_ipv6_64() {
+        use super::peer_bucket;
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        assert_eq!(peer_bucket(ip("192.0.2.7")), ip("192.0.2.7"));
+        assert_eq!(peer_bucket(ip("::ffff:192.0.2.7")), ip("192.0.2.7"));
+        let a = peer_bucket(ip("2001:db8:1:2:aaaa:bbbb:cccc:dddd"));
+        assert_eq!(a, peer_bucket(ip("2001:db8:1:2:1:2:3:4")), "one /64");
+        assert_ne!(a, peer_bucket(ip("2001:db8:1:3::1")), "another /64");
+        assert_ne!(
+            peer_bucket(ip("192.0.2.7")),
+            peer_bucket(ip("192.0.2.8")),
+            "IPv4 counts per address"
+        );
+    }
+
     #[test]
     fn unknown_access_key_label_never_contains_the_value() {
         use super::unknown_access_key_label;

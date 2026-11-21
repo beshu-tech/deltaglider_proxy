@@ -1628,6 +1628,7 @@ async fn plan_action(
                     upload_concurrency: None,
                     keep_created_at: true,
                     commit_count: &crate::maintenance::gate::BY_ADMISSION,
+                    origin: crate::types::WriteOrigin::Job,
                 },
             )
             .await

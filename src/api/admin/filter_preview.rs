@@ -277,6 +277,7 @@ pub async fn filter_preview(
                         &req.prefix,
                         None,
                         None,
+                        None,
                         limit,
                         budget,
                     )

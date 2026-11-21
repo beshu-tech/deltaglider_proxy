@@ -380,12 +380,21 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
         .unwrap();
     assert_eq!(r.status(), 422);
 
-    // 4. With the CA, the provider works.
+    // 4. With the CA, the provider works. A new network policy is a new
+    // destination: without a secret in the request the stored one is cleared.
+    let policy = json!({ "allow_local": true, "ca_cert_path": ca_path.display().to_string() });
     let r = admin
         .put(format!("{providers}/{id}"))
-        .json(&json!({ "extra_config": {
-            "allow_local": true, "ca_cert_path": ca_path.display().to_string()
-        } }))
+        .json(&json!({ "extra_config": policy }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let updated: Value = r.json().await.unwrap();
+    assert!(updated["client_secret"].is_null(), "{updated}");
+    let r = admin
+        .put(format!("{providers}/{id}"))
+        .json(&json!({ "extra_config": policy, "client_secret": CLIENT_SECRET }))
         .send()
         .await
         .unwrap();

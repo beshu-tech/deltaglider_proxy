@@ -583,6 +583,9 @@ async fn first_baseline_across_two_instances_makes_one_reference() {
 /// dir is empty and every op succeeds alone.
 #[tokio::test]
 async fn spool_budget_under_concurrent_streaming_ops_returns_to_zero() {
+    // One principal fires 16 PUTs and 16 GETs at a 24 MiB budget: what is over its reach
+    // (75 % of the budget in downloads) or over the budget is 503 SlowDown, by design.
+    common::expect_server_errors("a storm over the spool budget answers 503 SlowDown");
     let spool_dir = tempfile::TempDir::new().unwrap();
     const MIB: usize = 1024 * 1024;
     let server = TestServer::builder()

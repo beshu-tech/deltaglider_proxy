@@ -110,15 +110,23 @@ the IP address that opened them.
 
 More operational notes:
 
-- **Client IP addresses.** The router adds an `X-Forwarded-For` header to every
-  request. The operator sets `DGP_TRUST_PROXY_HEADERS=true` on the proxy pods, and it
+- **Client IP addresses.** The router deletes the `X-Forwarded-For`, `Forwarded` and
+  `X-Real-IP` headers that a client sent, and then adds its own `X-Forwarded-For`
+  header to every request. The router is therefore the only writer of that header,
+  and a client cannot name another address. If a trusted layer-7 hop (for example an
+  Ingress controller or a CDN that you run) sits in front of the router and sets the
+  client address for you, set `spec.router.trustClientForwardedFor: true`: the router
+  then keeps the headers that arrive and appends the address of its own peer. Never
+  set it when clients can reach the router directly. The operator sets `DGP_TRUST_PROXY_HEADERS=true` on the proxy pods, and it
   sets `DGP_TRUSTED_PROXY_CIDRS` to `spec.router.trustedProxyCidrs`. The proxy reads
   `X-Forwarded-For` only on a connection from one of those networks, so rate limits,
   `aws:SourceIp` permission conditions, and the IP binding of admin sessions see the
   real client address instead of the router's address. The operator cannot read the
   pod network of the cluster, so the default is every private range (`10.0.0.0/8`,
   `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `fc00::/7`). Any pod in those
-  ranges can name a client, so set `trustedProxyCidrs` to your pod CIDR. If
+  ranges can name a client, so set `trustedProxyCidrs` to your pod CIDR. With the
+  default, the proxy also leaves every client in those ranges out of its per-address
+  connection limit (`DGP_MAX_CONNECTIONS_PER_IP`). If
   untrusted workloads share the cluster network, also set
   `spec.router.networkPolicy: true`, so that only the router can reach the proxy pods.
 - **Scaling down keeps the volumes.** The operator never deletes a pod's persistent
@@ -202,6 +210,7 @@ spec:
     replicas: 2                # number of HAProxy pods (default 2; they are stateless)
     image: haproxy:3.0-alpine  # default
     trustedProxyCidrs: ["10.42.0.0/16"]  # the pod network (default: every private range)
+    trustClientForwardedFor: false  # keep the client's own forwarding headers (default false)
     networkPolicy: true        # proxy pods accept only router connections (default false)
   service:
     type: LoadBalancer         # default ClusterIP

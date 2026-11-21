@@ -100,6 +100,8 @@ pub fn part_charge(size: u64) -> u64 {
 struct Admitted {
     total: u64,
     by_upload: HashMap<String, u64>,
+    /// By the principal that sends the part (not the upload's creator).
+    by_payer: HashMap<String, u64>,
 }
 
 impl Admitted {
@@ -107,18 +109,29 @@ impl Admitted {
         self.by_upload.get(upload_id).copied().unwrap_or(0)
     }
 
-    fn add(&mut self, upload_id: &str, charge: u64) {
-        self.total = self.total.saturating_add(charge);
-        *self.by_upload.entry(upload_id.to_string()).or_default() += charge;
+    fn of_payer(&self, payer: &str) -> u64 {
+        self.by_payer.get(payer).copied().unwrap_or(0)
     }
 
-    fn release(&mut self, upload_id: &str, charge: u64) {
+    fn add(&mut self, upload_id: &str, payer: &str, charge: u64) {
+        self.total = self.total.saturating_add(charge);
+        *self.by_upload.entry(upload_id.to_string()).or_default() += charge;
+        *self.by_payer.entry(payer.to_string()).or_default() += charge;
+    }
+
+    fn release(&mut self, upload_id: &str, payer: &str, charge: u64) {
         self.total = self.total.saturating_sub(charge);
-        if let Some(held) = self.by_upload.get_mut(upload_id) {
-            *held = held.saturating_sub(charge);
-            if *held == 0 {
-                self.by_upload.remove(upload_id);
-            }
+        subtract_entry(&mut self.by_upload, upload_id, charge);
+        subtract_entry(&mut self.by_payer, payer, charge);
+    }
+}
+
+/// Take `charge` off the entry of `name`; an entry at zero is removed.
+fn subtract_entry(map: &mut HashMap<String, u64>, name: &str, charge: u64) {
+    if let Some(held) = map.get_mut(name) {
+        *held = held.saturating_sub(charge);
+        if *held == 0 {
+            map.remove(name);
         }
     }
 }
@@ -130,13 +143,19 @@ impl Admitted {
 pub struct AdmittedPart {
     admitted: Arc<parking_lot::Mutex<Admitted>>,
     upload_id: String,
+    /// The principal of the request that sends the part.
+    payer: String,
     charge: u64,
 }
 
 impl AdmittedPart {
     /// Release the charge under the caller's lock of `admitted`.
     fn release_in(&mut self, admitted: &mut Admitted) {
-        admitted.release(&self.upload_id, std::mem::take(&mut self.charge));
+        admitted.release(
+            &self.upload_id,
+            &self.payer,
+            std::mem::take(&mut self.charge),
+        );
     }
 }
 
@@ -144,7 +163,9 @@ impl Drop for AdmittedPart {
     fn drop(&mut self) {
         if self.charge > 0 {
             let charge = std::mem::take(&mut self.charge);
-            self.admitted.lock().release(&self.upload_id, charge);
+            self.admitted
+                .lock()
+                .release(&self.upload_id, &self.payer, charge);
         }
     }
 }
@@ -161,6 +182,9 @@ struct PartData {
     md5_raw: [u8; 16],
     size: u64,
     uploaded_at: DateTime<Utc>,
+    /// The principal of the request that sent the part: its relay bytes
+    /// count against that principal's share until the part is dropped.
+    payer: String,
 }
 
 impl PartData {
@@ -215,6 +239,9 @@ pub(crate) const UPLOAD_ID_METADATA_KEY: &str = "dg-mpu-upload-id";
 /// State for an in-progress multipart upload
 struct MultipartUpload {
     upload_id: String,
+    /// The principal that created the upload ([`crate::iam::principal_id`]):
+    /// the upload counts against that principal's share of the open uploads.
+    owner: String,
     bucket: String,
     key: String,
     created_at: DateTime<Utc>,
@@ -342,6 +369,28 @@ struct ValidatedParts {
 /// Overridable via `DGP_MAX_MULTIPART_UPLOADS` env var.
 fn default_max_uploads() -> usize {
     crate::config::env_parse_with_default("DGP_MAX_MULTIPART_UPLOADS", 1000)
+}
+
+/// Env var: a principal's share of the open uploads and of the part bytes
+/// (percent, 1-100): see [`crate::budget_share`].
+pub const PRINCIPAL_SHARE_ENV: &str = "DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT";
+
+/// The 503 of a principal that reached its own limit: the message says that
+/// the limit is the caller's, so an operator does not look for a full proxy.
+fn own_limit_error(detail: String) -> S3Error {
+    S3Error::SlowDown(format!("This is your own limit, not the proxy's: {detail}"))
+}
+
+/// The limits of the open-upload count for `max_uploads` and a share of
+/// `percent`: at least one upload.
+pub fn upload_shares(max_uploads: usize, percent: u8) -> crate::budget_share::Shares {
+    crate::budget_share::Shares::new(max_uploads as u64, percent, 1)
+}
+
+/// The limits of the part bytes for a global cap of `total_cap` bytes: at
+/// least one part ([`part_charge`] of one byte).
+pub fn byte_shares(total_cap: u64, percent: u8) -> crate::budget_share::Shares {
+    crate::budget_share::Shares::new(total_cap, percent, part_charge(1))
 }
 
 /// TTL before an idle (no recent UploadPart activity) multipart upload is
@@ -577,6 +626,13 @@ pub struct MultipartStore {
     /// adapter refreshes it from the live engine on every part and complete.
     max_object_size: std::sync::atomic::AtomicU64,
     max_uploads: usize,
+    /// `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT` (1-100): see
+    /// [`crate::budget_share`].
+    principal_share_percent: u8,
+    /// The part bytes ([`part_charge`]) that the kept parts hold, by the
+    /// principal that sent each part, changed under the same lock as
+    /// `in_flight_bytes`.
+    payer_bytes: parking_lot::Mutex<HashMap<String, u64>>,
     /// The spool budget that the kept parts of all uploads hold, in bytes:
     /// the sum of [`part_charge`] of every `MultipartUpload.parts[*]`,
     /// updated under the same write lock that mutates the parts map.
@@ -612,6 +668,10 @@ impl MultipartStore {
             completions: parking_lot::Mutex::new(HashMap::new()),
             max_object_size: std::sync::atomic::AtomicU64::new(max_object_size),
             max_uploads: default_max_uploads(),
+            principal_share_percent: crate::config::tuning::multipart_principal_share_percent(
+                &crate::config::process_env,
+            ),
+            payer_bytes: Default::default(),
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
             admitted: Default::default(),
             max_total_configured: crate::config::env_parse::<u64>(MAX_TOTAL_MULTIPART_ENV),
@@ -632,13 +692,20 @@ impl MultipartStore {
         self
     }
 
+    /// Override `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT` (1-100; 100 = no shares).
+    pub fn with_principal_share(mut self, percent: u8) -> Self {
+        self.principal_share_percent = percent.clamp(1, 100);
+        self
+    }
+
     /// Override `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` (`Some(0)` = no cap).
     pub fn with_relay_upload_max(mut self, configured: Option<u64>) -> Self {
         self.relay_upload_max = configured;
         self
     }
 
-    /// Test-only constructor with custom caps. Not part of the stable API.
+    /// Test-only constructor with custom caps and no shares (one principal may
+    /// use a whole cap; `with_principal_share` sets one). Not part of the stable API.
     #[cfg(test)]
     pub(crate) fn new_for_test(
         max_object_size: u64,
@@ -650,6 +717,7 @@ impl MultipartStore {
             max_total_configured: Some(max_total_multipart_bytes),
             idle_ttl,
             relay_upload_max: None,
+            principal_share_percent: 100,
             ..Self::new(max_object_size)
         }
     }
@@ -684,10 +752,24 @@ impl MultipartStore {
         max_total_multipart_bytes(self.spool.max_bytes(), self.max_total_configured)
     }
 
-    /// Create a new multipart upload, returns the upload ID.
-    /// Returns `S3Error::SlowDown` if the maximum number of concurrent uploads is reached.
-    pub fn create(
+    /// [`Self::create_for`] with a fixed test principal.
+    #[cfg(test)]
+    pub(crate) fn create(
         &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+    ) -> Result<String, S3Error> {
+        self.create_for("test-owner", bucket, key, content_type, user_metadata)
+    }
+
+    /// Create a new multipart upload for `owner` ([`crate::iam::principal_id`]),
+    /// returns the upload ID. `S3Error::SlowDown` when the process-wide cap
+    /// of open uploads is reached, or when `owner` holds its share of it.
+    pub fn create_for(
+        &self,
+        owner: &str,
         bucket: &str,
         key: &str,
         content_type: Option<String>,
@@ -702,6 +784,22 @@ impl MultipartStore {
 
         let mut uploads = self.uploads.write();
 
+        // The caller's own share first, so the error names the right limit.
+        let shares = upload_shares(self.max_uploads, self.principal_share_percent);
+        let own = uploads.values().filter(|u| u.owner == owner).count() as u64;
+        if !shares.admits(own, uploads.len() as u64, 1, false) {
+            return Err(own_limit_error(format!(
+                "you have {own} open multipart uploads and the others have {}; one principal \
+                 may hold {} on its own, or up to {} while all uploads together stay within \
+                 that ({PRINCIPAL_SHARE_ENV} is {} percent of {}); complete or abort some of \
+                 your uploads",
+                uploads.len() as u64 - own,
+                shares.own_cap(),
+                shares.shared_cap(),
+                self.principal_share_percent,
+                self.max_uploads
+            )));
+        }
         // Enforce maximum concurrent uploads to prevent resource exhaustion
         if uploads.len() >= self.max_uploads {
             return Err(S3Error::SlowDown(format!(
@@ -712,6 +810,7 @@ impl MultipartStore {
 
         let upload = MultipartUpload {
             upload_id: upload_id.clone(),
+            owner: owner.to_string(),
             bucket: bucket.to_string(),
             key: key.to_string(),
             created_at: now,
@@ -736,6 +835,7 @@ impl MultipartStore {
     /// the caps from now on, while it streams ([`PartAdmission`]).
     pub fn admit_part(
         &self,
+        payer: &str,
         upload_id: &str,
         bucket: &str,
         key: &str,
@@ -748,9 +848,9 @@ impl MultipartStore {
         // Check and count under one lock: two parallel parts cannot both
         // pass a cap that only one of them fits.
         let mut admitted = self.admitted.lock();
-        self.check_part_caps(upload, &admitted, part_number, declared)?;
+        self.check_part_caps(upload, &admitted, payer, part_number, declared)?;
         let charge = part_charge(declared);
-        admitted.add(upload_id, charge);
+        admitted.add(upload_id, payer, charge);
         Ok(PartAdmission {
             held_spool: crate::deltaglider::spool::HeldSpool::of_all(
                 upload.parts.values().map(|p| &p.budget),
@@ -758,6 +858,7 @@ impl MultipartStore {
             part: AdmittedPart {
                 admitted: self.admitted.clone(),
                 upload_id: upload_id.to_string(),
+                payer: payer.to_string(),
                 charge,
             },
         })
@@ -820,6 +921,7 @@ impl MultipartStore {
             md5_raw,
             size,
             uploaded_at: Utc::now(),
+            payer: admission.part.payer.clone(),
         };
         let etag = format!("\"{}\"", part.md5_hex);
         match self.insert_part(upload_id, bucket, key, part_number, part, admission.part) {
@@ -863,10 +965,12 @@ impl MultipartStore {
             Ok(upload) => upload,
             Err(e) => return Err((e, part)),
         };
-        let delta = match self.check_part_caps(upload, &admitted, part_number, part.size) {
+        let payer = part.payer.clone();
+        let delta = match self.check_part_caps(upload, &admitted, &payer, part_number, part.size) {
             Ok(delta) => delta,
             Err(e) => return Err((e, part)),
         };
+        let charge = part_charge(part.size);
         // Overwrite semantics: re-uploading same part_number replaces previous data.
         let replaced = upload.parts.insert(part_number, part);
         upload.last_activity = Utc::now();
@@ -879,6 +983,12 @@ impl MultipartStore {
             self.in_flight_bytes
                 .fetch_sub((-delta) as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        // The replaced part's payer gets its bytes back, the new part's pays.
+        let mut payers = self.payer_bytes.lock();
+        if let Some(old) = &replaced {
+            subtract_entry(&mut payers, &old.payer, part_charge(old.size));
+        }
+        *payers.entry(payer).or_default() += charge;
         Ok(replaced)
     }
 
@@ -899,10 +1009,12 @@ impl MultipartStore {
         &self,
         upload: &MultipartUpload,
         admitted: &Admitted,
+        payer: &str,
         part_number: u32,
         size: u64,
     ) -> Result<i64, S3Error> {
-        let old_part_size = upload.parts.get(&part_number).map(|p| p.size);
+        let old_part = upload.parts.get(&part_number);
+        let old_part_size = old_part.map(|p| p.size);
         let others = upload
             .parts
             .values()
@@ -923,13 +1035,40 @@ impl MultipartStore {
         let charge = part_charge(size);
         let old_charge = old_part_size.map_or(0, part_charge);
         let delta: i64 = charge as i64 - old_charge as i64;
-        if delta > 0 {
-            let new_total = self
+        // A part that only shrinks the payer's own holding is never refused for it.
+        let same_payer = old_part.is_some_and(|p| p.payer == payer);
+        if delta > 0 || (old_part.is_some() && !same_payer) {
+            let cap = self.max_total_multipart_bytes();
+            let shares = byte_shares(cap, self.principal_share_percent);
+            // What the payer and everyone hold, without the part this one replaces.
+            let payers = self.payer_bytes.lock();
+            let own_held = payers
+                .get(payer)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(admitted.of_payer(payer))
+                .saturating_sub(if same_payer { old_charge } else { 0 });
+            drop(payers);
+            let total_held = self
                 .in_flight_bytes
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .saturating_add(admitted.total)
-                .saturating_add(delta as u64);
-            let cap = self.max_total_multipart_bytes();
+                .saturating_sub(old_charge);
+            if !shares.admits(own_held, total_held, charge, false) {
+                return Err(own_limit_error(format!(
+                    "your multipart parts would hold {} bytes of spool budget and all uploads \
+                     hold {total_held} bytes; one principal may hold {} bytes on its own, or \
+                     up to {} bytes while all parts together stay within that \
+                     ({PRINCIPAL_SHARE_ENV} is {} percent of {MAX_TOTAL_MULTIPART_ENV}; each \
+                     part holds whole MiB, at least one); complete or abort some of your \
+                     uploads",
+                    own_held.saturating_add(charge),
+                    shares.own_cap(),
+                    shares.shared_cap(),
+                    self.principal_share_percent,
+                )));
+            }
+            let new_total = total_held.saturating_add(charge);
             if new_total > cap {
                 let origin = if self.max_total_configured.is_some() {
                     "set explicitly".to_string()
@@ -1368,6 +1507,10 @@ impl MultipartStore {
         if freed > 0 {
             self.in_flight_bytes
                 .fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+            let mut payers = self.payer_bytes.lock();
+            for part in upload.parts.values() {
+                subtract_entry(&mut payers, &part.payer, part_charge(part.size));
+            }
         }
         freed
     }

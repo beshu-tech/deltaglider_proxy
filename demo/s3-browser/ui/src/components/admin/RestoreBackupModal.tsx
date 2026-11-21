@@ -35,7 +35,7 @@ const MODES: { mode: ImportBackupMode; label: string; help: string; iam: boolean
   {
     mode: 'full',
     label: 'Everything, including the admin password',
-    help: "Everything in the backup. This instance takes the backup's admin password, unless DGP_BOOTSTRAP_PASSWORD_HASH sets it.",
+    help: "Everything in the backup. This instance takes the backup's admin password, unless DGP_BOOTSTRAP_PASSWORD_HASH sets it or this session did not sign in with the bootstrap password.",
     iam: true,
   },
 ];

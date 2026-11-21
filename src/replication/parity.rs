@@ -3350,6 +3350,7 @@ mod request_count_tests {
                 upload_concurrency: None,
                 keep_created_at: true,
                 commit_count: &crate::maintenance::gate::NO_GATE_FOR_TEST,
+                origin: crate::types::WriteOrigin::Job,
             },
         )
         .await

@@ -40,8 +40,8 @@ use transition::requires_restart_warnings;
 pub(crate) use transition::{apply_config_transition, TransitionCtx};
 pub use version::install_version_key as install_config_version_key;
 pub(crate) use write::{
-    run_internal, run_internal_held, HeldRefusal, Internal, InternalRefusal, OnPersistError,
-    RESTORE_ROLLBACK_ACTION,
+    frozen_check, put_back_config, run_internal, run_internal_held, HeldRefusal, Internal,
+    InternalRefusal, OnPersistError,
 };
 
 /// Names of the four sections the admin API understands. Canonical
@@ -1052,6 +1052,36 @@ pub async fn sync_status(
     Ok(Json(SyncStatusResponse {
         status: sync.status(),
         sync_generation,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct SyncFloorResetResponse {
+    /// The generation floor that this call dropped (`0`: there was none).
+    dropped_floor: i64,
+    status: String,
+}
+
+/// POST /api/admin/config/sync-floor/reset: the operator's reset of this instance's
+/// generation floor and merge base for its sync target. Audited; 404 without a sync bucket.
+pub async fn reset_sync_floor(
+    State(state): State<Arc<AdminState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<SyncFloorResetResponse>, AdminError> {
+    let sync = state.config_sync.as_ref().ok_or_else(no_sync_bucket)?;
+    let dropped_floor = sync
+        .reset_generation_floor()
+        .await
+        .map_err(AdminError::internal)?;
+    super::audit_log(
+        "config_sync_floor_reset",
+        "admin",
+        &format!("dropped floor {dropped_floor}"),
+        &headers,
+    );
+    Ok(Json(SyncFloorResetResponse {
+        dropped_floor,
+        status: "The floor and the merge base are gone. Call sync-now to pull the bucket.".into(),
     }))
 }
 

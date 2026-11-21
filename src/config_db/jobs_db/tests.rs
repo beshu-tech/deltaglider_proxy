@@ -242,7 +242,7 @@ fn a_new_node_merges_an_old_peer_copy_and_ignores_its_job_rows() {
     let peer_path = n.config_path.with_file_name("peer.db");
     drop(old_release_config_db(&peer_path));
 
-    config.merge_iam_from(&peer_path, None, KEY).unwrap();
+    config.merge_iam_from(&peer_path, None, KEY, 0).unwrap();
     let mut names: Vec<String> = config
         .load_users()
         .unwrap()
@@ -287,7 +287,7 @@ fn an_old_node_merges_a_new_copy_and_keeps_its_job_rows() {
         let old = ConfigDb::open_or_create(&old_path, KEY).unwrap();
         seed_old_release_job_rows(&old);
         let before = job_rows(&old.conn);
-        old.merge_iam_from(remote, None, KEY).unwrap();
+        old.merge_iam_from(remote, None, KEY, 0).unwrap();
         let mut names: Vec<String> = old
             .load_users()
             .unwrap()

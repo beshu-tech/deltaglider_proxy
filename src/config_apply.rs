@@ -169,8 +169,18 @@ impl ConfigMutator {
         // The engine that serves `rollback`: put back as is if the engine
         // rollback below cannot rebuild it.
         let rollback_engine = self.app.engine.load_full();
-        let mut new_cfg = rollback.clone();
-        mutate(&mut new_cfg);
+        // The writer edits a masked view (config::env_mask); it is the server's own
+        // (the migrate job), so it may end its `__dgmigrate_*` routes.
+        let view = crate::config::env_mask::MaskedView::of(&rollback, true)
+            .map_err(|e| format!("config change refused ({context}): {}", e.message()))?;
+        let mut edited = view.config.clone();
+        mutate(&mut edited);
+        let new_cfg = view
+            .finish(edited)
+            .map_err(|e| format!("config change refused ({context}): {}", e.message()))?;
+        new_cfg
+            .check_persistable()
+            .map_err(|e| format!("config change refused ({context}): {e}"))?;
         // On Err nothing changed: the old config and engine keep serving.
         apply_config_transition(ctx(), &mut cfg, new_cfg)
             .await
@@ -372,5 +382,86 @@ mod tests {
             engine_identity.starts_with(cfg_backend.as_deref().unwrap_or("?")),
             "config routes b to {cfg_backend:?}, the engine to {engine_identity:?}"
         );
+    }
+
+    const SK: &str = "SK-VALUE-0001-abcdef";
+    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn boot_with(data: &std::path::Path, extra: &str) -> Config {
+        let text = format!(
+            "access:\n  access_key_id: AK\n  secret_access_key: ${{env:SK}}\nstorage:\n  backend:\n    type: filesystem\n    path: {}\n{extra}",
+            data.display()
+        );
+        let env = |n: &str| match n {
+            "SK" => Some(SK.to_string()),
+            "BUCKET_KEY" => Some(KEY.to_string()),
+            _ => None,
+        };
+        Config::from_template_with(&text, &env).unwrap()
+    }
+
+    async fn mutator_of(cfg: Config, file: &std::path::Path) -> ConfigMutator {
+        let engine = DynEngine::new(&cfg, None).await.unwrap();
+        ConfigMutator {
+            config: cfg.into_shared(),
+            app: AppState::for_tests(engine),
+            persist_path: file.display().to_string(),
+        }
+    }
+
+    /// A background writer sees a mask where a reference stands: a copy of it
+    /// to a path with no declared derive step is refused before the transition,
+    /// so nothing is live and nothing is written.
+    #[tokio::test]
+    async fn a_background_edit_that_copies_a_reference_holder_is_refused() {
+        let data = tempfile::tempdir().unwrap();
+        let file = data.path().join("c.yaml");
+        let mutator = mutator_of(boot_with(data.path(), ""), &file).await;
+        let err = mutator
+            .mutate_and_apply("fake copy site", |c| {
+                c.public_url = c.secret_access_key.clone();
+            })
+            .await
+            .expect_err("the copy must be refused");
+        assert!(err.contains("/public_url"), "{err}");
+        assert!(err.contains("comes from the environment"), "{err}");
+        assert!(!err.contains(SK), "{err}");
+        assert!(mutator.read().await.public_url.is_none());
+        assert!(!file.exists(), "nothing may be written");
+        mutator
+            .mutate_and_apply("an edit with no copy", |c| c.max_delta_ratio = 0.5)
+            .await
+            .expect("an edit that copies nothing works");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("${env:SK}") && !text.contains(SK), "{text}");
+    }
+
+    /// The migrate job owns its `__dgmigrate_*` routes: it removes one that a
+    /// restart read from the file with references, and the references end
+    /// with it, the frozen ones too.
+    #[tokio::test]
+    async fn the_job_removes_a_route_with_its_frozen_references() {
+        let data = tempfile::tempdir().unwrap();
+        let route = "__dgmigrate_a_0";
+        let extra = format!(
+            "  buckets:\n    {route}:\n      encryption:\n        mode: aes256-gcm-proxy\n        key: ${{env:BUCKET_KEY}}\n        key_id: x\n"
+        );
+        let cfg = boot_with(data.path(), &extra);
+        let path = format!("/buckets/{route}/encryption/key");
+        assert!(cfg.env_refs.frozen.templates.contains_key(&path));
+        let file = data.path().join("c.yaml");
+        let mutator = mutator_of(cfg, &file).await;
+        mutator
+            .mutate_and_apply("remove the route", |c| {
+                c.buckets.remove(route);
+                c.env_refs
+                    .drop_templates_under(&format!("/buckets/{route}"));
+            })
+            .await
+            .expect("the job may remove its route");
+        let live = mutator.read().await;
+        assert!(live.buckets.is_empty());
+        assert!(live.env_refs.template_at(&path).is_none(), "template left");
+        assert!(!live.env_refs.frozen.templates.contains_key(&path));
     }
 }

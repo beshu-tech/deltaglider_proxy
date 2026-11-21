@@ -20,7 +20,7 @@ pub fn default_spool_threshold(max_object_size: u64) -> u64 {
 /// refused without a wait ([`crate::deltaglider::spool::CONTENDED`]: a
 /// holder never waits, or a no-wait caller found no free budget) is a
 /// retryable `Overloaded`; anything else is a storage error.
-fn spool_error(e: std::io::Error) -> EngineError {
+pub(super) fn spool_error(e: std::io::Error) -> EngineError {
     if e.kind() == crate::deltaglider::spool::CONTENDED {
         EngineError::Overloaded(e.to_string())
     } else {
