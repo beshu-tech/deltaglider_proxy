@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "deltaglider-operator"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "anyhow",
  "base64",

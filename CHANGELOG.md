@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.3.1 — 2026-11-22
+
 ### Added
 
 - **The proxy keeps the reference files of delta folders on its disk.** A GET of a delta object needs the reference of its folder. The proxy now keeps each verified reference in `<spool dir>/references`, with no time limit and across restarts, so a later GET sends no request for the reference to the backend. The size of this cache follows from the other limits: 16 references of the largest size (the lower of `max_object_size` and the delta ceiling), and at most a third of the spool budget. `DGP_REFERENCE_CACHE_MAX_BYTES` sets it by hand, and `0` turns it off. The proxy removes kept references before it refuses or delays another request for spool space. It keeps references of S3 backends only, and never those of a bucket that can hold an object that the proxy encrypted. A change of the encryption settings deletes every kept reference, and a deleted reference takes its kept file with it. See [Auto-sized limits](docs/product/reference/configuration.md#auto-sized-limits).
