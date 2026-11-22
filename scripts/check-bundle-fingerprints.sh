@@ -46,8 +46,14 @@ hits_of() {
 # 1. The crate version, standalone: not part of a longer dotted number, and not
 #    a number in SVG path data, where `-` after a digit or dot only separates
 #    two numbers (`1.5.3-2.2.4-.2` in an icon). `name-2.2.4` still matches.
+#    A run of 40+ characters of path data (command letters, digits, spaces,
+#    dots, commas, minus) is removed first: `0 2.3.1h.6` in an icon is no version.
 escaped=$(printf '%s' "$version" | sed 's/\./\\./g')
-hits=$(hits_of "(^|[^0-9.-]|(^|[^0-9.])-)${escaped}([^0-9.]|$)")
+hits=$(find "$dist" -type f \( -name '*.js' -o -name '*.html' -o -name '*.css' -o -name '*.json' \) -print0 |
+  while IFS= read -r -d '' f; do
+    if sed -E 's/[MmLlHhVvCcSsQqTtAaZz0-9 .,-]{40,}//g' "$f" |
+      grep -qE "(^|[^0-9.-]|(^|[^0-9.])-)${escaped}([^0-9.]|$)"; then echo "$f"; fi
+  done)
 [ -z "$hits" ] || report "crate version ${version} baked into: $(echo "$hits" | tr '\n' ' ')"
 
 # 2. Build timestamp literals.
