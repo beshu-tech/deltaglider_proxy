@@ -3488,6 +3488,25 @@ mod multipart_abort_tests {
     }
 
     impl StorageBackend for AbortSpy {
+        async fn needs_legacy_ref_key_conversion(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            filename: &str,
+        ) -> Result<bool, StorageError> {
+            let _ = (bucket, prefix, filename);
+            Ok(false)
+        }
+
+        async fn convert_legacy_ref_key(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            filename: &str,
+        ) -> Result<Option<crate::types::FileMetadata>, StorageError> {
+            let _ = (bucket, prefix, filename);
+            Ok(None)
+        }
         async fn copy_within(
             &self,
             v: crate::storage::ObjectVariant,
@@ -3830,6 +3849,16 @@ mod multipart_abort_tests {
     struct SpyRef(Arc<AbortSpy>);
 
     impl StorageBackend for SpyRef {
+        async fn needs_legacy_ref_key_conversion(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            filename: &str,
+        ) -> Result<bool, StorageError> {
+            self.0
+                .needs_legacy_ref_key_conversion(bucket, prefix, filename)
+                .await
+        }
         async fn copy_within(
             &self,
             v: crate::storage::ObjectVariant,
@@ -3922,6 +3951,14 @@ mod multipart_abort_tests {
             f: &str,
         ) -> Result<(FileMetadata, crate::storage::RewriteBasis), StorageError> {
             self.0.get_passthrough_metadata_for_rewrite(b, p, f).await
+        }
+        async fn convert_legacy_ref_key(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<Option<FileMetadata>, StorageError> {
+            self.0.convert_legacy_ref_key(b, p, f).await
         }
         async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
             self.0.create_bucket(b).await

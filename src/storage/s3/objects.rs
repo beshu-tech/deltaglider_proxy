@@ -143,6 +143,21 @@ impl S3Backend {
         fence: &RefFence,
         known_head: Option<&aws_sdk_s3::operation::head_object::HeadObjectOutput>,
     ) -> Result<Option<String>, StorageError> {
+        self.replace_metadata_in_place_with(bucket, key, metadata, fence, known_head, false)
+            .await
+    }
+
+    /// As above; `keep_stored_dg` also restates the stored `dg-*` names that
+    /// the metadata does not set (the dg-ref-key conversion).
+    pub(super) async fn replace_metadata_in_place_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: &FileMetadata,
+        fence: &RefFence,
+        known_head: Option<&aws_sdk_s3::operation::head_object::HeadObjectOutput>,
+        keep_stored_dg: bool,
+    ) -> Result<Option<String>, StorageError> {
         let copy_source = format!("{}/{}", bucket, encode_copy_source_key(key));
         // HEAD first: REPLACE drops everything the request does not restate
         // (a foreign object's own metadata and headers, D17).
@@ -176,10 +191,17 @@ impl S3Backend {
         let acl = self.object_acl_for_copy(bucket, key).await;
         // The bucket's own native mode (issue #116).
         let native = self.native_encryption.for_bucket(bucket);
+        let mut dg_headers = self.metadata_to_headers(metadata);
+        if keep_stored_dg {
+            dg_headers = metadata::conversion_headers(
+                dg_headers,
+                &head.metadata().cloned().unwrap_or_default(),
+            );
+        }
         let mut plan = self_copy_plan(
             head,
             acl.as_ref(),
-            self.metadata_to_headers(metadata),
+            dg_headers,
             !matches!(native, NativeEncryptionConfig::None),
             std::time::SystemTime::now(),
         );

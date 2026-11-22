@@ -899,6 +899,20 @@ impl RoutingBackend {
 }
 
 impl StorageBackend for RoutingBackend {
+    async fn needs_legacy_ref_key_conversion(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<bool, StorageError> {
+        route_existing!(
+            self,
+            bucket,
+            needs_legacy_ref_key_conversion,
+            prefix,
+            filename
+        )
+    }
     // === Bucket operations ===
 
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
@@ -1309,6 +1323,15 @@ impl StorageBackend for RoutingBackend {
             metadata,
             basis
         )
+    }
+
+    async fn convert_legacy_ref_key(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Option<FileMetadata>, StorageError> {
+        route_existing!(self, bucket, convert_legacy_ref_key, prefix, filename)
     }
 
     async fn variant_version(
@@ -1790,6 +1813,25 @@ mod tests {
     }
 
     impl StorageBackend for TestBackend {
+        async fn needs_legacy_ref_key_conversion(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            filename: &str,
+        ) -> Result<bool, StorageError> {
+            let _ = (bucket, prefix, filename);
+            Ok(false)
+        }
+
+        async fn convert_legacy_ref_key(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            filename: &str,
+        ) -> Result<Option<crate::types::FileMetadata>, StorageError> {
+            let _ = (bucket, prefix, filename);
+            Ok(None)
+        }
         async fn copy_within(
             &self,
             v: crate::storage::ObjectVariant,

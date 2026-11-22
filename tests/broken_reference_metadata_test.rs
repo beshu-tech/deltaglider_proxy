@@ -289,3 +289,182 @@ async fn the_heal_job_restamps_broken_references() {
         planted_wrong
     );
 }
+
+/// Run the heal job on `bucket`, wait for it, and return its job row.
+async fn run_heal_job(admin: &reqwest::Client, endpoint: &str, bucket: &str) -> serde_json::Value {
+    let resp = admin
+        .post(format!("{endpoint}/_/api/admin/jobs/backfill-metadata"))
+        .json(&serde_json::json!({ "buckets": [bucket], "refresh_last_modified": false }))
+        .send()
+        .await
+        .expect("job POST");
+    assert!(resp.status().is_success(), "job POST: {}", resp.status());
+    let started: serde_json::Value = resp.json().await.unwrap();
+    let mut finished = false;
+    for _ in 0..600 {
+        let v: serde_json::Value = admin
+            .get(format!("{endpoint}/_/api/admin/jobs/bucket/{bucket}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["active"].is_null() {
+            finished = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        finished,
+        "the heal job did not finish within 60 s: {started}"
+    );
+    let jobs: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/jobs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    jobs["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["kind"] == "backfill-metadata")
+        .max_by_key(|j| j["id"].as_str().unwrap_or("").to_string())
+        .expect("heal job row")
+        .clone()
+}
+
+/// A delta of the old toolchain names its reference only in `dg-ref-key`
+/// (no `dg-ref-path`, no `dg-note`). The heal job converts it to the
+/// current metadata without touching its bytes, and a second run finds
+/// nothing to convert.
+#[tokio::test]
+async fn the_heal_job_converts_a_dg_ref_key_delta() {
+    skip_unless_minio!();
+    let bucket = format!("heal-refkey-{}", &unique_prefix()[11..]);
+    let raw = minio_client().await;
+    let base = generate_binary(60_000, 411);
+    let variant = mutate_binary(&base, 0.05);
+    {
+        let writer = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), &bucket).await;
+        let client = writer.s3_client().await;
+        for (file, body) in [("base.zip", base), ("v1.zip", variant.clone())] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(format!("p/{file}"))
+                .body(aws_sdk_s3::primitives::ByteStream::from(body))
+                .send()
+                .await
+                .expect("PUT");
+        }
+    }
+    let key = "p/v1.zip.delta";
+    let mut meta = metadata_of(&raw, &bucket, key).await;
+    assert_eq!(
+        meta.get("dg-note").map(String::as_str),
+        Some("delta"),
+        "{meta:?}"
+    );
+    // The prod shape (see storage/s3/heal.rs): ref-key only, no note, no md5.
+    for gone in ["dg-ref-path", "dg-note", "dg-md5", "dg-multipart-etag"] {
+        meta.remove(gone);
+    }
+    meta.insert("dg-ref-key".into(), "p/reference.bin".into());
+    meta.insert("dg-future-field".into(), "kept".into());
+    set_metadata(&raw, &bucket, key, meta).await;
+
+    let server = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), &bucket).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let job = run_heal_job(&admin, &server.endpoint(), &bucket).await;
+    assert_eq!(job["status_raw"], "completed", "{job}");
+    assert_eq!(job["progress"]["failed"], 0, "{job}");
+    assert_eq!(
+        job["progress"]["processed"], 1,
+        "one delta converted: {job}"
+    );
+
+    let after = metadata_of(&raw, &bucket, key).await;
+    assert_eq!(
+        after.get("dg-ref-path").map(String::as_str),
+        Some("reference.bin"),
+        "{after:?}"
+    );
+    assert_eq!(
+        after.get("dg-note").map(String::as_str),
+        Some("delta"),
+        "{after:?}"
+    );
+    assert!(!after.contains_key("dg-ref-key"), "{after:?}");
+    assert_eq!(
+        after.get("dg-future-field").map(String::as_str),
+        Some("kept"),
+        "{after:?}"
+    );
+    let got = server
+        .s3_client()
+        .await
+        .get_object()
+        .bucket(&bucket)
+        .key("p/v1.zip")
+        .send()
+        .await
+        .expect("GET after the conversion")
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(&got[..], &variant[..]);
+
+    let again = run_heal_job(&admin, &server.endpoint(), &bucket).await;
+    assert_eq!(again["status_raw"], "completed", "{again}");
+    assert_eq!(
+        again["progress"]["processed"], 0,
+        "nothing to convert: {again}"
+    );
+    assert_eq!(metadata_of(&raw, &bucket, key).await, after);
+}
+
+/// A delta whose `dg-ref-key` names a reference of another folder is not
+/// converted: the job records a failure naming both paths, the metadata stays.
+#[tokio::test]
+async fn the_heal_job_refuses_a_dg_ref_key_of_another_folder() {
+    skip_unless_minio!();
+    let bucket = format!("heal-refkey-x-{}", &unique_prefix()[11..]);
+    let raw = minio_client().await;
+    let base = generate_binary(60_000, 412);
+    let variant = mutate_binary(&base, 0.05);
+    {
+        let writer = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), &bucket).await;
+        let client = writer.s3_client().await;
+        for (file, body) in [("base.zip", base), ("v1.zip", variant)] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(format!("p/{file}"))
+                .body(aws_sdk_s3::primitives::ByteStream::from(body))
+                .send()
+                .await
+                .expect("PUT");
+        }
+    }
+    let key = "p/v1.zip.delta";
+    let mut meta = metadata_of(&raw, &bucket, key).await;
+    for gone in ["dg-ref-path", "dg-note", "dg-md5", "dg-multipart-etag"] {
+        meta.remove(gone);
+    }
+    meta.insert("dg-ref-key".into(), "x/y/reference.bin".into());
+    set_metadata(&raw, &bucket, key, meta).await;
+    let before = metadata_of(&raw, &bucket, key).await;
+
+    let server = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), &bucket).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let job = run_heal_job(&admin, &server.endpoint(), &bucket).await;
+    assert_eq!(job["progress"]["failed"], 1, "{job}");
+    assert_eq!(metadata_of(&raw, &bucket, key).await, before);
+}

@@ -2756,6 +2756,28 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
             .put_passthrough_metadata(b, p, f, &stored, basis)
             .await
     }
+    async fn convert_legacy_ref_key(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<Option<FileMetadata>, StorageError> {
+        // A sealed object carries no `dg-ref-key`: only an unsealed one converts.
+        // Decide first: an object that needs no conversion needs no write rights.
+        if !self.inner.needs_legacy_ref_key_conversion(b, p, f).await? {
+            return Ok(None);
+        }
+        self.check_write(b).await?;
+        self.inner.convert_legacy_ref_key(b, p, f).await
+    }
+    async fn needs_legacy_ref_key_conversion(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner.needs_legacy_ref_key_conversion(b, p, f).await
+    }
     async fn reference_fence_with_metadata(
         &self,
         b: &str,

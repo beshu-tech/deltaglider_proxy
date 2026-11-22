@@ -613,6 +613,16 @@ impl FencingFs {
 }
 
 impl crate::storage::StorageBackend for FencingFs {
+    async fn needs_legacy_ref_key_conversion(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .needs_legacy_ref_key_conversion(bucket, prefix, filename)
+            .await
+    }
     async fn copy_within(
         &self,
         v: crate::storage::ObjectVariant,
@@ -799,6 +809,14 @@ impl crate::storage::StorageBackend for FencingFs {
         self.inner
             .get_passthrough_metadata_for_rewrite(b, p, f)
             .await
+    }
+    async fn convert_legacy_ref_key(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+    ) -> Result<Option<FileMetadata>, StorageError> {
+        self.inner.convert_legacy_ref_key(b, p, f).await
     }
     async fn open_object(
         &self,

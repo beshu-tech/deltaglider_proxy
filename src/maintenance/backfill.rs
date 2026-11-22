@@ -9,7 +9,9 @@
 //! object stored before the facts existed): each page is completed as a
 //! client LIST completes it, which HEADs a delta without facts and keeps
 //! them (`paged::list_job_keys_healing_facts`). No object is rewritten for
-//! that; a delta counts as skipped, as before.
+//! that. A delta that names its reference only in the old toolchain's
+//! `dg-ref-key` is converted in place (metadata only); a current delta is
+//! skipped, and one whose reference is in another folder fails.
 //!
 //! The bytes are read ONCE, only to compute the content hashes (the one
 //! part of the canonical set that cannot be derived without them), then the
@@ -322,6 +324,40 @@ impl Backfill<'_> {
     }
 }
 
+impl Backfill<'_> {
+    /// Convert a delta that names its reference only in `dg-ref-key` (the
+    /// caller holds the object's write lock); a current delta is skipped.
+    async fn convert_delta(
+        &self,
+        engine: &crate::deltaglider::DynEngine,
+        key: &str,
+    ) -> super::worker::Visit {
+        use super::worker::Visit;
+        let (prefix, filename) = split_key(key);
+        match engine
+            .storage()
+            .convert_legacy_ref_key(self.bucket, prefix, filename)
+            .await
+        {
+            Ok(Some(meta)) => {
+                engine.invalidate_metadata_cache(self.bucket, key);
+                Visit::Done {
+                    bytes: meta.file_size as i64,
+                }
+            }
+            Ok(None) => Visit::Skipped,
+            // A delta that a delete or an overwrite removed since the listing.
+            Err(crate::storage::StorageError::NotFound(_)) => Visit::Skipped,
+            Err(crate::storage::StorageError::Throttled(_)) => Visit::Failed(
+                "dg-ref-key conversion failed: the delta changed while the job read it; \
+                 the next run converts it"
+                    .to_string(),
+            ),
+            Err(e) => Visit::Failed(format!("dg-ref-key conversion failed: {e}")),
+        }
+    }
+}
+
 impl super::worker::ObjectVisitor for Backfill<'_> {
     // The walk's pages also write the missing listing facts of their deltas
     // (an object stored before the facts existed), so one run heals a bucket.
@@ -341,11 +377,18 @@ impl super::worker::ObjectVisitor for Backfill<'_> {
         let _lock = engine
             .lock_object_write(self.bucket, key, crate::types::WriteOrigin::Job)
             .await;
+        // A delta listed as one is never a passthrough: convert it, no other read.
+        if listed == Some(crate::storage::ObjectVariant::Delta) {
+            return self.convert_delta(engine, key).await;
+        }
         let (meta, basis) = match self.read(engine, key, listed).await {
             Ok(read) => read,
             Err(visit) => return visit,
         };
         let meta = &meta;
+        if meta.is_delta() {
+            return self.convert_delta(engine, key).await;
+        }
         if !needs_metadata_backfill(meta) {
             return Visit::Skipped;
         }

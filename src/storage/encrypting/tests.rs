@@ -592,6 +592,25 @@ mod wrapper_tests {
     }
 
     impl StorageBackend for CountingBackend {
+        async fn needs_legacy_ref_key_conversion(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            filename: &str,
+        ) -> Result<bool, StorageError> {
+            let _ = (bucket, prefix, filename);
+            Ok(false)
+        }
+
+        async fn convert_legacy_ref_key(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            filename: &str,
+        ) -> Result<Option<crate::types::FileMetadata>, StorageError> {
+            let _ = (bucket, prefix, filename);
+            Ok(None)
+        }
         async fn copy_within(
             &self,
             _: crate::storage::ObjectVariant,

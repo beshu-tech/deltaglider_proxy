@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **Heal metadata converts the deltas that the old Python toolchain wrote.** Such a delta names its reference only in the metadata name `dg-ref-key`. The job gives it `dg-ref-path` and `dg-note: delta` and removes `dg-ref-key`. It rewrites only the metadata, with a server-side copy that is conditional on the ETag that it read, and it holds the write lock of the object. A converted delta counts as done, and a delta that is already current counts as skipped. Run Heal metadata on each bucket that holds such deltas: a later release will stop reading `dg-ref-key`.
+
 ## v2.3.1 — 2026-11-22
 
 ### Added

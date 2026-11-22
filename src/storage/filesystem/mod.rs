@@ -1572,6 +1572,25 @@ impl FilesystemBackend {
 }
 
 impl StorageBackend for FilesystemBackend {
+    async fn needs_legacy_ref_key_conversion(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<bool, StorageError> {
+        let _ = (bucket, prefix, filename);
+        Ok(false)
+    }
+
+    async fn convert_legacy_ref_key(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Option<crate::types::FileMetadata>, StorageError> {
+        let _ = (bucket, prefix, filename);
+        Ok(None)
+    }
     fn new_key_refusal(&self, _bucket: &str, prefix: &str, _filename: &str) -> Option<String> {
         let segment = colliding_folder(prefix, Names::new(self.case_insensitive))?;
         Some(format!(

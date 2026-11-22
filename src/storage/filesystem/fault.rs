@@ -361,6 +361,16 @@ impl FaultyFs {
 }
 
 impl StorageBackend for FaultyFs {
+    async fn needs_legacy_ref_key_conversion(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner
+            .needs_legacy_ref_key_conversion(bucket, prefix, filename)
+            .await
+    }
     fn new_key_refusal(&self, bucket: &str, prefix: &str, filename: &str) -> Option<String> {
         self.inner.new_key_refusal(bucket, prefix, filename)
     }
@@ -440,6 +450,17 @@ impl StorageBackend for FaultyFs {
     ) -> Result<(), StorageError> {
         self.inner
             .put_passthrough_metadata(bucket, prefix, filename, metadata, basis)
+            .await
+    }
+
+    async fn convert_legacy_ref_key(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Option<FileMetadata>, StorageError> {
+        self.inner
+            .convert_legacy_ref_key(bucket, prefix, filename)
             .await
     }
 

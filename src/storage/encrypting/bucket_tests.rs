@@ -360,6 +360,33 @@ async fn a_witness_refusal_stops_every_write_also_a_folder_marker() {
     );
 }
 
+/// The dg-ref-key conversion write-checks only what it converts: on a
+/// refused bucket an object that needs no conversion is skipped, not failed.
+#[tokio::test]
+async fn a_refused_bucket_skips_an_object_that_needs_no_conversion() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = FilesystemBackend::new(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let gate = Arc::new(WitnessGate::default());
+    let wrapper = EncryptingBackend::new(fs, Arc::new(ArcSwap::new(Arc::new(two_keys()))))
+        .with_witness("local-disk", gate.clone());
+    wrapper.create_bucket("releases").await.unwrap();
+    gate.activate(std::time::Duration::from_secs(60));
+    gate.synced();
+    gate.set(WitnessGateState {
+        refused: HashMap::from([(
+            ("local-disk".to_string(), "releases".to_string()),
+            "mismatch".to_string(),
+        )]),
+        witnessed: Default::default(),
+    });
+    let out = wrapper
+        .convert_legacy_ref_key("releases", "p", "v1.zip.delta")
+        .await;
+    assert!(matches!(out, Ok(None)), "{out:?}");
+}
+
 /// Source guard: every write method of `StorageBackend` is overridden by
 /// the encrypting wrapper and calls the witness check in its first
 /// statement. A new write method fails here until it does.

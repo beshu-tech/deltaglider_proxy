@@ -91,6 +91,62 @@ pub(super) fn is_dg_owned_meta_key(key: &str) -> bool {
     k.starts_with("dg-") || k.starts_with("user-")
 }
 
+/// Pure: does this stored metadata name the reference only in the old
+/// toolchain's `dg-ref-key` (no `dg-ref-path`)? Such a delta reads as a delta
+/// but is not in the current form.
+pub(crate) fn needs_ref_key_conversion(stored: &HashMap<String, String>) -> bool {
+    let has = |k: &str| stored.get(k).is_some_and(|v| !v.is_empty());
+    has(crate::types::meta_keys::REF_KEY) && !has(crate::types::meta_keys::REF_PATH)
+}
+
+/// What the conversion does with one stored delta.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RefKeyVerdict {
+    /// Already current: no `dg-ref-key` without `dg-ref-path`.
+    Current,
+    /// The reference is in the delta's own folder: convert.
+    Convert,
+    /// The `dg-ref-key` names a reference of another folder (the value).
+    OtherFolder(String),
+}
+
+/// Pure: the conversion decision for a delta stored under `prefix`. The
+/// parsed metadata keeps only the reference's file name, so the folder is
+/// read from the stored value. A leading `/` and the bare `reference.bin`
+/// form name the delta's own folder.
+pub(crate) fn ref_key_verdict(stored: &HashMap<String, String>, prefix: &str) -> RefKeyVerdict {
+    if !needs_ref_key_conversion(stored) {
+        return RefKeyVerdict::Current;
+    }
+    let raw = &stored[crate::types::meta_keys::REF_KEY];
+    let ref_key = raw.trim_start_matches('/');
+    let own = prefix.trim_matches('/');
+    match ref_key.rsplit_once('/') {
+        None => RefKeyVerdict::Convert,
+        Some((folder, _)) if folder.trim_matches('/') == own => RefKeyVerdict::Convert,
+        Some(_) => RefKeyVerdict::OtherFolder(raw.clone()),
+    }
+}
+
+/// Pure: the headers of the conversion's rewrite. The current metadata's
+/// names win; every other stored `dg-*` name stays (the model does not know
+/// them all), except the `dg-ref-key` that the conversion removes.
+pub(crate) fn conversion_headers(
+    mut current: HashMap<String, String>,
+    stored: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    for (k, v) in stored {
+        let lower = k.to_ascii_lowercase();
+        if lower.starts_with("dg-")
+            && lower != crate::types::meta_keys::REF_KEY
+            && !current.keys().any(|c| c.eq_ignore_ascii_case(&lower))
+        {
+            current.insert(lower, v.clone());
+        }
+    }
+    current
+}
+
 /// An object ACL as the `x-amz-grant-*` headers of a copy request: each
 /// value is a comma-separated list of `id="…"`, `uri="…"` or
 /// `emailAddress="…"`.
@@ -821,6 +877,66 @@ mod dg_names_only_tests {
         assert!(m.is_delta());
         assert!(matches!(m.storage_info,
             StorageInfo::Delta { ref ref_path, .. } if ref_path == "reference.bin"));
+    }
+
+    #[test]
+    fn ref_key_conversion_is_needed_only_without_ref_path() {
+        let ours = needs_ref_key_conversion;
+        assert!(ours(&bare(&[("dg-ref-key", "p/reference.bin")])));
+        assert!(!ours(&bare(&[
+            ("dg-ref-key", "p/reference.bin"),
+            ("dg-ref-path", "reference.bin")
+        ])));
+        assert!(!ours(&bare(&[("dg-ref-key", "")])));
+        assert!(!ours(&bare(&[("dg-ref-path", "reference.bin")])));
+        assert!(!ours(&bare(&[])));
+    }
+
+    #[test]
+    fn the_conversion_converts_only_a_reference_of_the_own_folder() {
+        use RefKeyVerdict::*;
+        let v = |k: &str, prefix: &str| ref_key_verdict(&bare(&[("dg-ref-key", k)]), prefix);
+        assert_eq!(v("p/reference.bin", "p"), Convert);
+        assert_eq!(v("/p/reference.bin", "p/"), Convert);
+        assert_eq!(v("reference.bin", "p"), Convert);
+        assert_eq!(v("a/b/reference.bin", "a/b"), Convert);
+        assert_eq!(v("reference.bin", ""), Convert);
+        assert_eq!(
+            v("x/y/reference.bin", "p"),
+            OtherFolder("x/y/reference.bin".into())
+        );
+        assert_eq!(
+            v("p/reference.bin", "p/q"),
+            OtherFolder("p/reference.bin".into())
+        );
+        assert_eq!(
+            v("p/reference.bin", ""),
+            OtherFolder("p/reference.bin".into())
+        );
+        let current = bare(&[
+            ("dg-ref-key", "x/reference.bin"),
+            ("dg-ref-path", "reference.bin"),
+        ]);
+        assert_eq!(ref_key_verdict(&current, "p"), Current);
+    }
+
+    #[test]
+    fn the_conversion_keeps_unmodelled_dg_names_and_drops_dg_ref_key() {
+        let stored = bare(&[
+            ("dg-ref-key", "p/reference.bin"),
+            ("dg-future-field", "keep"),
+            ("dg-note", "old"),
+            ("owner", "bob"),
+        ]);
+        let current = bare(&[("dg-note", "delta"), ("dg-ref-path", "reference.bin")]);
+        let out = conversion_headers(current, &stored);
+        assert_eq!(out.get("dg-future-field").map(String::as_str), Some("keep"));
+        assert_eq!(out.get("dg-note").map(String::as_str), Some("delta"));
+        assert!(!out.contains_key("dg-ref-key"));
+        assert!(
+            !out.contains_key("owner"),
+            "foreign names come from the plan"
+        );
     }
 
     #[test]

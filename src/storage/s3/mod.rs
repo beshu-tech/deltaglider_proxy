@@ -705,6 +705,64 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
+    async fn convert_legacy_ref_key(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<Option<FileMetadata>, StorageError> {
+        let key = self.delta_key(prefix, filename);
+        let (mut meta, head) = self.head_object_response(bucket, &key).await?;
+        let stored = head.metadata().cloned().unwrap_or_default();
+        if !meta.is_delta() {
+            return Ok(None);
+        }
+        match metadata::ref_key_verdict(&stored, prefix) {
+            metadata::RefKeyVerdict::Current => return Ok(None),
+            metadata::RefKeyVerdict::OtherFolder(r) => {
+                return Err(other_folder_ref_error(&key, &r))
+            }
+            metadata::RefKeyVerdict::Convert => {}
+        }
+        // A model without a content type must not turn the stored one into the default.
+        if meta.content_type.is_none() {
+            meta.content_type = head.content_type().map(String::from);
+        }
+        // The parsed metadata writes the current names; the HEAD fences the copy.
+        self.replace_metadata_in_place_with(
+            bucket,
+            &key,
+            &meta,
+            &RefFence::Unfenced,
+            Some(&head),
+            true,
+        )
+        .await?;
+        debug!("Converted dg-ref-key to dg-ref-path for {}/{}", bucket, key);
+        Ok(Some(meta))
+    }
+
+    #[instrument(skip(self))]
+    async fn needs_legacy_ref_key_conversion(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<bool, StorageError> {
+        let key = self.delta_key(prefix, filename);
+        let (meta, head) = self.head_object_response(bucket, &key).await?;
+        if !meta.is_delta() {
+            return Ok(false);
+        }
+        let stored = head.metadata().cloned().unwrap_or_default();
+        match metadata::ref_key_verdict(&stored, prefix) {
+            metadata::RefKeyVerdict::Current => Ok(false),
+            metadata::RefKeyVerdict::Convert => Ok(true),
+            metadata::RefKeyVerdict::OtherFolder(r) => Err(other_folder_ref_error(&key, &r)),
+        }
+    }
+
+    #[instrument(skip(self))]
     async fn get_object(
         &self,
         bucket: &str,
@@ -1921,4 +1979,12 @@ impl StorageBackend for S3Backend {
         debug!("Created directory marker: {}/{}", bucket, key);
         Ok(())
     }
+}
+
+/// The error for a delta whose `dg-ref-key` names a reference of another folder.
+fn other_folder_ref_error(delta_key: &str, ref_key: &str) -> StorageError {
+    StorageError::Other(format!(
+        "delta {delta_key} names its reference {ref_key} in another folder; \
+         not converted, because the conversion would remove the only record of that path"
+    ))
 }

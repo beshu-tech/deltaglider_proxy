@@ -2,8 +2,9 @@
  * Start the one-off `backfill-metadata` job (Jobs → New job → Heal
  * metadata…). The job stamps DeltaGlider's metadata (content hashes, sizes,
  * created-at) onto objects that were written to the backend without the
- * proxy, and re-stamps delta references whose metadata is broken, reading
- * each such object once to hash it and rewriting only its metadata.
+ * proxy, re-stamps delta references whose metadata is broken, and converts
+ * deltas that name their reference only in `dg-ref-key`, reading each
+ * object once to hash it and rewriting only its metadata.
  * POST /_/api/admin/jobs/backfill-metadata.
  *
  * The bucket list has a search box and the backend of each bucket, and it
@@ -105,7 +106,9 @@ export default function BackfillMetadataModal({ open, onClose }: Props) {
         one-off job finds both kinds, reads each one once to compute its hashes, and then writes
         only the metadata. The bytes are not uploaded again, and objects with complete metadata are
         skipped. A reference whose bytes do not match the checksum that it records is left as it
-        is and listed as a failure.
+        is and listed as a failure. The job also converts a delta that an old toolchain wrote,
+        which names its reference only in the metadata name <code>dg-ref-key</code>, to the
+        current name <code>dg-ref-path</code>.
       </Text>
       <Alert
         type="warning"

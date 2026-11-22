@@ -1163,6 +1163,13 @@ mod readiness_tests {
         ),
         (
             "src/maintenance/backfill.rs",
+            "Err(crate::storage::StorageError::Throttled(_)) => Visit::Failed(",
+            1,
+            Reach::PerRequest,
+            "the dg-ref-key conversion lost its ETag condition: the JOB records the delta and the next run converts it, no client request is refused",
+        ),
+        (
+            "src/maintenance/backfill.rs",
             "matches!(e, crate::deltaglider::EngineError::Overloaded(_))",
             1,
             Reach::PerRequest,

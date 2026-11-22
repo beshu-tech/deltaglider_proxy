@@ -1207,6 +1207,33 @@ pub trait StorageBackend: Send + Sync {
         }
     }
 
+    /// Convert one delta that names its reference only in the old
+    /// toolchain's `dg-ref-key` to the current metadata (`dg-ref-path`,
+    /// `dg-note: delta`, no `dg-ref-key`). Metadata only: the bytes are not
+    /// rewritten, and the rewrite is fenced on the ETag that it read. Returns
+    /// the new metadata when it rewrote the object, `None` when the
+    /// object is already current. Only S3 objects can carry the old key, so
+    /// the filesystem never rewrites. A delta whose `dg-ref-key` names a
+    /// reference of another folder is an error, never converted. The caller
+    /// holds the object's write lock. No default: every wrapper forwards it.
+    fn convert_legacy_ref_key(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<Option<FileMetadata>, StorageError>> + Send;
+
+    /// Would [`Self::convert_legacy_ref_key`] rewrite this delta? One HEAD
+    /// and no write. A wrapper asks it BEFORE its own write check, so an
+    /// object that needs no conversion never needs write rights. Same error
+    /// as the conversion for a reference in another folder. No default.
+    fn needs_legacy_ref_key_conversion(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
+
     /// The metadata of one stored object (S3: one HEAD; filesystem: the
     /// xattr, or the file's stat). A missing object is `NotFound`. Callers
     /// use the names in [`StorageBackendExt`]. No default: a wrapper that
