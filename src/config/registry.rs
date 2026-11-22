@@ -460,7 +460,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_REFERENCE_CACHE_MAX_BYTES",
-        description: "Spool space of the verified reference files that the proxy keeps across requests and restarts, so a delta GET does not read its reference from the backend again; 0 keeps none (default: 16 files of the largest reference size, at most 25 % of the effective spool budget)",
+        description: "Spool space of the verified reference files that the proxy keeps across requests and restarts, so a delta GET does not read its reference from the backend again; 0 keeps none (default: 16 files of the largest reference size, at most a third of the effective spool budget)",
         example: "8589934592",
         category: "Server",
     },

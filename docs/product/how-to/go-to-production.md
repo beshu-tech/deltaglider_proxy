@@ -83,7 +83,7 @@ Decide per backend, before real data lands: `none`, proxy-side AES-256-GCM, SSE-
 
 ### 8. Size the caches
 
-Raise the reference cache (the LRU of reference baselines) to 1024 MiB or more, because hot-read workloads benefit most from it. Raise the metadata cache to 200 MiB or more if you list large prefixes repeatedly. The startup log warns with a `[cache]` prefix if you forgot. Both sizes apply at once, because the proxy rebuilds its caches when you apply a new size. The rebuilt caches start empty.
+Raise the in-memory reference cache (the LRU of reference baselines in RAM) to 1024 MiB or more, because hot-read workloads benefit most from it. Raise the metadata cache to 200 MiB or more if you list large prefixes repeatedly. The reference cache on the spool disk (`DGP_REFERENCE_CACHE_MAX_BYTES`) is a different cache: the proxy sizes it from the spool limits, and the **Space limits** card of the same page shows its size. The startup log warns with a `[cache]` prefix if you forgot. Both sizes apply at once, because the proxy rebuilds its caches when you apply a new size. The rebuilt caches start empty.
 
 In the admin UI:
 

@@ -134,7 +134,7 @@ A `refused` rate above zero in a bucket that encrypts means that clients read ob
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `deltaglider_backend_get_body_resumes_total` | Counter | — | Ranged requests that the proxy sent to S3 to get the remaining bytes of a response body that broke off. One download can add up to three |
+| `deltaglider_backend_get_body_resumes_total` | Counter | — | Ranged requests that the proxy sent to S3 to get the remaining bytes of a response body that broke off. A resume request that gets no answer, a `408`, a `429` or a `5xx` counts too, and the next resume follows it. One download can add up to three |
 
 A response body breaks off when the backend stops sending bytes for longer than `DGP_S3_STALL_GRACE_SECS` (20 seconds by default), or when the connection closes before the last byte. The proxy then requests the remaining bytes of the same object version, up to three times for one download.
 

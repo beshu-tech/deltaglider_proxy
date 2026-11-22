@@ -537,6 +537,14 @@ Because the proxy now removes objects in that folder, it refuses a client write 
 
 A bucket migrate, a re-encrypt job and a backfill job skip the probe keys. The bucket usage counters now warn that a counter "went negative" only when a scan once set that counter; the usage database gets a new column for this, and a downgrade to 2.2.1 still opens it.
 
+## The spool keeps reference files (2.3.1)
+
+A GET of a delta object needs the `reference.bin` file of its folder. The proxy now keeps each verified reference of a bucket on an S3 backend in the subdirectory `references` of the spool directory (`DGP_SPOOL_DIR`). It keeps these files with no time limit and across restarts, so a later delta GET sends no request for the reference to the backend. It never keeps the references of a bucket that can hold an object that the proxy encrypted. See [Auto-sized limits](../reference/configuration.md#auto-sized-limits) for the rules.
+
+- **The spool directory is no longer empty when the proxy is idle.** The kept files count against `DGP_SPOOL_MAX_BYTES`, so the spool does not grow past its budget. By default they take at most a third of the budget. Before the proxy refuses or delays an upload or a download for want of spool space, it removes kept files.
+- **Check the size.** The start-up `[limits]` line, `limits.reference_cache` in `GET /_/api/admin/config`, and the **Space limits** card of the System page show the size and how the proxy found it. Set `DGP_REFERENCE_CACHE_MAX_BYTES` to change it, or set it to `0` to turn the cache off. A start with the cache off deletes the files of an earlier run.
+- **Leave the spool directory out of backups.** The kept files are plaintext copies of objects in buckets that the proxy does not encrypt. A backup gains nothing from them, because the proxy downloads a missing reference again.
+
 ## Common gotchas
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.

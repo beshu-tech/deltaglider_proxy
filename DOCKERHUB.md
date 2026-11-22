@@ -88,8 +88,9 @@ You can set all settings through environment variables:
 |----------|---------|-------------|
 | `DGP_LISTEN_ADDR` | `0.0.0.0:9000` | S3 API listen address |
 | `DGP_MAX_DELTA_RATIO` | `0.75` | Max delta/original ratio (lower = more aggressive) |
-| `DGP_MAX_OBJECT_SIZE` | `auto` | Max size of an uploaded object, for every object and not only for deltas: bytes, or `auto` (half of the spool budget) |
-| `DGP_CACHE_MB` | `100` | Reference cache size in MB (recommend ≥1024 for production) |
+| `DGP_MAX_OBJECT_SIZE` | `auto` | Max size of an uploaded object, for every object and not only for deltas: bytes, or `auto` (37.5 % of the spool budget with the default limits) |
+| `DGP_CACHE_MB` | `100` | In-memory reference cache size in MB (recommend ≥1024 for production) |
+| `DGP_REFERENCE_CACHE_MAX_BYTES` | 16 references of the largest size, at most a third of the spool budget | Spool space of the verified reference files that the proxy keeps on disk across requests and restarts (S3 backends only, never for a bucket that can hold an object that the proxy encrypted). `0` turns it off |
 | `DGP_ACCESS_KEY_ID` | *(unset)* | Proxy SigV4 access key (**required**: the proxy refuses to start without credentials unless `DGP_AUTHENTICATION=none`) |
 | `DGP_SECRET_ACCESS_KEY` | *(unset)* | Proxy SigV4 secret key |
 | `DGP_AUTHENTICATION` | *(auto-detect)* | Set to `none` for open-access dev mode |

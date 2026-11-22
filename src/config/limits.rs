@@ -787,7 +787,7 @@ impl LimitWarning {
             Self::ReferenceCacheBelowLargestReference { cache, largest } => format!(
                 "DGP_REFERENCE_CACHE_MAX_BYTES ({}) is below the largest reference ({}, the \
                  lower of max_object_size and the delta ceiling). A reference above {} is not \
-                 kept: a delta GET reads it from the backend again after the range-spool TTL. \
+                 kept: a delta GET reads it from the backend again after 60 seconds. \
                  Raise DGP_REFERENCE_CACHE_MAX_BYTES, or remove it for the auto value.",
                 human_bytes(cache),
                 human_bytes(largest),

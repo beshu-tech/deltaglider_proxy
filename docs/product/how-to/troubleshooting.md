@@ -167,6 +167,8 @@ Symptom: a sudden latency spike on GETs, and `deltaglider_cache_miss_rate_ratio`
 
 Most common cause: a restart with a cold cache against a hot-read workload. This is expected for about 5 minutes, while the LRU fills again.
 
+A restart affects fewer buckets on an S3 backend. For a bucket there that cannot hold an object that the proxy encrypted, the proxy keeps verified reference files in the reference cache on the spool disk, also across a restart. A delta GET that finds its reference there counts as a hit and sends no request for the reference to the backend. If such buckets still show the storm after a restart, check that the start-up `[limits]` line does not say `reference cache off`, and that the spool directory keeps its files across the restart. A tmpfs is empty after a reboot, and a new container starts with an empty spool unless the spool directory is on a volume.
+
 Less common: `DGP_CACHE_MB` is undersized. The startup log warns `[cache] In-memory reference cache is only 100 MB — recommend ≥1024 MB for production`. Raise it.
 
 Very rare: a write burst pushes new references into the cache and evicts the hot set. Check `deltaglider_delta_decisions_total{decision="reference"}` rate. If you're creating many new deltaspaces quickly, consider segregating write-heavy and read-heavy workloads onto separate buckets (different LRU scope) or different instances.
