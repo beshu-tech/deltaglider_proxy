@@ -44,13 +44,13 @@ function renderSidebar(canAdmin = true) {
   );
 }
 
-const groupHeader = (backend: string) => screen.getByRole('button', { name: new RegExp(`^${backend} \\(\\d+ buckets\\)$`) });
+const groupHeader = (backend: string) => screen.getByRole('button', { name: new RegExp(`^${backend} \\d+ buckets?$`) });
 
 test('buckets are in groups by backend, in name order, without per-row chips', async () => {
   renderSidebar();
   await screen.findByText('releases');
   const headers = screen.getAllByRole('button', { expanded: true });
-  expect(headers.map((h) => h.textContent)).toEqual(['hetzner-fsn12', 'local-disk1']);
+  expect(headers.map((h) => h.textContent)).toEqual(['hetzner-fsn1 2 buckets', 'local-disk 1 bucket']);
   const hetznerList = document.getElementById(groupHeader('hetzner-fsn1').getAttribute('aria-controls')!)!;
   expect(within(hetznerList).getAllByRole('listitem').map((li) => li.textContent)).toEqual(['downloads', 'releases']);
   expect(screen.queryByLabelText(/^Backend /)).toBeNull();

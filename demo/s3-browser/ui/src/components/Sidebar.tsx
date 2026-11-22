@@ -526,7 +526,6 @@ export default function Sidebar({
           className="btn-reset dg-bucket-group-header"
           aria-expanded={expanded}
           aria-controls={listId}
-          aria-label={`${label} (${group.buckets.length} buckets)`}
           title={[backendFacts, hidesActive ? `Contains the open bucket ${activeBucket}` : null].filter(Boolean).join('\n')}
           onClick={() => toggleGroup(key)}
           style={{
@@ -539,7 +538,9 @@ export default function Sidebar({
           <TruncatedName text={label} title={false} className="dg-eyebrow" style={{ flex: 1 }} />
           {hidesActive && <span aria-hidden="true" className="dg-bucket-group-active-dot" />}
           <span style={{ flexShrink: 0, fontSize: 11, color: TEXT_MUTED, fontVariantNumeric: 'tabular-nums' }}>
-            {group.buckets.length}
+            {` ${group.buckets.length} `}
+            {/* The name is the visible text plus the unit (axe label-content-name-mismatch). */}
+            <span className="sr-only">{group.buckets.length === 1 ? 'bucket' : 'buckets'}</span>
           </span>
         </button>
         <ul id={listId} hidden={!expanded} className="dg-bucket-group-rows">

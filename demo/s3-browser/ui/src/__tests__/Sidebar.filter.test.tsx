@@ -37,7 +37,7 @@ function renderSidebar() {
   );
 }
 
-const header = (backend: string) => screen.getByRole('button', { name: new RegExp(`^${backend} \\(\\d+ buckets\\)$`) });
+const header = (backend: string) => screen.getByRole('button', { name: new RegExp(`^${backend} \\d+ buckets?$`) });
 const rowsOf = (backend: string) =>
   within(document.getElementById(header(backend).getAttribute('aria-controls')!)!).queryAllByRole('listitem').map((li) => li.textContent);
 
@@ -88,5 +88,5 @@ test('the header shows the backend type as an icon, not as text', async () => {
   await screen.findByText('pg-wal');
   expect(header('local-disk').querySelector('.anticon-hdd')).not.toBeNull();
   expect(header('aws-dr').querySelector('.anticon-cloud')).not.toBeNull();
-  expect(header('local-disk').textContent).toBe('local-disk3');
+  expect(header('local-disk').textContent).toBe('local-disk 3 buckets');
 });
