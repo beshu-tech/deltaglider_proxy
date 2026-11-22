@@ -1238,6 +1238,10 @@ impl StorageBackend for S3Backend {
         true
     }
 
+    fn keeps_reference_files(&self, _bucket: &str) -> bool {
+        true
+    }
+
     fn lite_list_carries_logical_facts(&self, _bucket: &str) -> bool {
         // S3 LIST returns NO user metadata (so replication-provenance ownership
         // can't be read from a lite entry) — parity must HEAD to know ownership.

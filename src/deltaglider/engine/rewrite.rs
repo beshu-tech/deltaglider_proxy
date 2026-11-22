@@ -401,6 +401,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let meta = rewrite_metadata(&read, Some(&hashes))?;
         let bytes = data.len() as u64;
         let data = Bytes::from(data);
+        self.forget_reference_files(bucket, prefix);
         let out = held
             .rewrite_reference_if(
                 &*self.storage,
@@ -419,6 +420,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 Rewritten::Done { bytes }
             }
         };
+        self.forget_reference_files(bucket, prefix);
         Ok(Some((outcome, read)))
     }
 }

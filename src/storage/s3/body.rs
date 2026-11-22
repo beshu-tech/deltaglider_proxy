@@ -149,7 +149,8 @@ impl BodyState {
     }
 
     /// The body of a ranged GET for the bytes not yet received, or the
-    /// error that ends the read.
+    /// error that ends the read. A body that breaks off and a resume request
+    /// that fails each use one of the [`BODY_RESUMES`] resumes.
     async fn resume_after(&mut self, cause: &str) -> Result<ByteStream, StorageError> {
         let fail = |at: u64, why: &str| {
             StorageError::Transient(format!(
@@ -164,67 +165,104 @@ impl BodyState {
             // Every byte arrived; the error is about the body as a whole.
             return Err(fail(r.next, ""));
         }
-        if r.resumes >= BODY_RESUMES {
-            return Err(fail(
-                r.next,
-                &format!(" (gave up after {BODY_RESUMES} resumes)"),
-            ));
-        }
-        warn!(
-            "S3 GET {}/{}: the body broke off at byte {} of {} ({cause}); resuming ({}/{BODY_RESUMES})",
-            r.bucket,
-            r.key,
-            r.next,
-            r.end,
-            r.resumes + 1
-        );
-        BACKEND_GET_BODY_RESUMES.inc();
-        tokio::time::sleep(std::time::Duration::from_millis(
-            RESUME_BACKOFF_MS[r.resumes as usize],
-        ))
-        .await;
-        r.resumes += 1;
-        let resp = r
-            .client
-            .get_object()
-            .bucket(&r.bucket)
-            .key(&r.key)
-            .range(format!("bytes={}-{}", r.next, r.end - 1))
-            .if_match_etag(
-                &r.etag,
-                crate::coordination::if_match::IfMatchDialect::Quoted,
-            )
-            .send()
-            .await;
-        let at = r.next;
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(e) if e.raw_response().map(|raw| raw.status().as_u16()) == Some(412) => {
-                return Err(fail(at, " (the object changed while it was read)"));
-            }
-            Err(e) => {
+        // A resume request that fails before its headers (a timeout, a 5xx)
+        // uses one resume and the next one follows.
+        let mut cause = cause.to_string();
+        loop {
+            let fail = |at: u64, why: &str| {
+                StorageError::Transient(format!(
+                    "Failed to read response body of {}/{} at byte {at}: {cause}{why}",
+                    r.bucket, r.key
+                ))
+            };
+            let at = r.next;
+            if r.resumes >= BODY_RESUMES {
                 return Err(fail(
                     at,
-                    &format!(" (the resume failed: {})", DisplayErrorContext(&e)),
+                    &format!(" (gave up after {BODY_RESUMES} resumes)"),
                 ));
             }
-        };
-        // A backend that ignores If-Match still names the version it sent.
-        if resp.e_tag() != Some(r.etag.as_str()) {
-            return Err(fail(at, " (the object changed while it was read)"));
+            warn!(
+                "S3 GET {}/{}: the body broke off at byte {} of {} ({cause}); resuming ({}/{BODY_RESUMES})",
+                r.bucket,
+                r.key,
+                r.next,
+                r.end,
+                r.resumes + 1
+            );
+            BACKEND_GET_BODY_RESUMES.inc();
+            tokio::time::sleep(std::time::Duration::from_millis(
+                RESUME_BACKOFF_MS[r.resumes as usize],
+            ))
+            .await;
+            r.resumes += 1;
+            let resp = r
+                .client
+                .get_object()
+                .bucket(&r.bucket)
+                .key(&r.key)
+                .range(format!("bytes={}-{}", r.next, r.end - 1))
+                .if_match_etag(
+                    &r.etag,
+                    crate::coordination::if_match::IfMatchDialect::Quoted,
+                )
+                .send()
+                .await;
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let status = e.raw_response().map(|raw| raw.status().as_u16());
+                    let why = format!("the resume failed: {}", DisplayErrorContext(&e));
+                    match resume_failure(status) {
+                        ResumeFailure::Changed => {
+                            return Err(fail(at, " (the object changed while it was read)"))
+                        }
+                        ResumeFailure::Final => return Err(fail(at, &format!(" ({why})"))),
+                        ResumeFailure::Again => {
+                            cause = why;
+                            continue;
+                        }
+                    }
+                }
+            };
+            // A backend that ignores If-Match still names the version it sent.
+            if resp.e_tag() != Some(r.etag.as_str()) {
+                return Err(fail(at, " (the object changed while it was read)"));
+            }
+            if body_span(resp.content_range(), resp.content_length()).map(|s| (s.start, s.end))
+                != Some((r.next, r.end))
+            {
+                return Err(fail(
+                    at,
+                    &format!(
+                        " (the backend answered the resume with Content-Range {:?})",
+                        resp.content_range()
+                    ),
+                ));
+            }
+            return Ok(resp.body);
         }
-        if body_span(resp.content_range(), resp.content_length()).map(|s| (s.start, s.end))
-            != Some((r.next, r.end))
-        {
-            return Err(fail(
-                at,
-                &format!(
-                    " (the backend answered the resume with Content-Range {:?})",
-                    resp.content_range()
-                ),
-            ));
-        }
-        Ok(resp.body)
+    }
+}
+
+/// What a resume request that got no usable response means for the read.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ResumeFailure {
+    /// 412: the object is another version now.
+    Changed,
+    /// The backend refused the request: another resume gets the same answer.
+    Final,
+    /// No response (a timeout, a reset), a 5xx, a 408 or a 429: resume again.
+    Again,
+}
+
+/// Pure: the verdict for the HTTP status of a failed resume request
+/// (`None`: no response arrived).
+pub(super) fn resume_failure(status: Option<u16>) -> ResumeFailure {
+    match status {
+        Some(412) => ResumeFailure::Changed,
+        None | Some(408) | Some(429) | Some(500..) => ResumeFailure::Again,
+        Some(_) => ResumeFailure::Final,
     }
 }
 
@@ -382,7 +420,7 @@ impl S3Backend {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_span, BodySpan};
+    use super::{body_span, resume_failure, BodySpan, ResumeFailure};
 
     fn span(start: u64, end: u64, total: Option<u64>) -> Option<BodySpan> {
         Some(BodySpan { start, end, total })
@@ -412,6 +450,17 @@ mod tests {
         assert_eq!(body_span(Some("bytes 5-9"), Some(5)), None);
         assert_eq!(body_span(Some("bytes 5-9/x"), None), None);
         assert_eq!(body_span(None, Some(-1)), None);
+    }
+
+    #[test]
+    fn resume_failure_truth_table() {
+        assert_eq!(resume_failure(Some(412)), ResumeFailure::Changed);
+        for again in [None, Some(408), Some(429), Some(500), Some(503), Some(504)] {
+            assert_eq!(resume_failure(again), ResumeFailure::Again, "{again:?}");
+        }
+        for fin in [Some(400), Some(403), Some(404), Some(416)] {
+            assert_eq!(resume_failure(fin), ResumeFailure::Final, "{fin:?}");
+        }
     }
 
     /// THE rule: a GET response's missing Content-Length is unknown, never

@@ -295,6 +295,13 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// Verified reconstructions of large delta objects, kept briefly for
     /// more range reads of the same object (storage-11).
     range_spools: Arc<crate::deltaglider::range_spool::RangeSpoolCache>,
+    /// The encryption settings of this engine as one text
+    /// (`construction::reference_policy`): the kept reference files belong
+    /// to the settings of the installed engine.
+    reference_policy: Arc<str>,
+    /// The directory and the budget of the kept reference files that this
+    /// engine asks for (`None`: the config has no limits of a boot).
+    kept_plan: Option<(std::path::PathBuf, u64)>,
     /// Env-only settings, copied from the config at build (see
     /// [`crate::config::RuntimeTuning`]).
     tuning: crate::config::RuntimeTuning,
@@ -326,6 +333,8 @@ impl<S: StorageBackend> Clone for DeltaGliderEngine<S> {
             bucket_usage: self.bucket_usage.clone(),
             spool: self.spool.clone(),
             range_spools: self.range_spools.clone(),
+            reference_policy: self.reference_policy.clone(),
+            kept_plan: self.kept_plan.clone(),
             tuning: self.tuning.clone(),
             memory: self.memory.clone(),
             encryption: self.encryption.clone(),

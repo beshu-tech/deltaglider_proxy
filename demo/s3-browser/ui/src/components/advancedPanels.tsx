@@ -33,7 +33,7 @@ import {
 } from '@ant-design/icons';
 import { useAdminConfig, useEnvOverride } from '../queries/config';
 import { useColors } from '../ThemeContext';
-import { useCardStyles } from './shared-styles';
+import { SPACE, useCardStyles } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
 import type { UseSectionEditorResult } from '../useSectionEditor';
 import { undefinedToNullSubset } from './advancedPayload';
@@ -45,6 +45,7 @@ import StickyDirtyBar from './StickyDirtyBar';
 import { ErrorState, LoadingState } from './StatePlaceholders';
 import { CUSTOM_LOG_LEVEL, LOG_LEVEL_PRESETS, logLevelRadio } from './admin/logLevelPresets';
 import { tint } from '../themeVars';
+import { derivedLimitRows } from '../derivedLimits';
 
 
 // ───────────────────────────────────────────────────────────
@@ -532,6 +533,7 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
 
 export function LimitsPanel({ onSessionExpired }: PanelProps) {
   const cardStyle = useStackCardStyle();
+  const { ACCENT_AMBER } = useColors();
   // Read-only env-var view of the running config (cached react-query read).
   // A 401 surfaces as `queryError`; useAdminConfig routes it to onSessionExpired.
   const { data: config, error: queryError, isError, refetch } = useAdminConfig({ onSessionExpired });
@@ -586,6 +588,33 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
           'DGP_MAX_MULTIPART_UPLOADS'
         )}
       </div>
+      {config.limits && (
+        <div style={cardStyle} data-testid="space-limits">
+          <SectionHeader
+            icon={<ControlOutlined />}
+            title="Space limits"
+            description={`The proxy derives these values at start from the free space of the spool directory${
+              config.limits.spool_dir ? ` (${config.limits.spool_dir})` : ''
+            } and from the largest object size. Each line says how its value was found. A variable sets a value by hand; a change needs a restart.`}
+          />
+          {derivedLimitRows(config.limits).map((row) => (
+            <FormField
+              key={row.id}
+              label={row.label}
+              helpText={row.help}
+              envVar={row.envVar}
+              ownerBadge={row.envVar ? undefined : 'derived'}
+            >
+              <ReadOnlyValue testId={`limit-${row.id}`}>{row.value}</ReadOnlyValue>
+            </FormField>
+          ))}
+          {(config.limits.warnings ?? []).map((warning) => (
+            <p key={warning} role="alert" style={{ color: ACCENT_AMBER, margin: `${SPACE.xs}px 0 0` }}>
+              {warning}
+            </p>
+          ))}
+        </div>
+      )}
     </PanelShell>
   );
 }

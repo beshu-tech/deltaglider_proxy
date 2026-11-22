@@ -1,4 +1,5 @@
 // Admin API client core: shared fetch glue + cross-cutting types.
+import type { DerivedLimits } from '../derivedLimits';
 import { ApiError, isSessionExpired, normalizeUiError, parseErrorBody, throwApiError } from '../errorHandling';
 import { loginFailureMessage, passwordChangeLockoutMessage, retryAfterSeconds } from '../loginError';
 import type { EnvOverride } from '../envOverrides';
@@ -169,9 +170,7 @@ export interface AdminConfig {
   max_object_size: number;
   /** The effective upload limits and where each comes from; null before the
    *  proxy measured its spool disk at start. */
-  limits?: {
-    max_object_size: { bytes: number; source: string; detail: string };
-  } | null;
+  limits?: DerivedLimits | null;
   cache_size_mb: number;
   metadata_cache_mb: number;
   codec_concurrency: number;

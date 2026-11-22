@@ -497,6 +497,9 @@ pub struct SpoolDir {
     /// Holders of optional spool files (the range-read reconstruction
     /// cache) that give budget back when an acquire finds it short.
     evictors: Arc<parking_lot::Mutex<Vec<std::sync::Weak<dyn SpoolEvictor>>>>,
+    /// The cached files were dropped for the disk level that refuses writes
+    /// now (once for each rise of the level).
+    dropped_for_level: Arc<std::sync::atomic::AtomicBool>,
     /// The disk level (`disk_watch`): at high or critical a new write is
     /// refused ([`SpoolDir::admit_new_write`]).
     gate: Arc<crate::disk_watch::SpoolGate>,
@@ -704,6 +707,7 @@ impl SpoolDir {
                 crate::config::tuning::DEFAULT_SPOOL_READ_MAX_PERCENT,
             ),
             evictors: Default::default(),
+            dropped_for_level: Default::default(),
             gate: Default::default(),
         })
     }
@@ -733,11 +737,43 @@ impl SpoolDir {
     /// of the spool, else (where the free space hides the limit) the use of
     /// the budget. [`Self::admit_new_write`] and every job that decides on a
     /// refusal ask this one function, so none misses a refusal by use.
+    ///
+    /// Cached files are optional. A refusal by use drops them first, one at
+    /// a time, and asks again. A refusal by level drops them all once, when
+    /// the level rises (the monitor measures the freed space at its next
+    /// tick); a cache keeps nothing new while the level refuses writes.
     pub fn write_refusal(&self) -> Option<String> {
-        self.gate.refusal().or_else(|| {
-            let th = self.gate.by_use()?;
-            crate::disk_watch::use_refusal(&th, self.max_bytes(), self.used_bytes(), self.dir())
-        })
+        use std::sync::atomic::Ordering;
+        if let Some(by_level) = self.gate.refusal() {
+            if !self.dropped_for_level.swap(true, Ordering::SeqCst) {
+                while self.evict_one_cached() {}
+            }
+            return Some(by_level);
+        }
+        self.dropped_for_level.store(false, Ordering::SeqCst);
+        let th = self.gate.by_use()?;
+        loop {
+            let refusal = crate::disk_watch::use_refusal(
+                &th,
+                self.max_bytes(),
+                self.used_bytes(),
+                self.dir(),
+            );
+            if refusal.is_none() || !self.evict_one_cached() {
+                return refusal;
+            }
+        }
+    }
+
+    /// Drop one cached file of any evictor; `false` when none is left.
+    fn evict_one_cached(&self) -> bool {
+        let evictors: Vec<_> = self
+            .evictors
+            .lock()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        evictors.iter().any(|e| e.evict_one())
     }
 
     /// Spool bytes reserved now (the budget in use), for the gauge. The
@@ -1531,7 +1567,7 @@ pub(crate) fn private_dir_verdict(owner: u32, me: u32, mode: u32) -> DirVerdict 
 /// [`private_dir_verdict`]: a pre-existing root keeps a private mode, has
 /// its group write bit removed, or is refused.
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -1561,7 +1597,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
@@ -1805,6 +1841,72 @@ mod tests {
         let _held = spool.try_acquire(40 * MIB).unwrap();
         assert!(spool.write_refusal().is_some(), "the budget is in use");
         assert!(spool.admit_new_write().is_err());
+    }
+
+    /// Cached files are optional: they never refuse a write. A refusal by
+    /// the use of the budget drops them first.
+    #[test]
+    fn a_refusal_by_use_drops_cached_files_first() {
+        const MIB: u64 = 1024 * 1024;
+        struct Cache(parking_lot::Mutex<Vec<Spool>>);
+        impl SpoolEvictor for Cache {
+            fn evict_one(&self) -> bool {
+                self.0.lock().pop().is_some()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spool = SpoolDir::new(dir.path().join("s"), 64 * MIB).unwrap();
+        let mut th = crate::disk_watch::Thresholds::new(
+            &crate::config::tuning::RuntimeTuning::default().disk_monitor,
+            MIB,
+        );
+        th.low_floor = 0;
+        th.high_floor = 32 * MIB;
+        th.critical_floor = 0;
+        spool.gate().set_by_use(Some(th));
+        let files = (0..4)
+            .map(|_| spool.try_acquire(10 * MIB).unwrap())
+            .collect();
+        let cache = Arc::new(Cache(parking_lot::Mutex::new(files)));
+        spool.register_evictor(Arc::downgrade(&cache) as std::sync::Weak<dyn SpoolEvictor>);
+        assert_eq!(spool.write_refusal(), None, "the cached files made way");
+        assert_eq!(cache.0.lock().len(), 3, "and only as many as needed");
+        // Space that a request holds is not optional.
+        let _held = spool.try_acquire(40 * MIB).unwrap();
+        assert!(spool.write_refusal().is_some());
+        assert!(cache.0.lock().is_empty());
+    }
+
+    /// A refusal by the disk level drops the cached files once, when the
+    /// level rises, not at every question: a cache that fills again during
+    /// the episode is not emptied by each refused write.
+    #[test]
+    fn a_refusal_by_level_drops_cached_files_once_per_rise() {
+        const MIB: u64 = 1024 * 1024;
+        struct Cache(parking_lot::Mutex<Vec<Spool>>);
+        impl SpoolEvictor for Cache {
+            fn evict_one(&self) -> bool {
+                self.0.lock().pop().is_some()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spool = SpoolDir::new(dir.path().join("s"), 64 * MIB).unwrap();
+        let cache = Arc::new(Cache(parking_lot::Mutex::new(Vec::new())));
+        spool.register_evictor(Arc::downgrade(&cache) as std::sync::Weak<dyn SpoolEvictor>);
+        let fill = || cache.0.lock().push(spool.try_acquire(MIB).unwrap());
+        let level = |l| spool.gate().set(l, "the disk is full".into());
+        fill();
+        level(crate::disk_watch::Level::High);
+        assert!(spool.write_refusal().is_some());
+        assert!(cache.0.lock().is_empty(), "dropped when the level rose");
+        fill();
+        assert!(spool.write_refusal().is_some());
+        assert_eq!(cache.0.lock().len(), 1, "not again in the same episode");
+        level(crate::disk_watch::Level::Ok);
+        assert_eq!(spool.write_refusal(), None);
+        level(crate::disk_watch::Level::High);
+        assert!(spool.write_refusal().is_some());
+        assert!(cache.0.lock().is_empty(), "the next rise drops again");
     }
 
     use super::*;

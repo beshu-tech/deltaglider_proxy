@@ -218,6 +218,8 @@ pub struct ExplicitLimits {
     pub total_multipart: Option<u64>,
     /// `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT`; `None` = the default.
     pub multipart_principal_share_percent: Option<u8>,
+    /// `DGP_REFERENCE_CACHE_MAX_BYTES`; `Some(0)` = no reference file is kept.
+    pub reference_cache: Option<u64>,
     pub max_object_size: BytesOrAuto,
     /// A configured backend is an S3 backend. An object above one PUT
     /// request (5 GiB, [`S3_SINGLE_PUT_MAX_BYTES`]) is stored as a backend
@@ -267,6 +269,27 @@ pub fn delta_ceiling(spool_budget: u64) -> u64 {
 /// multipart upload: [`DELTA_FILES_WITH_BODY_COPY`] files.
 pub fn delta_ceiling_with_body_copy(spool_budget: u64) -> u64 {
     spool_budget / DELTA_FILES_WITH_BODY_COPY
+}
+
+/// Reference files of the largest size that the auto reference cache holds.
+pub const REFERENCE_CACHE_FILES: u64 = 16;
+
+/// Pure: the largest reference. A reference is a stored object that a delta
+/// was made against, so it is at most the lower of `max_object_size` and the
+/// delta ceiling.
+pub fn largest_reference(spool_budget: u64, max_object_size: u64) -> u64 {
+    max_object_size.min(delta_ceiling(spool_budget))
+}
+
+/// Pure: the default size of the reference cache (the verified reference
+/// files that delta GETs and PUTs read, kept across requests and restarts):
+/// [`REFERENCE_CACHE_FILES`] files of the largest size
+/// ([`largest_reference`]), and at most the delta ceiling (a third of the
+/// spool budget). So one reference of the largest size always fits.
+pub fn default_reference_cache(spool_budget: u64, max_object_size: u64) -> u64 {
+    largest_reference(spool_budget, max_object_size)
+        .saturating_mul(REFERENCE_CACHE_FILES)
+        .min(delta_ceiling(spool_budget))
 }
 
 /// Pure: the largest plaintext whose encrypted form
@@ -334,6 +357,10 @@ pub struct EffectiveLimits {
     /// The same for a proxy-encrypted bucket and for a multipart upload
     /// ([`delta_ceiling_with_body_copy`]).
     pub delta_ceiling_with_body_copy: u64,
+    /// Spool space of the kept reference files
+    /// ([`default_reference_cache`]); 0 = none is kept.
+    pub reference_cache: u64,
+    pub reference_cache_source: Source,
 }
 
 /// What bounds the largest object.
@@ -410,6 +437,9 @@ pub enum LimitWarning {
     /// the spool after the boot measured. The budget stays; the smaller
     /// share for a shared device applies at the next start.
     ShareChangesAtRestart,
+    /// An explicit reference cache is below the largest reference: a
+    /// reference above it is not kept.
+    ReferenceCacheBelowLargestReference { cache: u64, largest: u64 },
 }
 
 /// Records whether the condition holds now and says whether it just began:
@@ -596,6 +626,20 @@ pub fn derive_limits(
             });
         }
     }
+    let (reference_cache, reference_cache_source) = match explicit.reference_cache {
+        Some(n) => (n.min(spool_budget), Source::Explicit),
+        None => (
+            default_reference_cache(spool_budget, max_object_size),
+            Source::Auto,
+        ),
+    };
+    let largest = largest_reference(spool_budget, max_object_size);
+    if reference_cache != 0 && reference_cache < largest {
+        warnings.push(LimitWarning::ReferenceCacheBelowLargestReference {
+            cache: reference_cache,
+            largest,
+        });
+    }
     if explicit.shares_device_now
         && !facts.shares_device_with_data
         && spool_source == Source::Auto
@@ -617,6 +661,8 @@ pub fn derive_limits(
             max_object_size_bound,
             delta_ceiling: delta_ceiling(spool_budget),
             delta_ceiling_with_body_copy: delta_ceiling_with_body_copy(spool_budget),
+            reference_cache,
+            reference_cache_source,
         },
         warnings,
     )
@@ -738,6 +784,15 @@ impl LimitWarning {
                  {AUTO_SHARED_DEVICE_PERCENT}% share for a shared device applies at the next \
                  start. A change of DGP_SPOOL_MAX_BYTES also needs a restart."
             ),
+            Self::ReferenceCacheBelowLargestReference { cache, largest } => format!(
+                "DGP_REFERENCE_CACHE_MAX_BYTES ({}) is below the largest reference ({}, the \
+                 lower of max_object_size and the delta ceiling). A reference above {} is not \
+                 kept: a delta GET reads it from the backend again after the range-spool TTL. \
+                 Raise DGP_REFERENCE_CACHE_MAX_BYTES, or remove it for the auto value.",
+                human_bytes(cache),
+                human_bytes(largest),
+                human_bytes(cache),
+            ),
         }
     }
 }
@@ -765,6 +820,34 @@ impl EffectiveLimits {
         }
     }
 
+    /// The reference cache for a person: its size, how it was found and
+    /// what it holds.
+    pub fn reference_cache_note(&self) -> String {
+        if self.reference_cache == 0 {
+            return "reference cache off (DGP_REFERENCE_CACHE_MAX_BYTES=0): a delta GET reads \
+                    its reference from the backend again after the range-spool TTL"
+                .to_string();
+        }
+        let largest = largest_reference(self.spool_budget, self.max_object_size).max(1);
+        let how = match self.reference_cache_source {
+            Source::Auto => format!(
+                "auto: {REFERENCE_CACHE_FILES} references of the largest size, at most the \
+                 delta ceiling"
+            ),
+            Source::Explicit => "set by DGP_REFERENCE_CACHE_MAX_BYTES".to_string(),
+        };
+        format!(
+            "reference cache {} ({how}; the largest reference is {}, the lower of \
+             max_object_size and the delta ceiling, so about {} of that size fit; kept on \
+             disk across restarts, evicted least recently used or when another request \
+             needs the spool space; S3 backends only, and not for a bucket that can hold \
+             objects that the proxy encrypted)",
+            human_bytes(self.reference_cache),
+            human_bytes(largest),
+            self.reference_cache / largest,
+        )
+    }
+
     /// The boot log line.
     pub fn boot_line(&self, dir: &Path) -> String {
         let per_upload = if self.per_upload == 0 {
@@ -783,12 +866,13 @@ impl EffectiveLimits {
         format!(
             "spool budget {} = {}; {per_upload}; total multipart limit {}; {mos}; delta ceiling \
              {} ({} in a proxy-encrypted bucket or for a multipart upload); an object above \
-             its ceiling is stored whole, reason delta-unavailable",
+             its ceiling is stored whole, reason delta-unavailable; {}",
             human_bytes(self.spool_budget),
             self.spool_note(dir),
             human_bytes(self.total_multipart),
             human_bytes(self.delta_ceiling),
             human_bytes(self.delta_ceiling_with_body_copy),
+            self.reference_cache_note(),
         )
     }
 }
@@ -836,6 +920,7 @@ pub const LIMIT_ENV_VARS: &[&str] = &[
     "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
     "DGP_MAX_TOTAL_MULTIPART_BYTES",
     "DGP_MAX_OBJECT_SIZE",
+    "DGP_REFERENCE_CACHE_MAX_BYTES",
 ];
 
 impl ResolvedLimits {
@@ -931,6 +1016,11 @@ impl ResolvedLimits {
                      upload also holds its relay parts beside the joined file"
                 ),
             ),
+            reference_cache: value(
+                e.reference_cache,
+                label(e.reference_cache_source, "DGP_REFERENCE_CACHE_MAX_BYTES"),
+                e.reference_cache_note(),
+            ),
             warnings: self.warning_messages(),
         }
     }
@@ -967,6 +1057,8 @@ pub struct LimitsReport {
     pub delta_ceiling_encrypted: LimitValue,
     /// The same for the delta of a multipart upload.
     pub delta_ceiling_multipart: LimitValue,
+    /// Spool space of the reference files kept across requests and restarts.
+    pub reference_cache: LimitValue,
     pub warnings: Vec<String>,
 }
 
@@ -1048,18 +1140,43 @@ pub fn shares_device(dir: &Path, roots: &[PathBuf]) -> bool {
     }
 }
 
-/// Bytes of the files that the spool directory holds now.
+/// The directory of the kept reference files, inside the spool directory.
+pub const REFERENCE_CACHE_DIR: &str = "references";
+
+/// Bytes of the files that the spool directory holds now: its own files and
+/// the kept reference files ([`REFERENCE_CACHE_DIR`]). A kept file has two
+/// names (hard links) while its process lives, and after a crash both stay
+/// for a time: each file counts once.
 fn own_spool_bytes(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| e.metadata().ok())
-                .filter(|m| m.is_file())
-                .map(|m| m.len())
-                .sum()
-        })
-        .unwrap_or(0)
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    for dir in [dir.to_path_buf(), dir.join(REFERENCE_CACHE_DIR)] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for meta in entries.flatten().filter_map(|e| e.metadata().ok()) {
+            if meta.is_file() && seen.insert(file_identity(&meta, seen.len())) {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+/// What tells two names of one file apart from two files: device and inode
+/// (elsewhere every name is its own file, numbered by `nth`).
+fn file_identity(meta: &std::fs::Metadata, nth: usize) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let _ = nth;
+        (meta.dev(), meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        (0, nth as u64)
+    }
 }
 
 #[cfg(unix)]
@@ -1178,6 +1295,86 @@ mod tests {
 
     fn auto() -> ExplicitLimits {
         ExplicitLimits::default()
+    }
+
+    /// The reference cache descends from the spool budget and
+    /// `max_object_size`: 16 references of the largest size, at most the
+    /// delta ceiling, so one reference of the largest size always fits.
+    #[test]
+    fn the_reference_cache_descends_from_the_object_size_and_the_budget() {
+        // Auto everything: 60 GiB free, budget 30 GiB, delta ceiling 10 GiB.
+        let (l, w) = derive_limits(facts(60 * GIB), auto());
+        assert_eq!(l.delta_ceiling, 10 * GIB);
+        assert_eq!(l.reference_cache, 10 * GIB);
+        assert_eq!(l.reference_cache_source, Source::Auto);
+        assert!(w.is_empty(), "{w:?}");
+        // The prod shape: max_object_size 512 MiB gives 16 files of 512 MiB.
+        let ex = ExplicitLimits {
+            max_object_size: BytesOrAuto::Bytes(512 * MIB),
+            ..auto()
+        };
+        let (l, w) = derive_limits(facts(60 * GIB), ex);
+        assert_eq!(l.reference_cache, 8 * GIB);
+        assert!(w.is_empty(), "{w:?}");
+        let note = l.reference_cache_note();
+        assert!(note.contains("reference cache 8 GiB"), "{note}");
+        assert!(
+            note.contains("512 MiB") && note.contains("about 16"),
+            "{note}"
+        );
+        assert!(l.boot_line(Path::new("/spool")).contains(&note));
+        // Explicit wins, is cut at the budget, and 0 turns the cache off.
+        for (set, want) in [(3 * GIB, 3 * GIB), (99 * GIB, 30 * GIB), (0, 0)] {
+            let ex = ExplicitLimits {
+                reference_cache: Some(set),
+                max_object_size: BytesOrAuto::Bytes(512 * MIB),
+                ..auto()
+            };
+            let (l, w) = derive_limits(facts(60 * GIB), ex);
+            assert_eq!(l.reference_cache, want);
+            assert_eq!(l.reference_cache_source, Source::Explicit);
+            assert!(w.is_empty(), "{w:?}");
+        }
+        let (off, _) = derive_limits(
+            facts(60 * GIB),
+            ExplicitLimits {
+                reference_cache: Some(0),
+                ..auto()
+            },
+        );
+        assert!(off.reference_cache_note().contains("reference cache off"));
+        // Below the largest reference: a warning that names both sizes.
+        let ex = ExplicitLimits {
+            reference_cache: Some(100 * MIB),
+            max_object_size: BytesOrAuto::Bytes(512 * MIB),
+            ..auto()
+        };
+        let (_, w) = derive_limits(facts(60 * GIB), ex);
+        assert_eq!(
+            w,
+            vec![LimitWarning::ReferenceCacheBelowLargestReference {
+                cache: 100 * MIB,
+                largest: 512 * MIB
+            }]
+        );
+        let text = w[0].message(Path::new("/spool"));
+        assert!(
+            text.contains("100 MiB") && text.contains("512 MiB"),
+            "{text}"
+        );
+    }
+
+    proptest::proptest! {
+        /// The auto cache is inside the budget and holds the largest reference.
+        #[test]
+        fn the_auto_reference_cache_holds_the_largest_reference(
+            budget in 0u64..(1u64 << 50),
+            max_object_size in 0u64..(1u64 << 50),
+        ) {
+            let cache = default_reference_cache(budget, max_object_size);
+            proptest::prop_assert!(cache <= delta_ceiling(budget));
+            proptest::prop_assert!(cache >= largest_reference(budget, max_object_size));
+        }
     }
 
     #[test]
@@ -1887,6 +2084,7 @@ mod tests {
                         per_upload,
                         total_multipart,
                         multipart_principal_share_percent: None,
+                        reference_cache: None,
                         max_object_size,
                         s3_backend,
                         s3_proxy_encrypted: false,

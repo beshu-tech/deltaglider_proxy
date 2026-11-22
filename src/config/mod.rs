@@ -1581,6 +1581,7 @@ impl Config {
                     spool: self.tuning.spool_max,
                     per_upload: self.tuning.multipart_relay_upload_max,
                     total_multipart: self.tuning.multipart_total_max,
+                    reference_cache: self.tuning.reference_cache_max,
                     multipart_principal_share_percent: Some(
                         self.tuning.multipart_principal_share_percent,
                     ),
@@ -1626,6 +1627,15 @@ impl Config {
                     l.effective.max_object_size
                 }),
         }
+    }
+
+    /// Spool space of the kept reference files, in bytes; 0 (also before the
+    /// boot measured the spool) = no reference file is kept.
+    pub fn reference_cache_bytes(&self) -> u64 {
+        self.tuning
+            .limits
+            .as_ref()
+            .map_or(0, |l| l.effective.reference_cache)
     }
 
     /// Re-apply the env overrides to an edited config that is about to

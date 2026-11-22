@@ -337,6 +337,9 @@ pub struct RuntimeTuning {
     /// `DGP_MAX_TOTAL_MULTIPART_BYTES`: what all open multipart uploads may
     /// hold together (`None` = half of the budget).
     pub multipart_total_max: Option<u64>,
+    /// `DGP_REFERENCE_CACHE_MAX_BYTES`: spool space of the kept reference
+    /// files (`Some(0)` = none is kept; `None` = derived from the limits).
+    pub reference_cache_max: Option<u64>,
     /// `DGP_MULTIPART_PRINCIPAL_SHARE_PERCENT` (1-100): the share of one
     /// principal of the open uploads and of the part bytes
     /// ([`crate::budget_share`]). The multipart store reads the same variable
@@ -453,6 +456,7 @@ impl RuntimeTuning {
             spool_max: super::limits::parse_spool_setting(env("DGP_SPOOL_MAX_BYTES").as_deref()).0,
             multipart_relay_upload_max: lookup_parse(env, "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES"),
             multipart_total_max: lookup_parse(env, "DGP_MAX_TOTAL_MULTIPART_BYTES"),
+            reference_cache_max: lookup_parse(env, "DGP_REFERENCE_CACHE_MAX_BYTES"),
             multipart_principal_share_percent: multipart_principal_share_percent(env),
             limits: None,
             // 0 would abandon the blocking tasks at once.
@@ -569,6 +573,10 @@ mod tests {
         (
             "DGP_MAX_TOTAL_MULTIPART_BYTES",
             Zero::Meaningful("no multipart part is admitted"),
+        ),
+        (
+            "DGP_REFERENCE_CACHE_MAX_BYTES",
+            Zero::Meaningful("no reference file is kept"),
         ),
         ("DGP_SHUTDOWN_TIMEOUT_SECS", Zero::Floor1),
         ("DGP_DISK_MONITOR_INTERVAL_SECS", Zero::Floor1),

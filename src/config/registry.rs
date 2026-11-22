@@ -459,6 +459,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_REFERENCE_CACHE_MAX_BYTES",
+        description: "Spool space of the verified reference files that the proxy keeps across requests and restarts, so a delta GET does not read its reference from the backend again; 0 keeps none (default: 16 files of the largest reference size, at most 25 % of the effective spool budget)",
+        example: "8589934592",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_MULTIPART_IDLE_TTL_HOURS",
         description: "Idle multipart upload TTL in hours before garbage collection (default: 24)",
         example: "24",

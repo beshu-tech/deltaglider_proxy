@@ -13,7 +13,10 @@ impl DynEngine {
     /// routes calls to the correct underlying backend per bucket. Otherwise,
     /// uses the legacy single-backend path from `config.backend`.
     pub async fn new(config: &Config, metrics: Option<Arc<Metrics>>) -> Result<Self, StorageError> {
-        Self::new_sharing(config, metrics, Arc::default()).await
+        let engine = Self::new_sharing(config, metrics, Arc::default()).await?;
+        // The engine of a boot replaces none: it is the installed one.
+        engine.install_reference_policy();
+        Ok(engine)
     }
 
     /// [`Self::new`], with the encryption-policy slots of `policies` (the
@@ -140,6 +143,7 @@ impl DynEngine {
         };
 
         let mut engine = Self::new_with_backend(Arc::new(storage), config, metrics);
+        engine.reference_policy = reference_policy(&published).into();
         engine.encryption = Arc::new(EngineEncryption {
             policies,
             published,
@@ -181,6 +185,22 @@ pub struct EngineEncryption {
     published: Vec<crate::storage::PolicySlot>,
 }
 
+/// Which buckets can hold a sealed object, as one text: the encryption
+/// settings that the kept reference files belong to. No key and no key id.
+fn reference_policy(published: &[crate::storage::PolicySlot]) -> String {
+    let mut lines: Vec<String> = published
+        .iter()
+        // The slot name is `backend\0<hash of its definition>`: only the
+        // backend name goes into the text (and into the file that holds it).
+        .map(|(name, _, cfg)| {
+            let backend = name.split('\0').next().unwrap_or_default();
+            format!("{backend}: {}", cfg.sealed_shape())
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// The policy-slot registry, to build the engine that replaces this one
     /// with [`DynEngine::new_sharing`].
@@ -195,6 +215,25 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// a rollback, which installs the previous engine again). Infallible.
     pub fn publish_encryption(&self) {
         self.encryption.policies.publish(&self.encryption.published);
+        self.install_reference_policy();
+    }
+
+    /// This engine is the installed one: the kept reference files belong to
+    /// its encryption settings. Files kept under other settings are all
+    /// dropped (a bucket that encrypts now may have a plaintext reference
+    /// among them), and an engine with other settings keeps nothing more.
+    pub fn install_reference_policy(&self) {
+        match &self.kept_plan {
+            Some((dir, budget)) => crate::deltaglider::range_spool::RangeSpoolCache::install_kept(
+                dir,
+                *budget,
+                &self.reference_policy,
+            ),
+            // An engine with a store of its own (tests).
+            None => {
+                self.range_spools.set_policy(&self.reference_policy);
+            }
+        }
     }
 }
 
@@ -654,9 +693,33 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             crate::deltaglider::spool::SpoolDir::shared()
                 .unwrap_or_else(|e| panic!("failed to init spool dir: {e}")),
         );
-        let range_spools = crate::deltaglider::range_spool::RangeSpoolCache::new(
-            std::time::Duration::from_secs(config.range_spool_ttl_secs),
+        let ttl = std::time::Duration::from_secs(config.range_spool_ttl_secs);
+        // Only a config with the limits of a boot says what to keep. The
+        // build changes nothing that is kept: the budget (0 with the cache
+        // off) takes effect when this engine is installed.
+        let kept_plan = config.tuning.limits.as_ref().map(|_| {
+            let budget = if ttl.is_zero() {
+                0
+            } else {
+                config.reference_cache_bytes()
+            };
+            let dir = spool.dir().join(crate::config::limits::REFERENCE_CACHE_DIR);
+            (dir, budget)
+        });
+        let kept_references = kept_plan
+            .as_ref()
+            .filter(|(_, budget)| *budget > 0)
+            .and_then(|(dir, budget)| {
+                crate::deltaglider::range_spool::RangeSpoolCache::kept_store(
+                    dir.clone(),
+                    *budget,
+                    &spool,
+                )
+            });
+        let range_spools = crate::deltaglider::range_spool::RangeSpoolCache::for_engine(
+            ttl,
             crate::deltaglider::range_spool::MAX_ENTRIES,
+            kept_references,
         );
         spool.register_evictor(Arc::downgrade(&range_spools) as _);
         Self {
@@ -683,6 +746,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             bucket_usage: None,
             spool,
             range_spools,
+            reference_policy: "".into(),
+            kept_plan,
             tuning: config.tuning.clone(),
             memory: Default::default(),
             encryption: Arc::new(EngineEncryption::default()),
@@ -705,6 +770,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[cfg(test)]
     pub(crate) fn with_spool_dir(mut self, spool: crate::deltaglider::spool::SpoolDir) -> Self {
         self.spool = Arc::new(spool);
+        self
+    }
+
+    /// Keep reference files in the engine's own spool (after
+    /// [`Self::with_spool_dir`]), with a budget of `max_bytes`.
+    #[cfg(test)]
+    pub(crate) fn with_kept_references(mut self, max_bytes: u64) -> Self {
+        use crate::deltaglider::range_spool::{RangeSpoolCache, MAX_ENTRIES};
+        let dir = self
+            .spool
+            .dir()
+            .join(crate::config::limits::REFERENCE_CACHE_DIR);
+        let store = RangeSpoolCache::kept_store(dir, max_bytes, &self.spool);
+        self.range_spools =
+            RangeSpoolCache::for_engine(std::time::Duration::from_secs(60), MAX_ENTRIES, store);
         self
     }
 

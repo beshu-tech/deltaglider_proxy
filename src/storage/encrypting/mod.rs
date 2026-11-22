@@ -340,6 +340,32 @@ impl EncryptionConfig {
         own || self.key.is_some() || self.legacy_key.is_some()
     }
 
+    /// Which buckets of this raw backend can hold a sealed object, as text:
+    /// the inputs of [`Self::bucket_may_hold_sealed`] and of the write mode,
+    /// with no key and no key id. Pure.
+    pub(crate) fn sealed_shape(&self) -> String {
+        let mut buckets: Vec<String> = self
+            .buckets
+            .iter()
+            .map(|(name, b)| {
+                format!(
+                    "{name}={:?}/{}/{}",
+                    b.write_mode,
+                    b.key.is_some(),
+                    b.legacy_key_id.is_some()
+                )
+            })
+            .collect();
+        buckets.sort();
+        format!(
+            "{:?}/{}/{} [{}]",
+            self.write_mode,
+            self.key.is_some(),
+            self.legacy_key.is_some(),
+            buckets.join(" ")
+        )
+    }
+
     /// The prepared key of `key` (from the ring; a key that is not there,
     /// which the engine never builds, is prepared on the spot).
     fn site_of(&self, key: &EncryptionKey) -> Arc<v2::SiteKey> {
@@ -2560,6 +2586,14 @@ impl<B: StorageBackend + Send + Sync + 'static> StorageBackend for EncryptingBac
             return "aes256-gcm-proxy";
         }
         self.inner.multipart_storage_label(bucket)
+    }
+
+    fn keeps_reference_files(&self, bucket: &str) -> bool {
+        // A reference of a bucket that can hold a sealed object is
+        // plaintext that the store holds encrypted: never kept on the disk.
+        self.writes_plaintext(bucket)
+            && !self.config.load().bucket_may_hold_sealed(bucket)
+            && self.inner.keeps_reference_files(bucket)
     }
 
     fn supports_native_multipart(&self, bucket: &str) -> bool {

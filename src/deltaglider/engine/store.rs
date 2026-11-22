@@ -1190,10 +1190,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             debug!("reference seed for {bucket}/{deltaspace_id} skipped: {e}");
             return;
         }
-        let key = crate::deltaglider::range_spool::RangeSpoolKey::reference(
-            self.cache_key(bucket, deltaspace_id),
-            ref_meta.file_sha256.clone(),
-        );
+        let key = self.reference_file_key(bucket, deltaspace_id, &ref_meta.file_sha256);
         let _ = self
             .range_spools
             .get_or_fill(key, || async { Ok::<_, std::convert::Infallible>(seed) })
@@ -1307,10 +1304,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // its own copy below.
         let shared_reference =
             if !fresh_baseline && !ref_meta.file_sha256.is_empty() && self.range_spools.caches() {
-                let key = crate::deltaglider::range_spool::RangeSpoolKey::reference(
-                    self.cache_key(put.bucket, put.deltaspace_id),
-                    ref_meta.file_sha256.clone(),
-                );
+                let key =
+                    self.reference_file_key(put.bucket, put.deltaspace_id, &ref_meta.file_sha256);
                 match self
                     .range_spools
                     .get_or_fill(key, || {
@@ -1516,6 +1511,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 self.cache.invalidate(&cache_key);
             }
         }
+        // A kept file of the reference that this one replaces is of no use.
+        self.forget_reference_files(put.bucket, put.deltaspace_id);
         // The `reference` decision counts when a delta commits against it.
         Ok(metadata)
     }
@@ -1530,6 +1527,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> bool {
         self.cache
             .invalidate(&self.cache_key(bucket, deltaspace_id));
+        self.forget_reference_files(bucket, deltaspace_id);
         match xnode
             .delete_reference(&*self.storage, bucket, deltaspace_id)
             .await
@@ -1777,6 +1775,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?;
         self.cache
             .invalidate(&self.cache_key(bucket, deltaspace_id));
+        self.forget_reference_files(bucket, deltaspace_id);
         Ok(ReferenceHeal::Healed(Box::new(healed)))
     }
 

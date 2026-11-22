@@ -2625,6 +2625,8 @@ mod body_resume_tests {
         Stall(usize),
         /// `n` bytes of the range, then the connection closes.
         Drop(usize),
+        /// No body: an error response with this status.
+        Refuse(u16),
     }
 
     /// One object; each GET takes the next plan entry (no entry: the whole
@@ -2665,6 +2667,17 @@ mod body_resume_tests {
         let body = f.body.lock().clone();
         let etag = f.etag.lock().clone();
         let mut h = HeaderMap::new();
+        if matches!(f.plan.lock().front(), Some(Send::Refuse(_))) {
+            let Some(Send::Refuse(status)) = f.plan.lock().pop_front() else {
+                unreachable!()
+            };
+            let xml = "<Error><Code>Refused</Code></Error>";
+            return (
+                StatusCode::from_u16(status).unwrap(),
+                h,
+                axum::body::Body::from(xml),
+            );
+        }
         if if_match.is_some_and(|m| m != etag) {
             let xml = "<Error><Code>PreconditionFailed</Code></Error>";
             return (
@@ -2691,7 +2704,7 @@ mod body_resume_tests {
         h.insert("etag", etag.parse().unwrap());
         h.insert("content-length", part.len().to_string().parse().unwrap());
         let out = match f.plan.lock().pop_front() {
-            None => axum::body::Body::from(part),
+            None | Some(Send::Refuse(_)) => axum::body::Body::from(part),
             Some(Send::Stall(n)) => {
                 let first = bytes::Bytes::from(part[..n].to_vec());
                 let s = futures::stream::iter([Ok::<_, std::io::Error>(first)])
@@ -2831,6 +2844,41 @@ mod body_resume_tests {
         assert!(matches!(err, StorageError::Transient(_)), "{err:?}");
         assert!(err.to_string().contains("the object changed"), "{err}");
         assert_eq!(fake.gets()[1].1, Some(old_etag));
+    }
+
+    /// Issue #200: a resume request that the backend does not answer uses
+    /// one resume, and the next resume reads the rest.
+    #[tokio::test]
+    async fn a_failed_resume_request_is_followed_by_the_next_resume() {
+        let obj = object();
+        let plan = vec![Send::Stall(70_000), Send::Refuse(503), Send::Refuse(503)];
+        let (ep, fake) = start(obj.clone(), plan).await;
+        let got = backend(&ep)
+            .get_delta("b", "v", "a.zip")
+            .await
+            .expect("the third resume reads the rest");
+        assert!(got == obj, "the resumed body differs from the object");
+        let range = Some(format!("bytes=70000-{}", obj.len() - 1));
+        let ranges: Vec<_> = fake.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(ranges, vec![None, range.clone(), range.clone(), range]);
+    }
+
+    /// Failed resume requests share the budget of the resumes, and a
+    /// refusal that no retry changes ends the read at once.
+    #[tokio::test]
+    async fn failed_resume_requests_end_the_read_within_the_budget() {
+        let mut plan = vec![Send::Stall(10)];
+        plan.extend(vec![Send::Refuse(503); BODY_RESUMES as usize]);
+        let (ep, fake) = start(object(), plan).await;
+        let err = backend(&ep).get_delta("b", "v", "a.zip").await.unwrap_err();
+        assert!(err.to_string().contains("gave up after"), "{err}");
+        assert_eq!(fake.gets().len(), BODY_RESUMES as usize + 1);
+
+        let plan = vec![Send::Stall(10), Send::Refuse(403)];
+        let (ep, fake) = start(object(), plan).await;
+        let err = backend(&ep).get_delta("b", "v", "a.zip").await.unwrap_err();
+        assert!(err.to_string().contains("the resume failed"), "{err}");
+        assert_eq!(fake.gets().len(), 2);
     }
 
     /// A body that breaks off on every GET fails after the resume budget,

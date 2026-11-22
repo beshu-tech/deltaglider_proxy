@@ -1511,6 +1511,12 @@ impl StorageBackend for RoutingBackend {
             .unwrap_or(false)
     }
 
+    fn keeps_reference_files(&self, bucket: &str) -> bool {
+        // Unknown home: no.
+        self.backend_hint(bucket, |b, real| b.keeps_reference_files(real))
+            .unwrap_or(false)
+    }
+
     fn new_key_refusal(&self, bucket: &str, prefix: &str, filename: &str) -> Option<String> {
         // An unknown home: the default backend's rule, as the multipart label does.
         self.backend_hint(bucket, |b, real| b.new_key_refusal(real, prefix, filename))

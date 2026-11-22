@@ -470,11 +470,15 @@ impl<S: StorageBackend + 'static> DeltaGliderEngine<S> {
         else {
             return Ok(());
         };
+        // Before and after: an error after the delete reached the store
+        // leaves no kept file either.
+        self.forget_reference_files(bucket, deltaspace_id);
         xnode
             .delete_reference(&*self.storage, bucket, deltaspace_id)
             .await?;
         self.cache
             .invalidate(&self.cache_key(bucket, deltaspace_id));
+        self.forget_reference_files(bucket, deltaspace_id);
         // Mirror `delete`'s accounting: the reclaimed reference bytes leave
         // stored_bytes (no object count change — the objects were counted as
         // they were individually deleted).

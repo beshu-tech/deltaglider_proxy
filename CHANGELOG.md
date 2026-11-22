@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- **The proxy keeps the reference files of delta folders on its disk.** A GET of a delta object needs the reference of its folder. The proxy now keeps each verified reference in `<spool dir>/references`, with no time limit and across restarts, so a later GET sends no request for the reference to the backend. The size of this cache follows from the other limits: 16 references of the largest size (the lower of `max_object_size` and the delta ceiling), and at most a third of the spool budget. `DGP_REFERENCE_CACHE_MAX_BYTES` sets it by hand, and `0` turns it off. The proxy removes kept references before it refuses or delays another request for spool space. It keeps references of S3 backends only, and never those of a bucket that can hold an object that the proxy encrypted. A change of the encryption settings deletes every kept reference, and a deleted reference takes its kept file with it. See [Auto-sized limits](docs/product/reference/configuration.md#auto-sized-limits).
+- The Limits card of the System page shows every derived space limit (spool budget, multipart limits, largest object, delta ceilings, reference cache) with its source and how the proxy found it. The boot log line and `GET /_/api/admin/config` `limits.reference_cache` show the reference cache too.
+
+### Fixed
+
+- A download of a delta object no longer fails with `503` when the backend stops in the middle of the reference and then does not answer the first resume request (issue #200). A resume request that gets no answer, a `5xx` or a `429` now uses one of the three resumes, and the next resume follows. Before, the first such request ended the read.
+- A cached file in the spool no longer counts against new uploads on a tmpfs or under Kubernetes: the proxy removes cached files before it refuses a write for the use of the spool budget.
+
 ## v2.3.0 — 2026-11-21
 
 ### Upgrade steps for the next release

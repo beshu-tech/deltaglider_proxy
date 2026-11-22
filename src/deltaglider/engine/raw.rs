@@ -155,6 +155,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .await
             }
         };
+        if written.is_ok() {
+            self.forget_reference_files(bucket, prefix);
+        }
         written.map_err(engine_to_storage)
     }
 

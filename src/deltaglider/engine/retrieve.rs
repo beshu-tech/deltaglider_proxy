@@ -629,10 +629,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 Ok((spool, filled.into_inner()))
             }
             StorageInfo::Reference { .. } => {
-                let key = RangeSpoolKey::reference(
-                    self.cache_key(bucket, deltaspace_id),
-                    metadata.file_sha256.clone(),
-                );
+                let key = self.reference_file_key(bucket, deltaspace_id, &metadata.file_sha256);
                 // A cached file needs no fill: no charge and no reservation.
                 if let Some(file) = self.range_spools.peek(&key) {
                     return Ok((file, None));
@@ -897,10 +894,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         };
         if !ref_sha256.is_empty() && self.range_spools.caches() {
             let group = out_and_delta().await?;
-            let key = RangeSpoolKey::reference(
-                self.cache_key(bucket, deltaspace_id),
-                ref_sha256.to_string(),
-            );
+            let key = self.reference_file_key(bucket, deltaspace_id, ref_sha256);
             let shared = self
                 .range_spools
                 .get_or_fill(key, || {
@@ -1276,10 +1270,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ref_sha256: &str,
         prefetched: Option<Vec<u8>>,
     ) -> Result<SharedDecode, EngineError> {
-        let key = RangeSpoolKey::reference(
-            self.cache_key(bucket, deltaspace_id),
-            ref_sha256.to_string(),
-        );
+        let key = self.reference_file_key(bucket, deltaspace_id, ref_sha256);
         let filled = std::sync::atomic::AtomicBool::new(false);
         let (shared, delta) = tokio::join!(
             self.range_spools.get_or_fill(key, || {
@@ -2062,6 +2053,98 @@ mod reference_download_tests {
             );
         })
         .await
+    }
+
+    /// A cold engine on `endpoint` that keeps reference files in the spool
+    /// directory `dir`, as the engine of a start does.
+    fn keeping_engine(endpoint: &str, dir: &std::path::Path) -> DynEngine {
+        const MIB: u64 = 1024 * 1024;
+        let s3 = crate::storage::s3_test_support::for_test_endpoint(endpoint);
+        let spool = crate::deltaglider::spool::SpoolDir::new(dir.to_path_buf(), 64 * MIB).unwrap();
+        DeltaGliderEngine::new_with_backend(
+            Arc::new(DynStorageBackend::new_box(s3)),
+            &Config::default(),
+            None,
+        )
+        .with_spool_dir(spool)
+        .with_kept_references(8 * MIB)
+    }
+
+    /// The kept reference files in the spool directory `dir`.
+    fn kept_files(dir: &std::path::Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir.join("references")) else {
+            return Vec::new();
+        };
+        entries
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| !n.starts_with('.'))
+            .collect()
+    }
+
+    /// Issue #200: the verified reference file outlives the engine that
+    /// downloaded it. The engine of the next start reads it from the local
+    /// disk, so a delta GET sends no reference read to the backend. When
+    /// the reference is deleted, its kept file goes.
+    #[tokio::test]
+    async fn a_new_engine_reads_a_kept_reference_from_the_disk() {
+        crate::deltaglider::spool::as_background(async {
+            let (writer, _, fake, endpoint) = writer_and_reader(&Config::default(), None).await;
+            let keys = store_deltas(&writer, "run", 3).await;
+            let want = writer.retrieve("b", &keys[2]).await.unwrap().0;
+            let dir = tempfile::tempdir().unwrap();
+            let reference_gets = || count(&fake, "GET /b/run/reference.bin");
+
+            let reader = keeping_engine(&endpoint, dir.path());
+            fake.clear();
+            read_all(&reader, &keys[1]).await.unwrap();
+            assert_eq!(reference_gets(), 1, "the first read is cold");
+            assert_eq!(kept_files(dir.path()).len(), 1);
+            // The process ends: its spool names go, the kept name stays.
+            drop(reader);
+            let left: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(left, ["references"], "the store of the reader is gone");
+            fake.clear();
+            let restarted = keeping_engine(&endpoint, dir.path());
+            assert_eq!(read_all(&restarted, &keys[2]).await.unwrap(), want);
+            assert_eq!(reference_gets(), 0, "{:#?}", fake.requests());
+
+            // The last object of the folder goes, and its reference with it.
+            for key in &keys {
+                restarted
+                    .delete("b", key, crate::maintenance::gate::Counted::for_test())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(kept_files(dir.path()), Vec::<String>::new());
+        })
+        .await
+    }
+
+    /// A filesystem backend is on a local disk already: its references are
+    /// not kept.
+    #[tokio::test]
+    async fn a_filesystem_reference_is_not_kept() {
+        const MIB: u64 = 1024 * 1024;
+        let (data, dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let backend = crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+            .await
+            .unwrap();
+        let spool =
+            crate::deltaglider::spool::SpoolDir::new(dir.path().to_path_buf(), 64 * MIB).unwrap();
+        let engine: DynEngine = DeltaGliderEngine::new_with_backend(
+            Arc::new(DynStorageBackend::new_box(backend)),
+            &Config::default(),
+            None,
+        )
+        .with_spool_dir(spool)
+        .with_kept_references(8 * MIB);
+        engine.create_bucket("b").await.unwrap();
+        let keys = store_deltas(&engine, "run", 2).await;
+        read_all(&engine, &keys[1]).await.unwrap();
+        assert_eq!(kept_files(dir.path()), Vec::<String>::new());
     }
 
     /// N concurrent cold GETs of one delta object above the spool threshold

@@ -145,6 +145,42 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )
     }
 
+    /// The key of the verified reference FILE of a deltaspace in
+    /// `range_spools`. A reference that the storage may keep
+    /// (`StorageBackend::keeps_reference_files`: a remote backend, a bucket
+    /// that cannot hold a sealed object) has no TTL and outlives a restart.
+    /// The tag is made BEFORE the storage is asked, so a purge that follows
+    /// a change of the encryption settings is seen by the fill. Only the
+    /// installed engine keeps: the tag names this engine's settings.
+    pub(super) fn reference_file_key(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        sha256: &str,
+    ) -> crate::deltaglider::range_spool::RangeSpoolKey {
+        use crate::deltaglider::range_spool::RangeSpoolKey;
+        match self.range_spools.kept_tag(&self.reference_policy) {
+            Some(tag) if !sha256.is_empty() && self.storage.keeps_reference_files(bucket) => {
+                RangeSpoolKey::kept_reference(
+                    &self.storage.storage_identity(bucket),
+                    deltaspace_id,
+                    sha256.to_string(),
+                    tag,
+                )
+            }
+            _ => {
+                RangeSpoolKey::reference(self.cache_key(bucket, deltaspace_id), sha256.to_string())
+            }
+        }
+    }
+
+    /// The reference of `deltaspace_id` was deleted or written again: drop
+    /// its kept file.
+    pub(super) fn forget_reference_files(&self, bucket: &str, deltaspace_id: &str) {
+        self.range_spools
+            .forget_deltaspace(&self.storage.storage_identity(bucket), deltaspace_id);
+    }
+
     /// Parse and validate an S3 key, returning the parsed key and deltaspace ID.
     pub(super) fn validated_key(
         &self,

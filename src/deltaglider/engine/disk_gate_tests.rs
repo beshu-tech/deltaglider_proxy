@@ -144,6 +144,9 @@ enum Spool {
     /// A write of the CLI (`cp`): the CLI process runs no disk monitor, so
     /// its spool gate never leaves level ok.
     NoMonitor,
+    /// The space of files that are on the disk already (the kept reference
+    /// files of an earlier run): it writes no new bytes.
+    OnDisk,
 }
 
 /// Every fn of `src/` (outside `spool.rs`) that acquires spool space, by
@@ -212,6 +215,7 @@ const SPOOL_SITES: &[(&str, &str, Spool)] = &[
         Spool::Gated,
     ),
     ("src/cli/transfer_io.rs", "upload_file", Spool::NoMonitor),
+    ("src/deltaglider/range_spool.rs", "adopt", Spool::OnDisk),
 ];
 
 /// The functions of `src/` that acquire spool space: `(file, function)`.
@@ -294,7 +298,13 @@ fn every_spool_acquisition_is_classified() {
             Spool::Gated if !asks => {
                 problems.push(format!("{file}::{name} is a write and must ask the gate"))
             }
-            Spool::SmallCodec | Spool::Primitive | Spool::NoMonitor | Spool::Admitted if asks => {
+            Spool::SmallCodec
+            | Spool::Primitive
+            | Spool::NoMonitor
+            | Spool::Admitted
+            | Spool::OnDisk
+                if asks =>
+            {
                 problems.push(format!(
                     "{file}::{name} is {class:?} and must not ask the gate"
                 ))
@@ -563,4 +573,49 @@ async fn a_download_over_the_principal_share_is_refused_at_once_and_a_write_is_n
     let _write = as_principal("dana", engine.spool_acquire_ungated(8 * MIB))
         .await
         .unwrap();
+}
+
+/// Issue #200: a kept reference file must not outlive its reference. Every
+/// fn of the engine that writes or deletes a reference.bin (through the
+/// guard methods of `locking::reference_writes`) also drops the kept file.
+#[test]
+fn every_reference_write_forgets_the_kept_file() {
+    const WRITES: &[&str] = &[
+        "put_reference",
+        "put_reference_from_file",
+        "delete_reference",
+        "rewrite_reference_if",
+    ];
+    let mut found = 0;
+    let mut missing = Vec::new();
+    for src in crate::source_scan::ast::src() {
+        // The guard methods themselves live in locking.rs.
+        if !src.rel.starts_with("src/deltaglider/engine/")
+            || src.rel.ends_with("/locking.rs")
+            || src.rel.ends_with("_tests.rs")
+        {
+            continue;
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for call in &src.prod.calls {
+            if !WRITES.iter().any(|n| call.named(n)) {
+                continue;
+            }
+            let name = src.fn_name(call.func).to_string();
+            if seen.contains(&name) {
+                continue;
+            }
+            seen.push(name.clone());
+            found += 1;
+            let body = crate::source_scan::prod_fn_text(&src.rel, &name);
+            if !body.contains("forget_reference_files(") {
+                missing.push(format!("{}::{name}", src.rel));
+            }
+        }
+    }
+    assert!(found >= 6, "the scan found only {found} reference writers");
+    assert!(
+        missing.is_empty(),
+        "call forget_reference_files after the reference write in: {missing:?}"
+    );
 }

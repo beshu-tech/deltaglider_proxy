@@ -1677,6 +1677,17 @@ pub trait StorageBackend: Send + Sync {
         }
     }
 
+    /// May the engine keep the plaintext reference files of `bucket` on its
+    /// local disk with no time limit, also across restarts
+    /// (`deltaglider::range_spool`, issue #200)? Yes only for a remote
+    /// backend that stores the bucket in the clear. A local backend gains
+    /// nothing, and the wrapper that encrypts says no for every bucket that
+    /// can hold a sealed object. The default is no, so a wrapper that does
+    /// not forward the question keeps nothing.
+    fn keeps_reference_files(&self, _bucket: &str) -> bool {
+        false
+    }
+
     /// A name for the STORAGE behind `bucket`: two bucket names that store
     /// into the same real bucket (policy aliases) get the same identity, so
     /// the engine's deltaspace locks serialise them. An unrouted bucket is

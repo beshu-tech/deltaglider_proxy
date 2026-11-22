@@ -3089,3 +3089,98 @@ mod range_matrix_tests {
         assert!(mm.is_empty(), "{mm:#?}");
     }
 }
+
+/// Issue #200: the engine keeps a plaintext reference file on its local
+/// disk only for a bucket that cannot hold a sealed object.
+mod kept_reference_tests {
+    use super::*;
+
+    fn wrapper(cfg: EncryptionConfig) -> EncryptingBackend<crate::storage::S3Backend> {
+        // The S3 backend says yes for every bucket; no request is sent.
+        let s3 = crate::storage::s3::test_support::for_test_endpoint("http://127.0.0.1:1");
+        assert!(s3.keeps_reference_files("b"));
+        EncryptingBackend::new(s3, shared(cfg))
+    }
+
+    fn with_bucket(mut cfg: EncryptionConfig, bucket: &str, keys: BucketKeys) -> EncryptionConfig {
+        cfg.buckets.insert(bucket.to_string(), keys);
+        cfg
+    }
+
+    #[tokio::test]
+    async fn only_a_bucket_that_cannot_hold_a_sealed_object_is_kept() {
+        let plain = EncryptionConfig::default;
+        let keyed_bucket = BucketKeys {
+            key: Some(key(2)),
+            key_id: Some("kid-b".into()),
+            ..Default::default()
+        };
+        let was_keyed = BucketKeys {
+            legacy_key_id: Some("kid-old".into()),
+            ..Default::default()
+        };
+        let mode_none = BucketKeys {
+            write_mode: WriteMode::PassThrough,
+            ..Default::default()
+        };
+        let cases: Vec<(&str, EncryptionConfig, bool, bool)> = vec![
+            // (name, config, bucket `b` is kept, another bucket is kept)
+            ("no key", plain(), true, true),
+            ("backend key", keyed(key(1), "kid-1"), false, false),
+            (
+                "backend key, plaintext writes",
+                EncryptionConfig {
+                    write_mode: WriteMode::PassThrough,
+                    ..keyed(key(1), "kid-1")
+                },
+                false,
+                false,
+            ),
+            (
+                "backend legacy key",
+                EncryptionConfig {
+                    legacy_key: Some(key(1)),
+                    legacy_key_id: Some("kid-old".into()),
+                    ..Default::default()
+                },
+                false,
+                false,
+            ),
+            (
+                "bucket key",
+                with_bucket(plain(), "b", keyed_bucket),
+                false,
+                true,
+            ),
+            (
+                "bucket stopped encrypting",
+                with_bucket(plain(), "b", was_keyed),
+                false,
+                true,
+            ),
+            (
+                "mode none on a keyed backend",
+                with_bucket(keyed(key(1), "kid-1"), "b", mode_none),
+                false,
+                false,
+            ),
+        ];
+        for (name, cfg, b, other) in cases {
+            let w = wrapper(cfg);
+            assert_eq!(w.keeps_reference_files("b"), b, "{name}: b");
+            assert_eq!(w.keeps_reference_files("other"), other, "{name}: other");
+        }
+    }
+
+    /// The answer follows the published config: an engine that a config
+    /// apply replaced stops keeping as soon as the new settings are live.
+    #[tokio::test]
+    async fn the_answer_follows_the_live_config() {
+        let slot = shared(EncryptionConfig::default());
+        let s3 = crate::storage::s3::test_support::for_test_endpoint("http://127.0.0.1:1");
+        let w = EncryptingBackend::new(s3, slot.clone());
+        assert!(w.keeps_reference_files("b"));
+        slot.store(Arc::new(keyed(key(1), "kid-1")));
+        assert!(!w.keeps_reference_files("b"));
+    }
+}
