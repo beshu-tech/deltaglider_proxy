@@ -47,7 +47,8 @@ test('a read-only destination says so, offers the writable prefixes and blocks t
 test('a file over max_object_size or the remaining quota is refused before upload', async () => {
   const { json, mockFetch } = await import('../test/fetchMock');
   const http = mockFetch();
-  http.on('GET', '/_/api/admin/config', json({ max_object_size: 100, bucket_policies: { releases: { quota_bytes: 1000 } } }));
+  http.on('GET', '/_/api/admin/storage/status', json({ state: 'healthy', largest_file: 100 }));
+  http.on('GET', '/_/api/admin/config', json({ bucket_policies: { releases: { quota_bytes: 1000 } } }));
   http.on('GET', '/_/api/admin/usage/bucket/releases', json({ bucket: 'releases', stored_bytes: 950, logical_bytes: 950, object_count: 1, never_scanned: false }));
   const user = userEvent.setup();
   renderWithQuery(
@@ -61,7 +62,7 @@ test('a file over max_object_size or the remaining quota is refused before uploa
   );
   // The refusal is on the file's own row, and the counts are of the files
   // that CAN go (D25, D30): never "3 files ready" above "Upload 1 file".
-  expect(await screen.findByRole('listitem', { name: 'big.bin: refused' })).toHaveTextContent(/200 B is over the 100 B object size limit/);
+  expect(await screen.findByRole('listitem', { name: 'big.bin: refused' })).toHaveTextContent(/This file is too large\. The limit is 100 B\./);
   expect(await screen.findByRole('listitem', { name: 'mid.bin: refused' })).toHaveTextContent(/60 B does not fit in the bucket quota/);
   expect(screen.getByText(/^3 files staged · 1 can be uploaded \(10 B\) · 2 refused$/)).toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: /Upload 1 file to builds\// }));

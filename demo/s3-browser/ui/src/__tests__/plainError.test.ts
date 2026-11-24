@@ -95,7 +95,7 @@ describe('plainError: S3 requests', () => {
   test.each([
     [s3(403, 'AccessDenied', 'Access Denied.'), 'You do not have permission to do this. Ask an administrator for access.'],
     [s3(403, 'SignatureDoesNotMatch', 'sig'), 'The access key or the secret key is wrong. Sign in again with valid credentials.'],
-    [s3(413, 'EntityTooLarge', 'too big'), 'The file is larger than the proxy accepts. Upload a smaller file, or ask an administrator to raise the size limit.'],
+    [s3(413, 'EntityTooLarge', 'too big'), 'This file is too large.'],
     [s3(503, 'SlowDown', 'Please reduce your request rate.'), 'The proxy is busy. Wait a moment and try again.'],
     [s3(404, 'NoSuchBucket', 'The specified bucket does not exist'), 'The bucket does not exist.'],
   ])('%s', (err, sentence) => {

@@ -19,8 +19,7 @@ test('a file over max_object_size is refused with the limit named', () => {
   assert.deepEqual(r.accepted.map((x) => x.name), ['ok.bin']);
   assert.equal(r.refused.length, 1);
   assert.equal(r.refused[0].file.name, 'big.bin');
-  // The limits are 1024-based, so the units say MiB (docs-audit finding 5).
-  assert.match(r.refused[0].reason, /143\.0 MiB.*100\.0 MiB/);
+  assert.equal(r.refused[0].reason, 'This file is too large. The limit is 100 MB.');
 });
 
 test('the quota counts the used bytes and the files before it in the batch', () => {

@@ -1,8 +1,9 @@
 import { formatBytes } from './utils';
+import { sizeWords } from './storageStatusView';
 
 /** What the page knows of the server's write limits; null = unknown. */
 export interface UploadLimits {
-  /** `advanced.max_object_size` (bytes). */
+  /** The largest file (bytes), from the storage status. */
   maxObjectSize: number | null;
   /** The bucket's `quota_bytes` policy. */
   quotaBytes: number | null;
@@ -32,7 +33,7 @@ export function precheckUpload<F extends Sized>(files: F[], limits: UploadLimits
     if (limits.maxObjectSize != null && file.size > limits.maxObjectSize) {
       refused.push({
         file,
-        reason: `${formatBytes(file.size)} is over the ${formatBytes(limits.maxObjectSize)} object size limit (max_object_size)`,
+        reason: `This file is too large. The limit is ${sizeWords(limits.maxObjectSize)}.`,
       });
       continue;
     }

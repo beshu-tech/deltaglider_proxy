@@ -16,6 +16,9 @@
  * (`plainError.test.ts`).
  */
 import { ApiError } from './errorHandling';
+import { queryClient } from './queries/client';
+import { qk } from './queries/keys';
+import { sizeWords } from './storageStatusView';
 
 /** An error as the UI shows it: one plain sentence, and the raw text for a
  *  "Details" disclosure when the sentence leaves something out. */
@@ -94,6 +97,8 @@ interface ErrorFacts {
   code?: string;
   /** The server's own text (JSON `message`, S3 `<Message>`). */
   detail?: string;
+  /** The proxy's machine reason (`x-deltaglider-reason`), e.g. `uploads-paused`. */
+  reason?: string;
   /** The full operator-facing text, for `details`. */
   raw: string;
 }
@@ -104,6 +109,7 @@ type SdkLikeError = {
   Code?: string;
   code?: string;
   $metadata?: { httpStatusCode?: number; requestId?: string };
+  $response?: { headers?: Record<string, string> };
 };
 
 /** "<context> failed (<status>) [<code>]: <text> (request-id: <id>)" — the
@@ -114,7 +120,7 @@ const WIRE_SHAPE = /^.*? failed(?: \((\d{3})\))?(?: \[([\w.:-]+)\])?: (.*?)(?: \
 function errorFacts(err: unknown): ErrorFacts {
   if (err instanceof ApiError) {
     const wire = WIRE_SHAPE.exec(err.message);
-    return { status: err.status, code: err.code, detail: err.detail ?? wire?.[3], raw: err.message };
+    return { status: err.status, code: err.code, detail: err.detail ?? wire?.[3], reason: err.reason, raw: err.message };
   }
   const sdk = (err && typeof err === 'object' ? err : {}) as SdkLikeError;
   if (sdk.$metadata) {
@@ -122,7 +128,7 @@ function errorFacts(err: unknown): ErrorFacts {
     const id = sdk.$metadata.requestId;
     const status = sdk.$metadata.httpStatusCode;
     const raw = `${status ? `(${status}) ` : ''}${code ? `[${code}] ` : ''}${sdk.message ?? ''}${id ? ` (request-id: ${id})` : ''}`.trim();
-    return { status, code, detail: sdk.message, raw };
+    return { status, code, detail: sdk.message, reason: sdk.$response?.headers?.['x-deltaglider-reason'], raw };
   }
   const text = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
   if (err instanceof TypeError && /failed to fetch|networkerror|load failed|network request failed/i.test(text)) {
@@ -155,7 +161,8 @@ const STATUS_SENTENCE: Record<number, string> = {
 const NAMES_A_DOC = /https:\/\/(?:www\.)?deltaglider\.com\/docs\//;
 
 /** Pure: the plain sentence for an S3 (or HTTP) failure, or null. */
-function knownRequestSentence({ status, code, detail }: ErrorFacts): string | null {
+function knownRequestSentence({ status, code, detail, reason }: ErrorFacts): string | null {
+  if (reason === 'uploads-paused') return "Uploads are paused. The server's disk is full. Try again later.";
   if (detail && NAMES_A_DOC.test(detail)) return null; // the proxy's own reason is better
   const quota = detail && /Bucket quota exceeded: (.+?) used \+ (.+?) upload > (.+?) limit/.exec(detail);
   if (quota) {
@@ -168,8 +175,11 @@ function knownRequestSentence({ status, code, detail }: ErrorFacts): string | nu
       return 'The access key or the secret key is wrong. Sign in again with valid credentials.';
     case 'AccessDenied':
       return 'You do not have permission to do this. Ask an administrator for access.';
-    case 'EntityTooLarge':
-      return 'The file is larger than the proxy accepts. Upload a smaller file, or ask an administrator to raise the size limit.';
+    case 'EntityTooLarge': {
+      // The limit is the one the status poll last read (any session).
+      const limit = queryClient.getQueryData<{ largest_file?: number }>(qk.storageStatus())?.largest_file;
+      return limit ? `This file is too large. The limit is ${sizeWords(limit)}.` : 'This file is too large.';
+    }
     case 'NoSuchBucket':
       return 'The bucket does not exist.';
     case 'NoSuchKey':

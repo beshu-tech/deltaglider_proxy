@@ -28,3 +28,4 @@ export * from './adminApi/bulkObjects';
 export * from './adminApi/deltaEfficiency';
 export * from './adminApi/bucketScan';
 export * from './adminApi/encryptionWitness';
+export * from './adminApi/storage';

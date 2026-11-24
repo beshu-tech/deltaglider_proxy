@@ -42,6 +42,8 @@ export const qk = {
   },
 
   // ── Storage ─────────────────────────────────────────────────────
+  /** The disk-capacity answer (admin view or browser view, by session). */
+  storageStatus: () => ['storage-status'] as const,
   backends: {
     // Deliberately a prefix of `origins`: a backend create/delete moves
     // buckets, so BackendsPanel's refresh() of the list also refetches origins.

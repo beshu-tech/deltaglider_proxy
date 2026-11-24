@@ -1,6 +1,7 @@
 /**
  * System — ONE page for the platform/runtime knobs that used to be five
- * separate Advanced screens plus Backup: Listener & TLS, Caches, runtime
+ * separate Advanced screens plus Backup: the Storage card and the largest-file
+ * limit, Listener & TLS, Caches, runtime
  * Limits (read-only env vars), Logging, Config DB sync, the encryption
  * witness (several instances only), Configuration as YAML and Backup.
  *
@@ -15,11 +16,13 @@ import {
   LimitsPanel,
   ListenerTlsPanel,
   LoggingPanel,
+  ObjectSizeLimitCard,
 } from './advancedPanels';
 import { useQuery } from '@tanstack/react-query';
 import RecoveryPanel from './RecoveryPanel';
 import ConfigYamlCard, { type ConfigYamlActions } from './ConfigYamlCard';
 import { CARD_GAP, contentColumn, CONTENT_FORM } from './shared-styles';
+import StorageCard from './StorageCard';
 import EncryptionWitnessCard from './EncryptionWitnessCard';
 import { ErrorState, LoadingState } from './StatePlaceholders';
 import { getSectionVersioned } from '../adminApi';
@@ -67,6 +70,8 @@ export default function SystemPanel({ onSessionExpired, onExportBackup, onImport
   // margin or padding of their own).
   return (
     <div style={column}>
+      <StorageCard />
+      <ObjectSizeLimitCard onSessionExpired={onSessionExpired} />
       <ListenerTlsPanel onSessionExpired={onSessionExpired} />
       <CachesPanel onSessionExpired={onSessionExpired} />
       <LimitsPanel onSessionExpired={onSessionExpired} />

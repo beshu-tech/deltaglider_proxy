@@ -457,16 +457,18 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
 }
 
 // ───────────────────────────────────────────────────────────
-// ObjectSizeLimitCard  (advanced.max_object_size — on the Buckets page)
+// ObjectSizeLimitCard  (advanced.max_object_size — on the System page)
 // ───────────────────────────────────────────────────────────
 
 const MIB = 1024 * 1024;
 
-/** The largest object any bucket accepts. Global, but operators look for it
- *  next to the per-bucket quota, so it renders on the Buckets page. */
+/** The element id of the editor: the Storage card's "Change the limit" scrolls to it. */
+export const SIZE_LIMIT_ANCHOR = 'storage-size-limit';
+
+/** The largest object any bucket accepts. Global; it sits under the Storage card on the System page. */
 export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
-  const subset = useAdvancedSubset(SIZE_LIMIT_INITIAL, onSessionExpired, 'storage/buckets/limits');
+  const subset = useAdvancedSubset(SIZE_LIMIT_INITIAL, onSessionExpired, 'system/limits');
   const { value, setValue } = subset;
   const form = useFieldValidation();
   const { data: config } = useAdminConfig({ onSessionExpired });
@@ -490,7 +492,7 @@ export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
     v.optional(v.integer({ min: 1, max: 5 * 1024 * 1024 })),
   );
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div id={SIZE_LIMIT_ANCHOR} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
       <AdvancedApplyRail editor={subset} form={form} />
       <div style={cardStyle}>
         <SectionHeader

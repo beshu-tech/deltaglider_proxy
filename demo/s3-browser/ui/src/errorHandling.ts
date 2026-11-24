@@ -4,17 +4,21 @@
  * (`{ok|success|applied: false, error}`) and the backup import send the
  * text in `error` and no `message`.
  */
-type JsonErrorBody = { error?: unknown; message?: unknown };
+type JsonErrorBody = { error?: unknown; message?: unknown; reason?: unknown };
 
 /** Pure: the code and the text of an admin JSON error body. */
-export function parseErrorBody(data: unknown): { code?: string; message?: string } {
+export function parseErrorBody(data: unknown): { code?: string; message?: string; reason?: string } {
   if (!data || typeof data !== 'object') return {};
-  const { error, message } = data as JsonErrorBody;
+  const { error, message, reason } = data as JsonErrorBody;
   const err = typeof error === 'string' && error ? error : undefined;
   const msg = typeof message === 'string' && message ? message : undefined;
-  if (msg) return { code: err, message: msg };
-  return { message: err };
+  const why = typeof reason === 'string' && reason ? { reason } : {};
+  if (msg) return { code: err, message: msg, ...why };
+  return { message: err, ...why };
 }
+
+/** The proxy's machine reason for a refusal, on the S3 wire. */
+const REASON_HEADER = 'x-deltaglider-reason';
 
 function statusHint(status: number): string {
   switch (status) {
@@ -67,7 +71,7 @@ function parseXmlError(xmlText: string): { code?: string; message?: string } {
   }
 }
 
-async function readResponseBodyMessage(res: Response): Promise<{ code?: string; message?: string }> {
+async function readResponseBodyMessage(res: Response): Promise<{ code?: string; message?: string; reason?: string }> {
   const ct = (res.headers.get('content-type') || '').toLowerCase();
   const body = await res.text();
   if (!body) return {};
@@ -75,7 +79,7 @@ async function readResponseBodyMessage(res: Response): Promise<{ code?: string; 
   if (ct.includes('application/json')) {
     try {
       const parsed = parseErrorBody(JSON.parse(body));
-      return { code: parsed.code, message: parsed.message || trimOneLine(body) };
+      return { code: parsed.code, message: parsed.message || trimOneLine(body), reason: parsed.reason };
     } catch {
       return { message: trimOneLine(body) };
     }
@@ -102,9 +106,12 @@ export class ApiError extends Error {
   readonly code?: string;
   /** The server's error text (JSON `message`, or a lone `error`), when it sent one. */
   readonly detail?: string;
+  /** The proxy's machine reason (`x-deltaglider-reason`, or the JSON `reason`), e.g. `uploads-paused`. */
+  readonly reason?: string;
 
-  constructor(message: string, status: number, code?: string, detail?: string) {
+  constructor(message: string, status: number, code?: string, detail?: string, reason?: string) {
     super(message);
+    this.reason = reason;
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
@@ -114,7 +121,7 @@ export class ApiError extends Error {
 
 export async function throwApiError(res: Response, context: string): Promise<never> {
   const requestId = res.headers.get('x-amz-request-id') || res.headers.get('x-request-id') || '';
-  const { code, message } = await readResponseBodyMessage(res.clone());
+  const { code, message, reason: bodyReason } = await readResponseBodyMessage(res.clone());
   const hint = statusHint(res.status);
   const main = message || hint || `HTTP ${res.status}`;
   const codePart = code ? ` [${code}]` : '';
@@ -124,6 +131,7 @@ export async function throwApiError(res: Response, context: string): Promise<nev
     res.status,
     code,
     message,
+    res.headers.get(REASON_HEADER) || bodyReason,
   );
 }
 
@@ -156,6 +164,8 @@ type S3LikeError = {
     httpStatusCode?: number;
     requestId?: string;
   };
+  /** The raw HTTP answer the AWS SDK attaches to a service error (header names lower-case). */
+  $response?: { headers?: Record<string, string> };
 };
 
 /**
@@ -171,6 +181,7 @@ export function normalizeS3Error(err: unknown, context: string): ApiError {
     prior?.status ?? e?.$metadata?.httpStatusCode ?? 0,
     prior?.code ?? (e?.Code || e?.code || e?.name),
     prior?.detail ?? e?.message,
+    prior?.reason ?? e?.$response?.headers?.[REASON_HEADER],
   );
 }
 

@@ -9,6 +9,7 @@ import { useIsNarrow } from '../useIsNarrow';
 import { BREAKPOINT } from './shared-styles';
 import FullScreenHeader from './FullScreenHeader';
 import AdminSidebar from './AdminSidebar';
+import StorageBanner from './StorageBanner';
 import { ADMIN_IA } from './adminNavigation';
 import { findEntry } from '../adminNavTree';
 import ReloginModal from './ReloginModal';
@@ -544,6 +545,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
             overflow: 'auto',
           }}
         >
+          <StorageBanner enabled={authed && canAdmin} onFix={() => navigateAdmin('system')} />
           {adminConfig.data?.config_file_writable === false && (
             // A read-only mount (Docker `:ro`, a Kubernetes subPath) keeps
             // applies live only until the next restart.
