@@ -3015,6 +3015,7 @@ async fn a_disk_full_refusal_has_a_fixed_text_and_a_reason_on_every_write_verb()
                 Some("uploads-paused"),
                 "{what}"
             );
+            assert!(headers.contains_key("retry-after"), "{what}: Retry-After");
             let body = resp.text().await.unwrap();
             assert!(
                 body.contains("<Code>ServiceUnavailable</Code>"),
@@ -3042,4 +3043,53 @@ async fn a_disk_full_refusal_has_a_fixed_text_and_a_reason_on_every_write_verb()
             assert!(!figure.is_match(&body), "{what}: {body}");
         }
     }
+}
+
+/// A browser page reads the reason and `Retry-After` of the refusal: the
+/// permissive CORS layer exposes both on the real 503 and on a preflight.
+#[tokio::test]
+async fn the_disk_full_refusal_exposes_its_reason_headers_to_a_browser() {
+    common::expect_server_errors("a full disk refuses the write that this test tries");
+    let spool = tempfile::TempDir::new().unwrap();
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .env("DGP_CORS_PERMISSIVE", "true")
+        .env("DGP_TEST_DISK_MONITOR_FREE_PERCENT", "3")
+        .build()
+        .await;
+    let url = format!("{}/{}/cors.bin", server.endpoint(), server.bucket());
+    let resp = server
+        .http()
+        .put(&url)
+        .header("origin", "https://app.example")
+        .body(vec![7u8; 512])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    let exposed = resp
+        .headers()
+        .get("access-control-expose-headers")
+        .expect("expose list on the 503")
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    for name in ["x-deltaglider-reason", "retry-after"] {
+        assert!(exposed.contains(name), "{name} not exposed: {exposed}");
+    }
+    let pre = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "PUT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        pre.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "{:?}",
+        pre.headers()
+    );
 }

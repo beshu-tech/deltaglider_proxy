@@ -413,14 +413,23 @@ pub struct CompletionFailure {
     /// The owner's explicit status (a code that has no status of its own,
     /// such as a quota refusal, carries it here).
     pub status: Option<axum::http::StatusCode>,
+    /// The owner's `x-deltaglider-reason` (a disk-full refusal), so a joiner
+    /// answers with the same header.
+    pub reason: Option<&'static str>,
 }
 
 impl CompletionFailure {
     pub fn of(err: &s3s::S3Error) -> Self {
+        let reason = err
+            .headers()
+            .and_then(|h| h.get(crate::api::errors::REASON_HEADER))
+            .filter(|v| v.as_bytes() == crate::disk_watch::UPLOADS_PAUSED_REASON.as_bytes())
+            .map(|_| crate::disk_watch::UPLOADS_PAUSED_REASON);
         Self {
             code: err.code().clone(),
             message: err.message().map(str::to_string),
             status: err.status_code(),
+            reason,
         }
     }
 
@@ -429,6 +438,7 @@ impl CompletionFailure {
             code: s3s::S3ErrorCode::InternalError,
             message: Some(message.to_string()),
             status: None,
+            reason: None,
         }
     }
 
@@ -442,6 +452,7 @@ impl CompletionFailure {
                 "the request that completes this upload ended before it finished; retry".into(),
             ),
             status: Some(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+            reason: None,
         }
     }
 
@@ -452,6 +463,14 @@ impl CompletionFailure {
         };
         if let Some(status) = self.status {
             err.set_status_code(status);
+        }
+        if let Some(reason) = self.reason {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                crate::api::errors::REASON_HEADER,
+                axum::http::HeaderValue::from_static(reason),
+            );
+            err = crate::s3_adapter_s3s::error_with_headers(err, headers);
         }
         err
     }

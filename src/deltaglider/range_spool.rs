@@ -1356,11 +1356,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sd = SpoolDir::new(dir.path().to_path_buf(), 64 * MIB).unwrap();
         let cache = store(&sd, Duration::from_secs(60), 8 * MIB);
-        sd.gate()
-            .set(crate::disk_watch::Level::High, "the disk is full".into());
+        sd.gate().set(crate::disk_watch::Level::High);
         reference(&cache, &sd, &mib_of(1, 1)).await;
         assert!(names(&sd).is_empty());
-        sd.gate().set(crate::disk_watch::Level::Ok, String::new());
+        sd.gate().set(crate::disk_watch::Level::Ok);
         reference(&cache, &sd, &mib_of(2, 1)).await;
         assert_eq!(names(&sd).len(), 1);
     }

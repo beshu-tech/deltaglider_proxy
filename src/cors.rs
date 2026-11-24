@@ -165,6 +165,8 @@ mod tests {
         }
         for name in [
             "etag",
+            "retry-after",
+            "x-deltaglider-reason",
             "content-range",
             "x-amz-request-id",
             "x-amz-version-id",

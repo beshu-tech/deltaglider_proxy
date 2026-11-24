@@ -928,7 +928,7 @@ async fn a_reencrypt_that_waits_for_disk_resumes_on_the_real_clock_and_drains_th
         .load()
         .spool_dir()
         .gate()
-        .set(crate::disk_watch::Level::Ok, String::new());
+        .set(crate::disk_watch::Level::Ok);
     let gate = e.state.maintenance_gate.clone();
     let row = |id| {
         let db = e.db.clone();
@@ -1020,7 +1020,7 @@ async fn a_reencrypt_without_the_write_gate_sets_no_mark_and_never_drains() {
         .load()
         .spool_dir()
         .gate()
-        .set(crate::disk_watch::Level::Ok, String::new());
+        .set(crate::disk_watch::Level::Ok);
     let gate = e.state.maintenance_gate.clone();
     let row = |id| {
         let db = e.db.clone();
@@ -1106,12 +1106,7 @@ async fn a_reencrypt_whose_objects_need_no_spool_runs_at_a_full_spool_disk() {
     use crate::disk_watch::Level;
     let e = env_own_spool(4).await;
     let _watch = watch_with(&e.state, 50);
-    e.state
-        .engine
-        .load()
-        .spool_dir()
-        .gate()
-        .set(Level::High, "the spool disk is full".into());
+    e.state.engine.load().spool_dir().gate().set(Level::High);
     let job = e.claim().await.unwrap();
     let id = job.id;
     e.run(job).await;
@@ -1218,7 +1213,7 @@ async fn a_disk_wait_marks_the_gate_only_in_the_phases_where_it_is_safe() {
             .load()
             .spool_dir()
             .gate()
-            .set(crate::disk_watch::Level::Ok, String::new());
+            .set(crate::disk_watch::Level::Ok);
         let params = (kind == "migrate").then(|| {
             serde_json::to_string(&super::super::migrate::MigrateParams {
                 disk_wait: false,
@@ -1287,10 +1282,7 @@ async fn a_large_reencrypt_visit_at_a_full_spool_disk_defers_and_leaves_the_obje
         .store("b", "large.jpg", &large, None, Default::default())
         .await
         .unwrap();
-    engine
-        .spool_dir()
-        .gate()
-        .set(Level::High, "the spool disk is full".into());
+    engine.spool_dir().gate().set(Level::High);
     let marker = crate::maintenance::conversion::begin(&engine, "b", None)
         .await
         .unwrap();
@@ -1308,7 +1300,7 @@ async fn a_large_reencrypt_visit_at_a_full_spool_disk_defers_and_leaves_the_obje
     };
     let visit = visitor.visit(&engine, "large.jpg", None).await;
     assert!(
-        matches!(&visit, Visit::Deferred(m) if m == "the spool disk is full"),
+        matches!(&visit, Visit::Deferred(m) if m == crate::disk_watch::UPLOADS_PAUSED_MESSAGE),
         "a refusal of the spool gate defers the job: {}",
         match &visit {
             Visit::Failed(m) => format!("Failed({m})"),
@@ -1328,7 +1320,7 @@ async fn a_large_reencrypt_visit_at_a_full_spool_disk_defers_and_leaves_the_obje
     );
     assert_eq!(engine.retrieve("b", "large.jpg").await.unwrap().0, large);
     // With room again the same visit rewrites it.
-    engine.spool_dir().gate().set(Level::Ok, String::new());
+    engine.spool_dir().gate().set(Level::Ok);
     assert!(matches!(
         visitor.visit(&engine, "large.jpg", None).await,
         Visit::Done { .. } | Visit::Adopted { .. }

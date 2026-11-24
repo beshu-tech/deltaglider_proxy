@@ -756,13 +756,11 @@ impl SpoolDir {
         self.dropped_for_level.store(false, Ordering::SeqCst);
         let th = self.gate.by_use()?;
         loop {
-            let refusal = crate::disk_watch::use_refusal(
-                &th,
-                self.max_bytes(),
-                self.used_bytes(),
-                self.dir(),
-            );
+            let (budget, used) = (self.max_bytes(), self.used_bytes());
+            let refusal = crate::disk_watch::use_refusal(&th, budget, used);
             if refusal.is_none() || !self.evict_one_cached() {
+                self.gate
+                    .note_use_refusal(refusal.is_some(), self.dir(), used, budget);
                 return refusal;
             }
         }
@@ -1823,14 +1821,13 @@ mod tests {
         assert_eq!(spool.write_refusal(), None);
         assert!(spool.admit_new_write().is_ok());
         // By level.
-        spool
-            .gate()
-            .set(crate::disk_watch::Level::High, "the disk is full".into());
-        assert_eq!(spool.write_refusal().as_deref(), Some("the disk is full"));
+        spool.gate().set(crate::disk_watch::Level::High);
+        assert_eq!(
+            spool.write_refusal().as_deref(),
+            Some(crate::disk_watch::UPLOADS_PAUSED_MESSAGE)
+        );
         assert!(spool.admit_new_write().is_err());
-        spool
-            .gate()
-            .set(crate::disk_watch::Level::Ok, String::new());
+        spool.gate().set(crate::disk_watch::Level::Ok);
         // By use: the budget is nearly all reserved.
         let mut th = crate::disk_watch::Thresholds::new(
             &crate::config::tuning::RuntimeTuning::default().disk_monitor,
@@ -1897,7 +1894,7 @@ mod tests {
         let cache = Arc::new(Cache(parking_lot::Mutex::new(Vec::new())));
         spool.register_evictor(Arc::downgrade(&cache) as std::sync::Weak<dyn SpoolEvictor>);
         let fill = || cache.0.lock().push(spool.try_acquire(MIB).unwrap());
-        let level = |l| spool.gate().set(l, "the disk is full".into());
+        let level = |l| spool.gate().set(l);
         fill();
         level(crate::disk_watch::Level::High);
         assert!(spool.write_refusal().is_some());

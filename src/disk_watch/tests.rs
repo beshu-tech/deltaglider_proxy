@@ -809,11 +809,22 @@ fn the_spool_is_judged_live_by_its_use_where_the_free_space_hides_the_limit() {
     assert!(spool.gate().by_use().is_none());
 }
 
+/// The use refusal logs once per transition, not per refused request.
+#[test]
+fn the_use_refusal_logs_once_per_transition() {
+    let gate = SpoolGate::default();
+    let dir = Path::new("/spool");
+    let t = |refused| gate.note_use_refusal(refused, dir, 95 * MIB, 100 * MIB);
+    assert!(t(true));
+    assert!(!t(true));
+    assert!(!t(false));
+    assert!(t(true));
+}
+
 /// Pure: the live refusal over `used / budget`, by table.
 #[test]
 fn the_use_refusal_table() {
     let th = Thresholds::percent_only(&tuning());
-    let dir = Path::new("/spool");
     // (used MiB of 100, refused?): high starts below 10% left.
     let table = [
         (0, false),
@@ -827,20 +838,20 @@ fn the_use_refusal_table() {
         (150, true),
     ];
     for (used, want) in table {
-        let got = use_refusal(&th, 100 * MIB, used * MIB, dir);
+        let got = use_refusal(&th, 100 * MIB, used * MIB);
         assert_eq!(got.is_some(), want, "{used} MiB of 100 reserved");
     }
     // No budget, no judgement (a spool of zero is not a verdict).
-    assert!(use_refusal(&th, 0, 0, dir).is_none());
+    assert!(use_refusal(&th, 0, 0).is_none());
     // A level high that is off never refuses; critical alone refuses at 95%.
     let mut t = tuning();
     t.high_max_bytes = 0;
     let th = Thresholds::percent_only(&t);
-    assert!(use_refusal(&th, 100 * MIB, 92 * MIB, dir).is_none());
-    assert!(use_refusal(&th, 100 * MIB, 96 * MIB, dir).is_some());
+    assert!(use_refusal(&th, 100 * MIB, 92 * MIB).is_none());
+    assert!(use_refusal(&th, 100 * MIB, 96 * MIB).is_some());
     t.critical_max_bytes = 0;
     let th = Thresholds::percent_only(&t);
-    assert!(use_refusal(&th, 100 * MIB, 100 * MIB, dir).is_none());
+    assert!(use_refusal(&th, 100 * MIB, 100 * MIB).is_none());
 }
 
 /// The spool level is the worse of its disk and its use; a spool whose disk
@@ -1222,10 +1233,12 @@ async fn the_running_tick_names_the_default_backend() {
 #[test]
 fn the_refusal_of_a_home_by_table() {
     use crate::storage::BucketHome;
-    let critical: BTreeMap<String, String> =
-        [("second".to_string(), "disk full".to_string())].into();
+    let critical: BTreeSet<String> = ["second".to_string()].into();
     let table = [
-        (BucketHome::Backend("second".into()), Some("disk full")),
+        (
+            BucketHome::Backend("second".into()),
+            Some(UPLOADS_PAUSED_MESSAGE),
+        ),
         (BucketHome::Backend("first".into()), None),
         // No router: the one backend, the default.
         (BucketHome::Default, None),
@@ -1241,7 +1254,7 @@ fn the_refusal_of_a_home_by_table() {
     }
     // The default backend itself critical: `Default` and an Undetermined
     // bucket differ, the first is refused and the second is not.
-    let critical: BTreeMap<String, String> = [("first".to_string(), "full".to_string())].into();
+    let critical: BTreeSet<String> = ["first".to_string()].into();
     assert!(refusal_for_home(&critical, "first", &BucketHome::Default).is_some());
     assert!(refusal_for_home(&critical, "first", &BucketHome::Undetermined).is_none());
 }

@@ -31,10 +31,7 @@ async fn engine() -> (tempfile::TempDir, DynEngine) {
 }
 
 fn set_level(engine: &DynEngine, level: Level) {
-    engine
-        .spool
-        .gate()
-        .set(level, format!("at level {}", level.name()));
+    engine.spool.gate().set(level);
 }
 
 /// The ingest reservation the way the ingest makes it: the gate, then the wrapper.

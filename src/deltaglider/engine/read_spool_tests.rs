@@ -369,10 +369,7 @@ async fn a_small_put_against_a_large_reference_at_a_full_spool_disk_is_stored_wh
         .store("b", "rel/a.zip", &base, None, HashMap::new())
         .await
         .unwrap();
-    engine
-        .spool
-        .gate()
-        .set(Level::High, "the spool disk is full".into());
+    engine.spool.gate().set(Level::High);
     let mut small = base[..2048].to_vec();
     small[100] ^= 1;
     let r = engine
@@ -386,7 +383,7 @@ async fn a_small_put_against_a_large_reference_at_a_full_spool_disk_is_stored_wh
     );
     assert_eq!(engine.retrieve("b", "rel/s.zip").await.unwrap().0, small);
     // With room again the same PUT is a delta.
-    engine.spool.gate().set(Level::Ok, String::new());
+    engine.spool.gate().set(Level::Ok);
     let mut again = base[..2048].to_vec();
     again[200] ^= 1;
     let r = engine

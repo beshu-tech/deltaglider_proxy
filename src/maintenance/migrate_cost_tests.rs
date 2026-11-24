@@ -563,10 +563,12 @@ async fn a_migrate_copy_ignores_a_full_spool_disk_when_no_object_needs_a_spool()
     use super::super::worker::cost_tests::watch_with;
     let e = env_with("stage", 5, false).await;
     let _watch = watch_with(&e.state, 50);
-    e.state.engine.load().spool_dir().gate().set(
-        crate::disk_watch::Level::High,
-        "the spool disk is full".into(),
-    );
+    e.state
+        .engine
+        .load()
+        .spool_dir()
+        .gate()
+        .set(crate::disk_watch::Level::High);
     let mut c = Counters::default();
     e.run().copy(&mut c).await.unwrap();
     assert_eq!(c.done, 5, "{c:?}");
@@ -584,7 +586,7 @@ async fn a_migrate_copy_waits_for_the_disk_of_its_target_backend() {
         .load()
         .spool_dir()
         .gate()
-        .set(crate::disk_watch::Level::Ok, String::new());
+        .set(crate::disk_watch::Level::Ok);
     let mut c = Counters::default();
     let Err(stop) = e.run().copy(&mut c).await else {
         panic!("the copy waits");
@@ -634,7 +636,7 @@ async fn a_cancelled_migrate_unwinds_while_the_target_disk_is_still_full() {
         .load()
         .spool_dir()
         .gate()
-        .set(crate::disk_watch::Level::Ok, String::new());
+        .set(crate::disk_watch::Level::Ok);
     let gate = e.state.maintenance_gate.clone();
     gate.sync_from(&*e.db.lock().await);
     gate.mark_disk_deferred(e.job.id, super::super::store::current_unix_seconds() - 1);

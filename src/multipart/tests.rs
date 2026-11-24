@@ -171,6 +171,34 @@ async fn completion_joiner_sees_the_owners_error() {
     assert_eq!(seen.message(), Some("tiny"));
 }
 
+/// A joiner of a Complete that the disk gate refused keeps the reason header.
+#[tokio::test]
+async fn completion_joiner_keeps_the_disk_full_reason() {
+    let store = std::sync::Arc::new(unshared(1024));
+    let parts = parts_fixture();
+    let up = store.create("b", "k", None, Default::default()).unwrap();
+    let owner = match store.begin_complete(&up, "b", "k", &parts).unwrap() {
+        BeginComplete::Owner(p) => p,
+        _ => panic!("must be Owner"),
+    };
+    let rx = match store.begin_complete(&up, "b", "k", &parts).unwrap() {
+        BeginComplete::Join(rx) => rx,
+        _ => panic!("must Join"),
+    };
+    let owner_error: s3s::S3Error = crate::api::S3Error::from(
+        crate::deltaglider::EngineError::Overloaded(crate::deltaglider::Overload::DiskFull),
+    )
+    .into();
+    owner.publish(Err(CompletionFailure::of(&owner_error)));
+    let seen = rx.borrow().clone().unwrap().unwrap_err().to_s3s();
+    assert_eq!(
+        seen.headers()
+            .and_then(|h| h.get("x-deltaglider-reason"))
+            .map(|v| v.as_bytes()),
+        Some(&b"uploads-paused"[..])
+    );
+}
+
 #[tokio::test]
 async fn completion_publisher_drop_without_publish_unwedges_registry() {
     let store = std::sync::Arc::new(unshared(1024));

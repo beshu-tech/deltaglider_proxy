@@ -32,7 +32,7 @@
 //! `data`) `deltaglider_disk_free_bytes` and `deltaglider_disk_total_bytes`;
 //! and for every role `deltaglider_disk_level`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -339,8 +339,9 @@ pub fn log_action(
 #[derive(Debug, Default)]
 pub struct SpoolGate {
     level: AtomicU8,
-    message: Mutex<String>,
     by_use: Mutex<Option<Thresholds>>,
+    /// Is the use of the budget refusing now? (for the once-per-transition log)
+    use_refusing: std::sync::atomic::AtomicBool,
 }
 
 impl SpoolGate {
@@ -348,22 +349,38 @@ impl SpoolGate {
         Level::from_u8(self.level.load(Ordering::Acquire))
     }
 
-    /// Set by the monitor. `message` is what a refused request reads.
-    pub fn set(&self, level: Level, message: String) {
-        *self.message.lock() = message;
+    /// Set by the monitor. A refused request reads the fixed
+    /// [`UPLOADS_PAUSED_MESSAGE`]: the gate holds no free text.
+    pub fn set(&self, level: Level) {
         self.level.store(level.as_u8(), Ordering::Release);
     }
 
     /// `Some(message)` while the disk of the spool is at level high or
     /// critical.
     pub fn refusal(&self) -> Option<String> {
-        (self.level() >= Level::High).then(|| self.message.lock().clone())
+        (self.level() >= Level::High).then(|| UPLOADS_PAUSED_MESSAGE.to_string())
     }
 
     /// Turn the live judgement of the use of the budget on (with its
     /// thresholds) or off. Set by the monitor.
     pub fn set_by_use(&self, thresholds: Option<Thresholds>) {
         *self.by_use.lock() = thresholds;
+    }
+
+    /// Log, at warn, the start of a refusal by the use of the budget: once
+    /// per transition, never per refused request.
+    pub fn note_use_refusal(&self, refused: bool, dir: &Path, used: u64, budget: u64) -> bool {
+        let was = self.use_refusing.swap(refused, Ordering::AcqRel);
+        let started = refused && !was;
+        if started {
+            tracing::warn!(
+                "[disk] the spool budget of {} is nearly all reserved: refusing new uploads ({} of {} left)",
+                dir.display(),
+                human(budget.saturating_sub(used)),
+                human(budget)
+            );
+        }
+        started
     }
 
     /// The thresholds of the live judgement, when it is on.
@@ -375,21 +392,13 @@ impl SpoolGate {
 /// Pure: the refusal of a new spool reservation by the use of the budget:
 /// `Some(message)` when the reserved bytes (`used`) leave less than the high
 /// threshold of the budget.
-pub fn use_refusal(th: &Thresholds, budget: u64, used: u64, dir: &Path) -> Option<String> {
+pub fn use_refusal(th: &Thresholds, budget: u64, used: u64) -> Option<String> {
     let facts = Facts {
         free: budget.saturating_sub(used),
         total: budget,
     };
     let level = raw_level(facts, th);
-    (level >= Level::High).then(|| {
-        tracing::debug!(
-            "[disk] the spool budget of {} is nearly all reserved: refusing a new upload ({} of {} left)",
-            dir.display(),
-            human(facts.free),
-            human(facts.total)
-        );
-        UPLOADS_PAUSED_MESSAGE.to_string()
-    })
+    (level >= Level::High).then(|| UPLOADS_PAUSED_MESSAGE.to_string())
 }
 
 /// One measured path.
@@ -627,8 +636,8 @@ struct State {
 #[derive(Default)]
 struct Refusals {
     default_backend: String,
-    /// Backends whose device is critical, with the message of the refusal.
-    critical: BTreeMap<String, String>,
+    /// Backends whose device is critical.
+    critical: BTreeSet<String>,
 }
 
 /// The monitor's state.
@@ -745,8 +754,8 @@ pub fn backend_refusal_message(backend: &str, path: &Path, facts: Facts) -> Stri
 fn log_new_refusals(
     effective: &[RoleReport],
     prev_spool: Level,
-    prev_critical: &BTreeMap<String, String>,
-    critical: &BTreeMap<String, String>,
+    prev_critical: &BTreeSet<String>,
+    critical: &BTreeSet<String>,
 ) {
     for r in effective {
         if r.label == "spool" && r.level >= Level::High && r.level != prev_spool {
@@ -756,7 +765,7 @@ fn log_new_refusals(
             );
         }
         if let Some(name) = r.label.strip_prefix("backend:") {
-            if critical.contains_key(name) && !prev_critical.contains_key(name) {
+            if critical.contains(name) && !prev_critical.contains(name) {
                 tracing::warn!("{}", backend_refusal_message(name, &r.path, r.facts));
             }
         }
@@ -834,16 +843,17 @@ pub fn log_line(level: Level, roles: &[&RoleReport], reminder: bool) -> String {
 /// tell is NOT judged by the default backend (that would be a guess): the
 /// write meets its backend's own error.
 pub fn refusal_for_home(
-    critical: &BTreeMap<String, String>,
+    critical: &BTreeSet<String>,
     default_backend: &str,
     home: &crate::storage::BucketHome,
 ) -> Option<String> {
     use crate::storage::BucketHome;
     match home {
-        BucketHome::Backend(name) => critical.get(name).cloned(),
-        BucketHome::Default => critical.get(default_backend).cloned(),
-        BucketHome::Undetermined => None,
+        BucketHome::Backend(name) => critical.contains(name),
+        BucketHome::Default => critical.contains(default_backend),
+        BucketHome::Undetermined => false,
     }
+    .then(|| UPLOADS_PAUSED_MESSAGE.to_string())
 }
 
 impl DiskWatch {
@@ -1008,8 +1018,7 @@ impl DiskWatch {
         // keep refusing until the next tick.
         let prev_spool = self.spool_gate.level();
         if let Some(disk) = effective.iter().find(|r| r.label == "spool") {
-            self.spool_gate
-                .set(disk.level, UPLOADS_PAUSED_MESSAGE.to_string());
+            self.spool_gate.set(disk.level);
         }
         self.spool_gate.set_by_use(by_use.then_some(th_use));
         state.by_use = Some(by_use);
@@ -1020,9 +1029,7 @@ impl DiskWatch {
             for r in &effective {
                 if let Some(name) = r.label.strip_prefix("backend:") {
                     if r.level == Level::Critical {
-                        refusals
-                            .critical
-                            .insert(name.to_string(), UPLOADS_PAUSED_MESSAGE.to_string());
+                        refusals.critical.insert(name.to_string());
                     }
                 }
             }

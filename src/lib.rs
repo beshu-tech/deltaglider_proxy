@@ -1785,19 +1785,27 @@ mod source_guards {
     /// (`spool_refusal_message`, `backend_refusal_message`) are log lines.
     /// A client text is the fixed `UPLOADS_PAUSED_MESSAGE`; only
     /// `log_new_refusals` reads the detail, so no `S3Error`, `AdminError` or
-    /// `to_string()` can carry it to a client.
+    /// `to_string()` can carry it to a client. `SpoolGate` and the critical
+    /// set hold no free text (the type), so no stored message can leak it.
     #[test]
     fn refusal_detail_is_read_by_logging_only() {
         let mut offenders = Vec::new();
         let mut reads = 0;
         for src in crate::source_scan::ast::src() {
             for name in ["spool_refusal_message", "backend_refusal_message"] {
-                for c in src.prod.calls_named(name) {
+                // Every path that names the fn: a call, and the fn as a value
+                // (`.map(spool_refusal_message)`).
+                for p in src
+                    .prod
+                    .paths
+                    .iter()
+                    .filter(|p| p.expr && p.segs.last().is_some_and(|s| s == name))
+                {
                     reads += 1;
                     if !(src.rel == "src/disk_watch.rs"
-                        && src.fn_name(c.func) == "log_new_refusals")
+                        && src.fn_name(p.func) == "log_new_refusals")
                     {
-                        offenders.push(format!("{}:{} {name}", src.rel, c.line));
+                        offenders.push(format!("{}:{} {name}", src.rel, p.line));
                     }
                 }
             }
