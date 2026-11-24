@@ -70,6 +70,8 @@ pub struct AdminError {
     ///
     /// [`AtomicityRefusal`]: crate::coordination::atomicity::AtomicityRefusal
     atomic_writes: Option<serde_json::Value>,
+    /// A machine-readable reason sent as `reason` (a disk-full refusal).
+    reason: Option<&'static str>,
 }
 
 impl AdminError {
@@ -82,6 +84,7 @@ impl AdminError {
             message: message.into(),
             public: false,
             atomic_writes: None,
+            reason: None,
         }
     }
 
@@ -144,6 +147,15 @@ impl AdminError {
         Self {
             public: true,
             ..Self::status(StatusCode::SERVICE_UNAVAILABLE, message)
+        }
+    }
+
+    /// 503 for a refused write while a disk is full: the fixed text and
+    /// `reason: "uploads-paused"`. It takes no detail, so no path can leak.
+    pub(crate) fn uploads_paused() -> Self {
+        Self {
+            reason: Some(crate::disk_watch::UPLOADS_PAUSED_REASON),
+            ..Self::unavailable(crate::disk_watch::UPLOADS_PAUSED_MESSAGE)
         }
     }
 
@@ -212,6 +224,9 @@ impl IntoResponse for AdminError {
         let mut body = serde_json::json!({ "error": code, "message": message });
         if let Some(details) = self.atomic_writes.as_ref().filter(|_| !self.scrubbed()) {
             body["atomic_writes"] = details.clone();
+        }
+        if let Some(reason) = self.reason.filter(|_| !self.scrubbed()) {
+            body["reason"] = reason.into();
         }
         (self.status, axum::Json(body)).into_response()
     }

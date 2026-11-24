@@ -198,7 +198,7 @@ mod tests {
 
         tick(&watch, 3);
         let why = gate.store_blocked("b").expect("critical: a store waits");
-        assert!(why.contains("backend 'default'"), "{why}");
+        assert_eq!(why, crate::disk_watch::UPLOADS_PAUSED_MESSAGE);
         // A delete (a delete job, a mirror delete, a lifecycle expiry) goes on.
         assert_eq!(gate.write_blocked("b"), None);
         assert!(admit_all(Some(&gate), &["b"]).is_ok());
@@ -230,7 +230,7 @@ mod tests {
         check_client_store_allowed(&state, "b").await.unwrap();
         tick(&watch, 3);
         match check_client_store_allowed(&state, "b").await {
-            Err(S3Error::SlowDown(m)) => assert!(m.contains("backend 'default'"), "{m}"),
+            Err(S3Error::UploadsPaused) => {}
             other => panic!("a store at level critical: {other:?}"),
         }
         check_client_write_allowed(&state, "b")

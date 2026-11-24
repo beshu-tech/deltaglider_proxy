@@ -1781,6 +1781,36 @@ mod source_guards {
         );
     }
 
+    /// The refusal texts that name a path and free-space figures
+    /// (`spool_refusal_message`, `backend_refusal_message`) are log lines.
+    /// A client text is the fixed `UPLOADS_PAUSED_MESSAGE`; only
+    /// `log_new_refusals` reads the detail, so no `S3Error`, `AdminError` or
+    /// `to_string()` can carry it to a client.
+    #[test]
+    fn refusal_detail_is_read_by_logging_only() {
+        let mut offenders = Vec::new();
+        let mut reads = 0;
+        for src in crate::source_scan::ast::src() {
+            for name in ["spool_refusal_message", "backend_refusal_message"] {
+                for c in src.prod.calls_named(name) {
+                    reads += 1;
+                    if !(src.rel == "src/disk_watch.rs"
+                        && src.fn_name(c.func) == "log_new_refusals")
+                    {
+                        offenders.push(format!("{}:{} {name}", src.rel, c.line));
+                    }
+                }
+            }
+        }
+        assert_eq!(reads, 2, "log_new_refusals reads each message once");
+        assert!(
+            offenders.is_empty(),
+            "a refusal's path and figures go to the log only; a client gets \
+             disk_watch::UPLOADS_PAUSED_MESSAGE:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// A log excerpt of a string is cut with `security::str_prefix`, never
     /// with a byte-index slice ending at `s.len().min(n)`: an index inside a
     /// multi-byte char panics, and the OAuth callback died on a client-sent

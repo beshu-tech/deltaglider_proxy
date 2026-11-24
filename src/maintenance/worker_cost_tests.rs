@@ -945,7 +945,7 @@ async fn a_reencrypt_that_waits_for_disk_resumes_on_the_real_clock_and_drains_th
         r.last_error
             .as_deref()
             .unwrap_or("")
-            .contains("backend 'default'"),
+            .contains(crate::disk_watch::UPLOADS_PAUSED_MESSAGE),
         "{r:?}"
     );
     assert_eq!(

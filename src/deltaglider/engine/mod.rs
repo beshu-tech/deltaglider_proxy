@@ -97,7 +97,38 @@ pub enum EngineError {
     KeyRefused(String),
 
     #[error("Service overloaded: {0}")]
-    Overloaded(String),
+    Overloaded(Overload),
+}
+
+/// Why a request met `EngineError::Overloaded`. Both are retryable and both
+/// make a job DEFER; only a client answer tells them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Overload {
+    /// No spool budget or codec slot now (the text is for logs and jobs).
+    Busy(String),
+    /// The disk gate refuses new writes. The text is fixed and path-free.
+    DiskFull,
+}
+
+impl std::fmt::Display for Overload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(why) => f.write_str(why),
+            Self::DiskFull => f.write_str(crate::disk_watch::UPLOADS_PAUSED_MESSAGE),
+        }
+    }
+}
+
+impl From<String> for Overload {
+    fn from(why: String) -> Self {
+        Self::Busy(why)
+    }
+}
+
+impl From<&str> for Overload {
+    fn from(why: &str) -> Self {
+        Self::Busy(why.to_string())
+    }
 }
 
 impl EngineError {
@@ -129,8 +160,13 @@ impl EngineError {
             },
             Self::InvalidArgument(s) => Self::InvalidArgument(s.clone()),
             Self::KeyRefused(s) => Self::KeyRefused(s.clone()),
-            Self::Overloaded(s) => Self::Overloaded(s.clone()),
+            Self::Overloaded(o) => Self::Overloaded(o.clone()),
         }
+    }
+
+    /// The disk gate refused a new write ([`Overload::DiskFull`]).
+    pub fn is_disk_full(&self) -> bool {
+        matches!(self, Self::Overloaded(Overload::DiskFull))
     }
 
     /// The object does not exist. The engine reports a missing object as
@@ -239,7 +275,8 @@ impl From<EngineError> for crate::api::S3Error {
             EngineError::InvalidArgument(msg) | EngineError::KeyRefused(msg) => {
                 crate::api::S3Error::InvalidArgument(msg)
             }
-            EngineError::Overloaded(msg) => crate::api::S3Error::SlowDown(msg),
+            EngineError::Overloaded(Overload::DiskFull) => crate::api::S3Error::UploadsPaused,
+            EngineError::Overloaded(Overload::Busy(msg)) => crate::api::S3Error::SlowDown(msg),
             EngineError::Storage(e) => e.into(),
             EngineError::Codec(e) => e.into(),
             // E4: route opaque engine errors through the sanitiser so

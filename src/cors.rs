@@ -37,6 +37,7 @@ pub const EXPOSED_HEADERS: &[&str] = &[
     "last-modified",
     "accept-ranges",
     "retry-after",
+    "x-deltaglider-reason",
     "x-amz-request-id",
     "x-amz-version-id",
     "x-amz-delete-marker",

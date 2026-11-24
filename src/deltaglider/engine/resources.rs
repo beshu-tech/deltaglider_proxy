@@ -22,7 +22,14 @@ pub fn default_spool_threshold(max_object_size: u64) -> u64 {
 /// retryable `Overloaded`; anything else is a storage error.
 pub(super) fn spool_error(e: std::io::Error) -> EngineError {
     if e.kind() == crate::deltaglider::spool::CONTENDED {
-        EngineError::Overloaded(e.to_string())
+        let disk_full = e
+            .get_ref()
+            .is_some_and(|inner| inner.is::<crate::disk_watch::DiskFullRefusal>());
+        EngineError::Overloaded(if disk_full {
+            Overload::DiskFull
+        } else {
+            Overload::Busy(e.to_string())
+        })
     } else {
         EngineError::Storage(StorageError::from(e))
     }
@@ -122,9 +129,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let secs = self.tuning.spool_acquire_timeout_secs;
         tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
             .await
-            .map_err(|_| {
-                EngineError::Overloaded("spool budget exhausted; retry shortly".to_string())
-            })
+            .map_err(|_| EngineError::Overloaded("spool budget exhausted; retry shortly".into()))
     }
 
     /// Acquire a spool file (timed). For the adapter to stage a large PUT/POST

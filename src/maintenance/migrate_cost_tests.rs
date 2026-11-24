@@ -590,7 +590,7 @@ async fn a_migrate_copy_waits_for_the_disk_of_its_target_backend() {
         panic!("the copy waits");
     };
     assert!(
-        matches!(&stop, PhaseStop::Deferred(m) if m.contains("backend 'default'")),
+        matches!(&stop, PhaseStop::Deferred(m) if m == crate::disk_watch::UPLOADS_PAUSED_MESSAGE),
         "{stop:?}"
     );
     assert_eq!((c.done, c.failed), (0, 0), "{c:?}");

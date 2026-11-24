@@ -49,7 +49,7 @@ async fn reserve(
 
 fn refused<T>(r: Result<T, EngineError>) -> String {
     match r {
-        Err(EngineError::Overloaded(m)) => m,
+        Err(EngineError::Overloaded(m)) => m.to_string(),
         Err(e) => panic!("want Overloaded, got {e}"),
         Ok(_) => panic!("want Overloaded, the reservation was admitted"),
     }
@@ -69,7 +69,7 @@ async fn a_new_write_reservation_is_refused_at_high_and_critical() {
         set_level(&engine, level);
         for wait in [SpoolWait::Queue, SpoolWait::Now] {
             let m = refused(reserve(&engine, HeldSpool::NOTHING, wait).await);
-            assert!(m.contains(level.name()), "{m}");
+            assert_eq!(m, crate::disk_watch::UPLOADS_PAUSED_MESSAGE, "{level:?}");
         }
         // A small codec source (a reference of at most the threshold) is no
         // new body: the rule is "larger than the threshold".
@@ -106,7 +106,7 @@ async fn admission_refuses_critical_for_a_new_write_and_admits_a_holder() {
     engine.admit_new_spool_write(HeldSpool::NOTHING).unwrap();
     set_level(&engine, Level::Critical);
     let m = refused(engine.admit_new_spool_write(HeldSpool::NOTHING));
-    assert!(m.contains(Level::Critical.name()), "{m}");
+    assert_eq!(m, crate::disk_watch::UPLOADS_PAUSED_MESSAGE);
     engine.admit_new_spool_write(HeldSpool::of(&spool)).unwrap();
 }
 
@@ -466,7 +466,7 @@ async fn a_large_rewrite_is_refused_at_a_full_spool_disk_and_a_small_one_is_not(
     };
     set_level(&engine, Level::High);
     let m = refused(rewrite("large.jpg").await);
-    assert!(m.contains("level high"), "{m}");
+    assert_eq!(m, crate::disk_watch::UPLOADS_PAUSED_MESSAGE);
     assert!(
         matches!(
             rewrite("small.jpg").await,
@@ -567,7 +567,7 @@ async fn a_download_over_the_principal_share_is_refused_at_once_and_a_write_is_n
     // The refusal reaches the client as a retryable Overloaded.
     assert!(matches!(
         super::resources::spool_error(err),
-        crate::deltaglider::EngineError::Overloaded(m) if m.contains("DGP_SPOOL_READ_SHARE_PERCENT")
+        crate::deltaglider::EngineError::Overloaded(m) if m.to_string().contains("DGP_SPOOL_READ_SHARE_PERCENT")
     ));
     // A write is no stream: it takes the free space.
     let _write = as_principal("dana", engine.spool_acquire_ungated(8 * MIB))
@@ -618,4 +618,23 @@ fn every_reference_write_forgets_the_kept_file() {
         missing.is_empty(),
         "call forget_reference_files after the reference write in: {missing:?}"
     );
+}
+
+/// The io error of a refused admission carries a typed payload: it survives
+/// `spool_error` as `Overload::DiskFull`, while a busy budget (the same
+/// `CONTENDED` kind) stays `Overload::Busy`. Both are `Overloaded`, so a job
+/// defers on either.
+#[test]
+fn a_disk_refusal_is_typed_and_a_busy_budget_is_not() {
+    let full = std::io::Error::new(
+        crate::deltaglider::spool::CONTENDED,
+        crate::disk_watch::DiskFullRefusal,
+    );
+    let e = super::resources::spool_error(full);
+    assert!(e.is_disk_full(), "{e}");
+    assert_eq!(e.to_string().matches('/').count(), 0, "{e}");
+    let busy = std::io::Error::new(crate::deltaglider::spool::CONTENDED, "no free budget");
+    let e = super::resources::spool_error(busy);
+    assert!(!e.is_disk_full(), "{e}");
+    assert!(matches!(e, EngineError::Overloaded(Overload::Busy(_))));
 }

@@ -516,9 +516,9 @@ fn the_monitor_goes_low_high_critical_and_recovers_one_step_at_a_time() {
     assert_eq!(level_gauge(&metrics, "spool"), 2);
     let e = spool.admit_new_write().unwrap_err();
     assert_eq!(e.kind(), crate::deltaglider::spool::CONTENDED);
-    assert!(e.to_string().contains("level high"), "{e}");
-    assert!(e.to_string().contains("/spool"), "{e}");
-    assert!(e.to_string().contains("DGP_SPOOL_MAX_BYTES"), "{e}");
+    // The client text is fixed and path-free; the payload is typed.
+    assert_eq!(e.to_string(), UPLOADS_PAUSED_MESSAGE);
+    assert!(e.get_ref().is_some_and(|i| i.is::<DiskFullRefusal>()));
     // A device at high does not stop the writes of another device.
     assert_eq!(watch.write_refusal_for(&backend("hetzner-fsn1")), None);
 
@@ -534,7 +534,7 @@ fn the_monitor_goes_low_high_critical_and_recovers_one_step_at_a_time() {
     tick(4);
     assert_eq!(level_gauge(&metrics, "backend:hetzner-fsn1"), 3);
     let m = watch.write_refusal_for(&backend("hetzner-fsn1")).unwrap();
-    assert!(m.contains("hetzner-fsn1") && m.contains("critical"), "{m}");
+    assert_eq!(m, UPLOADS_PAUSED_MESSAGE);
     assert!(watch
         .write_refusal_for(&crate::storage::BucketHome::Default)
         .is_some());
@@ -778,8 +778,8 @@ fn the_spool_is_judged_live_by_its_use_where_the_free_space_hides_the_limit() {
     let more = spool.try_acquire(41 * MIB).unwrap();
     let e = spool.admit_new_write().unwrap_err();
     assert_eq!(e.kind(), crate::deltaglider::spool::CONTENDED);
-    assert!(e.to_string().contains("nearly all reserved"), "{e}");
-    assert!(e.to_string().contains("DGP_SPOOL_MAX_BYTES"), "{e}");
+    assert_eq!(e.to_string(), UPLOADS_PAUSED_MESSAGE);
+    assert!(e.get_ref().is_some_and(|i| i.is::<DiskFullRefusal>()));
     // The gauge follows at the next tick; the refusal does not wait for it.
     tick(91 * MIB);
     assert_eq!(level_gauge(&metrics, SPOOL_BUDGET_ROLE), 2);
@@ -1215,7 +1215,7 @@ async fn the_running_tick_names_the_default_backend() {
     let m = watch
         .write_refusal_for(&crate::storage::BucketHome::Default)
         .expect("a bucket with no route lives on the default backend");
-    assert!(m.contains("backend 'default'"), "{m}");
+    assert_eq!(m, UPLOADS_PAUSED_MESSAGE);
     assert!(watch.write_refusal_for(&backend("other")).is_none());
 }
 
@@ -1306,7 +1306,7 @@ async fn a_bucket_on_a_non_default_critical_backend_is_refused_with_a_cold_cache
     let m = bucket_write_refusal_with(&watch, &engine, "b2")
         .await
         .expect("b2 lives on the critical backend `second`");
-    assert!(m.contains("backend 'second'"), "{m}");
+    assert_eq!(m, UPLOADS_PAUSED_MESSAGE);
     // The router remembers: the memory-only gate knows now.
     assert!(bucket_write_refusal_now(&watch, &engine, "b2").is_some());
     // A bucket on the healthy default backend is not refused.

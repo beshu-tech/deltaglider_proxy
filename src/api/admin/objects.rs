@@ -99,6 +99,9 @@ pub struct CopyFailure {
     pub source_key: String,
     pub dest_key: String,
     pub error: String,
+    /// `"uploads-paused"` when the disk gate refused this item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -604,7 +607,7 @@ async fn reject_if_disk_critical(
 ) -> Result<(), AdminError> {
     let engine = state.s3_state.engine.load_full();
     match crate::disk_watch::bucket_write_refusal(&engine, bucket).await {
-        Some(message) => Err(AdminError::unavailable(message)),
+        Some(_) => Err(AdminError::uploads_paused()),
         None => Ok(()),
     }
 }
@@ -693,6 +696,8 @@ enum CopyOutcome {
     Copied(Box<crate::types::FileMetadata>),
     /// Not copied: the destination key and the error.
     Failed(String, String),
+    /// Not copied: the disk gate refused the destination (the destination key).
+    Paused(String),
     /// Not tried: a maintenance job armed on the destination bucket first.
     Skipped,
     /// Not copied: `no_overwrite`, and the destination key holds an object.
@@ -798,6 +803,7 @@ async fn run_copy_loop(
                         Ok(source) => CopyOutcome::Copied(Box::new(source)),
                         Err(CopyFault::Exists) => CopyOutcome::Exists(dk),
                         Err(CopyFault::Failed(e)) => CopyOutcome::Failed(dk, e),
+                        Err(CopyFault::Paused) => CopyOutcome::Paused(dk),
                     },
                 ));
             }
@@ -841,6 +847,18 @@ async fn run_copy_loop(
                 continue;
             }
             CopyOutcome::Failed(dest_key, error) => (dest_key, error),
+            CopyOutcome::Paused(dest_key) => {
+                res.failed += 1;
+                if res.failures.len() < MAX_FAILURE_ENTRIES {
+                    res.failures.push(CopyFailure {
+                        source_key: req.items[idx].source_key.to_string(),
+                        dest_key,
+                        error: crate::disk_watch::UPLOADS_PAUSED_MESSAGE.to_string(),
+                        reason: Some(crate::disk_watch::UPLOADS_PAUSED_REASON),
+                    });
+                }
+                continue;
+            }
             CopyOutcome::Skipped if skip_reported => {
                 res.failed += 1;
                 continue;
@@ -863,6 +881,7 @@ async fn run_copy_loop(
                 source_key: req.items[idx].source_key.to_string(),
                 dest_key,
                 error,
+                reason: None,
             });
         }
     }
@@ -873,6 +892,8 @@ async fn run_copy_loop(
 enum CopyFault {
     /// `no_overwrite`: the destination key holds an object.
     Exists,
+    /// The disk gate refused the write.
+    Paused,
     Failed(String),
 }
 
@@ -947,6 +968,8 @@ async fn copy_one(
             .map_err(|e| {
                 if e.class == crate::transfer::CopyClass::DestinationExists {
                     CopyFault::Exists
+                } else if e.is_uploads_paused() {
+                    CopyFault::Paused
                 } else {
                     CopyFault::failed(format!("copy {sb}/{sk} -> {db}/{dk}: {e}"))
                 }

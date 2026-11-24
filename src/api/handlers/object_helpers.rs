@@ -401,16 +401,19 @@ pub(crate) fn check_client_key(bucket: &str, key: &str) -> Result<(), S3Error> {
 /// CopyObject, UploadPartCopy, CreateMultipartUpload, CompleteMultipartUpload,
 /// form POST): it also
 /// refuses while the disk of the filesystem backend that holds the bucket
-/// is at level critical (`disk_watch`), with a retryable `503 SlowDown`
-/// that names the disk. A delete never asks this gate: it frees space.
+/// is at level critical (`disk_watch`), with `S3Error::UploadsPaused`: a
+/// retryable 503 with a fixed text and no path. A delete never asks this gate: it frees space.
 pub(crate) async fn check_client_store_allowed(
     state: &Arc<AppState>,
     bucket: &str,
 ) -> Result<(), S3Error> {
     check_client_write_allowed(state, bucket).await?;
     let engine = state.engine.load_full();
-    if let Some(message) = crate::disk_watch::bucket_write_refusal(&engine, bucket).await {
-        return Err(S3Error::SlowDown(message));
+    if crate::disk_watch::bucket_write_refusal(&engine, bucket)
+        .await
+        .is_some()
+    {
+        return Err(S3Error::UploadsPaused);
     }
     Ok(())
 }

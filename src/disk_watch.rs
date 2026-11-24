@@ -381,7 +381,15 @@ pub fn use_refusal(th: &Thresholds, budget: u64, used: u64, dir: &Path) -> Optio
         total: budget,
     };
     let level = raw_level(facts, th);
-    (level >= Level::High).then(|| spool_refusal_message(level, SPOOL_BUDGET_ROLE, dir, facts))
+    (level >= Level::High).then(|| {
+        tracing::debug!(
+            "[disk] the spool budget of {} is nearly all reserved: refusing a new upload ({} of {} left)",
+            dir.display(),
+            human(facts.free),
+            human(facts.total)
+        );
+        UPLOADS_PAUSED_MESSAGE.to_string()
+    })
 }
 
 /// One measured path.
@@ -665,7 +673,33 @@ fn human(n: u64) -> String {
     crate::config::limits::human_bytes(n)
 }
 
-/// Pure: the message of a refused new spool reservation.
+/// THE client text of every disk-full refusal (S3 wire, form POST, admin
+/// bulk routes, job notes). It names no path and no figure: those go to the
+/// log only (`spool_refusal_message`, `backend_refusal_message`).
+pub const UPLOADS_PAUSED_MESSAGE: &str =
+    "Uploads are paused because the server's disk is full. Retry later.";
+
+/// The value of the `x-deltaglider-reason` header (and of the `reason` field
+/// of a JSON error) of a disk-full refusal.
+pub const UPLOADS_PAUSED_REASON: &str = "uploads-paused";
+
+/// The typed payload of the `io::Error` that a refused spool admission
+/// carries ([`crate::deltaglider::spool::CONTENDED`] alone cannot tell a full
+/// disk from a busy budget). `spool_error` finds it again.
+#[derive(Debug)]
+pub struct DiskFullRefusal;
+
+impl std::fmt::Display for DiskFullRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(UPLOADS_PAUSED_MESSAGE)
+    }
+}
+
+impl std::error::Error for DiskFullRefusal {}
+
+/// Pure: the LOG line of a refused new spool reservation (it has the path).
+/// Only `log_new_refusals` reads it; guard
+/// `refusal_detail_is_read_by_logging_only`.
 pub fn spool_refusal_message(level: Level, label: &str, path: &Path, facts: Facts) -> String {
     let what = if label == SPOOL_BUDGET_ROLE {
         format!(
@@ -692,7 +726,8 @@ pub fn spool_refusal_message(level: Level, label: &str, path: &Path, facts: Fact
     )
 }
 
-/// Pure: the message of a refused write to a bucket of a filesystem backend.
+/// Pure: the LOG line of a refused write to a bucket of a filesystem
+/// backend (it has the path). Same reader rule as [`spool_refusal_message`].
 pub fn backend_refusal_message(backend: &str, path: &Path, facts: Facts) -> String {
     format!(
         "the disk of backend '{backend}' ({}) is at level critical ({} free of {}); the proxy \
@@ -702,6 +737,30 @@ pub fn backend_refusal_message(backend: &str, path: &Path, facts: Facts) -> Stri
         human(facts.free),
         human(facts.total)
     )
+}
+
+/// Log the detail (path, free space) of every refusal that starts at this
+/// tick: once per level change, never per refused request. The client text
+/// is the fixed [`UPLOADS_PAUSED_MESSAGE`].
+fn log_new_refusals(
+    effective: &[RoleReport],
+    prev_spool: Level,
+    prev_critical: &BTreeMap<String, String>,
+    critical: &BTreeMap<String, String>,
+) {
+    for r in effective {
+        if r.label == "spool" && r.level >= Level::High && r.level != prev_spool {
+            tracing::warn!(
+                "{}",
+                spool_refusal_message(r.level, &r.label, &r.path, r.facts)
+            );
+        }
+        if let Some(name) = r.label.strip_prefix("backend:") {
+            if critical.contains_key(name) && !prev_critical.contains_key(name) {
+                tracing::warn!("{}", backend_refusal_message(name, &r.path, r.facts));
+            }
+        }
+    }
 }
 
 /// Pure: what to do about a level on a role. The text follows the role: the
@@ -947,28 +1006,27 @@ impl DiskWatch {
         // budget is judged live, at every new reservation, from the same
         // thresholds ([`SpoolGate::set_by_use`]): a spike of use must not
         // keep refusing until the next tick.
+        let prev_spool = self.spool_gate.level();
         if let Some(disk) = effective.iter().find(|r| r.label == "spool") {
-            self.spool_gate.set(
-                disk.level,
-                spool_refusal_message(disk.level, &disk.label, &disk.path, disk.facts),
-            );
+            self.spool_gate
+                .set(disk.level, UPLOADS_PAUSED_MESSAGE.to_string());
         }
         self.spool_gate.set_by_use(by_use.then_some(th_use));
         state.by_use = Some(by_use);
         {
             let mut refusals = self.refusals.write();
             refusals.default_backend = targets.default_backend.clone();
-            refusals.critical.clear();
+            let prev_critical = std::mem::take(&mut refusals.critical);
             for r in &effective {
                 if let Some(name) = r.label.strip_prefix("backend:") {
                     if r.level == Level::Critical {
-                        refusals.critical.insert(
-                            name.to_string(),
-                            backend_refusal_message(name, &r.path, r.facts),
-                        );
+                        refusals
+                            .critical
+                            .insert(name.to_string(), UPLOADS_PAUSED_MESSAGE.to_string());
                     }
                 }
             }
+            log_new_refusals(&effective, prev_spool, &prev_critical, &refusals.critical);
         }
 
         if let Some(m) = metrics {

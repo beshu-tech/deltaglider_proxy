@@ -83,6 +83,13 @@ pub(crate) fn ensure_retry_after(status: StatusCode, headers: &mut axum::http::H
     }
 }
 
+/// The response header that names why a request was refused, for a client
+/// that must tell "uploads are paused" from a busy server.
+pub(crate) const REASON_HEADER: &str = "x-deltaglider-reason";
+
+const UPLOADS_PAUSED_REASON_VALUE: axum::http::HeaderValue =
+    axum::http::HeaderValue::from_static(crate::disk_watch::UPLOADS_PAUSED_REASON);
+
 /// The client text of a 503 for a transient backend fault. The cause can
 /// carry backend detail, so it goes to the log only.
 const TRANSIENT_503: &str =
@@ -210,6 +217,12 @@ pub enum S3Error {
     /// Used when the proxy cannot serve S3 traffic (e.g. config DB locked).
     #[error("ServiceUnavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// The disk gate refuses new writes: `503 ServiceUnavailable` with the
+    /// fixed text and `x-deltaglider-reason: uploads-paused`. It carries no
+    /// detail, so a path or a figure cannot reach a client through it.
+    #[error("ServiceUnavailable: {}", crate::disk_watch::UPLOADS_PAUSED_MESSAGE)]
+    UploadsPaused,
 }
 
 impl S3Error {
@@ -244,6 +257,7 @@ impl S3Error {
             S3Error::InvalidRange => "InvalidRange",
             S3Error::PreconditionFailed => "PreconditionFailed",
             S3Error::ServiceUnavailable(_) => "ServiceUnavailable",
+            S3Error::UploadsPaused => "ServiceUnavailable",
         }
     }
 
@@ -283,18 +297,27 @@ impl S3Error {
             S3Error::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
             S3Error::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             S3Error::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            S3Error::UploadsPaused => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
     /// The `Retry-After` of a 503 (`SlowDown`, `ServiceUnavailable`): both
     /// say that a retry can succeed. `None` for every other answer.
     pub fn retry_after_secs(&self) -> Option<u64> {
-        matches!(self, S3Error::SlowDown(_) | S3Error::ServiceUnavailable(_))
-            .then_some(RETRY_AFTER_SECS)
+        matches!(
+            self,
+            S3Error::SlowDown(_) | S3Error::ServiceUnavailable(_) | S3Error::UploadsPaused
+        )
+        .then_some(RETRY_AFTER_SECS)
     }
 
     /// Generate XML error response with a unique request ID.
     pub fn to_xml(&self, request_id: &str) -> String {
+        // The disk-full text is the same fixed sentence on every wire path.
+        let message = match self {
+            S3Error::UploadsPaused => crate::disk_watch::UPLOADS_PAUSED_MESSAGE.to_string(),
+            other => other.to_string(),
+        };
         let resource = match self {
             S3Error::NoSuchKey(key) => escape_xml(key),
             S3Error::NoSuchBucket(bucket) => escape_xml(bucket),
@@ -310,7 +333,7 @@ impl S3Error {
     <RequestId>{}</RequestId>
 </Error>"#,
             self.code(),
-            escape_xml(&self.to_string()),
+            escape_xml(&message),
             resource,
             request_id
         )
@@ -325,11 +348,17 @@ impl IntoResponse for S3Error {
         let body = self.to_xml(&request_id);
 
         let retry_after = self.retry_after_secs();
+        let self_is_paused = matches!(self, S3Error::UploadsPaused);
         let mut response = (status, [("Content-Type", "application/xml")], body).into_response();
         response.headers_mut().insert(
             "x-amz-request-id",
             axum::http::HeaderValue::from_str(&request_id).unwrap(),
         );
+        if self_is_paused {
+            response
+                .headers_mut()
+                .insert(REASON_HEADER, UPLOADS_PAUSED_REASON_VALUE);
+        }
         if let Some(secs) = retry_after {
             response
                 .headers_mut()
@@ -412,6 +441,18 @@ impl From<S3Error> for s3s::S3Error {
             S3Error::SlowDown(msg) => s3s::s3_error!(SlowDown, "{}", msg),
             // A backend that did not answer: 503 (retryable), naming the backend.
             S3Error::ServiceUnavailable(msg) => s3s::s3_error!(ServiceUnavailable, "{}", msg),
+            S3Error::UploadsPaused => {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(REASON_HEADER, UPLOADS_PAUSED_REASON_VALUE);
+                crate::s3_adapter_s3s::error_with_headers(
+                    s3s::s3_error!(
+                        ServiceUnavailable,
+                        "{}",
+                        crate::disk_watch::UPLOADS_PAUSED_MESSAGE
+                    ),
+                    headers,
+                )
+            }
             other @ S3Error::InternalError(_) => {
                 // The wire error carries only the code, so without this the
                 // cause (upstream timeout, a storage I/O failure) is lost and
@@ -1165,6 +1206,7 @@ mod tests {
             S3Error::InvalidRange,
             S3Error::PreconditionFailed,
             S3Error::ServiceUnavailable("x".into()),
+            S3Error::UploadsPaused,
         ];
         assert_eq!(
             all.len(),
@@ -1380,6 +1422,7 @@ mod tests {
         for e in [
             S3Error::SlowDown("x".into()),
             S3Error::ServiceUnavailable("x".into()),
+            S3Error::UploadsPaused,
         ] {
             let code = e.code();
             let axum_resp = e.into_response();
@@ -1443,6 +1486,38 @@ mod tests {
             let code = e.code();
             assert!(s3s::S3Error::from(e).headers().is_none(), "{code}");
         }
+    }
+
+    /// The disk-full refusal: 503 `ServiceUnavailable`, the fixed text and the
+    /// reason header on both wire paths, from the engine's typed carrier.
+    /// A busy engine stays `SlowDown` with no reason.
+    #[test]
+    fn a_disk_full_refusal_has_the_fixed_text_and_the_reason_on_both_wire_paths() {
+        use crate::deltaglider::{EngineError, Overload};
+        let fixed = crate::disk_watch::UPLOADS_PAUSED_MESSAGE;
+        let paused: S3Error = EngineError::Overloaded(Overload::DiskFull).into();
+        assert!(matches!(paused, S3Error::UploadsPaused));
+        let resp = S3Error::UploadsPaused.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(REASON_HEADER).unwrap(), "uploads-paused");
+        assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+        let s3s_err = s3s::S3Error::from(S3Error::UploadsPaused);
+        assert_eq!(s3s_err.code().as_str(), "ServiceUnavailable");
+        assert_eq!(s3s_err.message(), Some(fixed));
+        assert_eq!(
+            s3s_err.headers().unwrap().get(REASON_HEADER).unwrap(),
+            "uploads-paused"
+        );
+        assert_eq!(
+            s3s_err.headers().unwrap().get("content-type").unwrap(),
+            "application/xml"
+        );
+        assert!(S3Error::UploadsPaused
+            .to_xml("id")
+            .contains(&escape_xml(fixed)));
+        let busy: S3Error = EngineError::Overloaded("all delta codec slots busy".into()).into();
+        assert!(matches!(busy, S3Error::SlowDown(_)));
+        assert!(busy.into_response().headers().get(REASON_HEADER).is_none());
     }
 
     /// E4 security fix: `sanitise_for_client` must return a generic string,

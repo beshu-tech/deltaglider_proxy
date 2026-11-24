@@ -1346,6 +1346,14 @@ impl CopyError {
     /// behind it, as the store path gives it; a source that changed under
     /// the copy is 503 SlowDown (the client retries, and the retry judges
     /// the new object).
+    /// The copy met the disk gate: the destination takes no new write now.
+    pub(crate) fn is_uploads_paused(&self) -> bool {
+        matches!(
+            self.cause.as_deref(),
+            Some(CopyCause::Engine(e)) if e.is_disk_full()
+        )
+    }
+
     pub(crate) fn into_s3_error(self) -> crate::api::S3Error {
         if self.class == CopyClass::SourceChanged {
             return crate::api::S3Error::copy_source_changed();
@@ -3135,6 +3143,19 @@ mod tests {
             engine(E::KeyRefused("x".into())).class,
             CopyClass::Permanent
         );
+    }
+
+    /// A copy that met the disk gate is Busy (a job defers) and says so to
+    /// an admin bulk route; a busy budget is Busy and says nothing of the kind.
+    #[test]
+    fn a_copy_that_met_the_disk_gate_is_told_apart() {
+        use crate::deltaglider::{EngineError as E, Overload};
+        let full = CopyError::engine("copy", E::Overloaded(Overload::DiskFull));
+        assert_eq!(full.class, CopyClass::Busy);
+        assert!(full.is_uploads_paused());
+        let busy = CopyError::engine("copy", E::Overloaded("spool budget exhausted".into()));
+        assert_eq!(busy.class, CopyClass::Busy);
+        assert!(!busy.is_uploads_paused());
     }
 
     /// The copy retry, the replication run and the event consumer act on the

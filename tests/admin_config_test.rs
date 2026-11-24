@@ -2279,6 +2279,11 @@ async fn validate_runs_the_apply_gates() {
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
+/// The one client text of a disk-full refusal.
+const UPLOADS_PAUSED: &str = "Uploads are paused because the server's disk is full. Retry later.";
+/// The same text as it is escaped in an XML body.
+const UPLOADS_PAUSED_XML: &str =
+    "Uploads are paused because the server&apos;s disk is full. Retry later.";
 
 async fn get_limits(server: &TestServer) -> serde_json::Value {
     let admin = admin_http_client(&server.endpoint()).await;
@@ -2601,9 +2606,8 @@ async fn at_disk_level_high_a_new_large_upload_is_refused_and_reads_go_on() {
 
     let (status, body) = put_status(&server, "large.bin", 8 * 1024).await;
     assert_eq!(status, 503, "{body}");
-    for needle in ["SlowDown", "level high", "DGP_SPOOL_MAX_BYTES"] {
-        assert!(body.contains(needle), "{needle} not in: {body}");
-    }
+    assert!(body.contains("ServiceUnavailable"), "{body}");
+    assert!(body.contains(UPLOADS_PAUSED_XML), "{body}");
 
     // The rule is "a body above the spool threshold goes to a spool file":
     // a small file of a delta-eligible type is admitted like a small image
@@ -2643,9 +2647,8 @@ async fn at_disk_level_critical_writes_to_the_backend_are_refused_and_deletes_wo
     // A passthrough body needs no spool, so only the backend gate refuses it.
     let (status, body) = put_status(&server, "small.jpg", 1024).await;
     assert_eq!(status, 503, "{body}");
-    for needle in ["SlowDown", "critical", "Reads and deletes still work"] {
-        assert!(body.contains(needle), "{needle} not in: {body}");
-    }
+    assert!(body.contains("ServiceUnavailable"), "{body}");
+    assert!(body.contains(UPLOADS_PAUSED_XML), "{body}");
     let del = server
         .http()
         .delete(format!(
@@ -2807,8 +2810,10 @@ async fn at_disk_level_critical_bulk_copy_move_and_multipart_are_refused() {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 503, "bulk {route}");
-        let text = resp.text().await.unwrap();
-        assert!(text.contains("critical"), "{route}: {text}");
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["reason"], "uploads-paused", "{route}: {json}");
+        assert_eq!(json["message"], UPLOADS_PAUSED, "{route}: {json}");
+        assert!(!json.to_string().contains('/'), "no path in {json}");
     }
     let http = server.http();
     for (what, req) in [
@@ -2832,7 +2837,7 @@ async fn at_disk_level_critical_bulk_copy_move_and_multipart_are_refused() {
         let resp = req.send().await.unwrap();
         assert_eq!(resp.status().as_u16(), 503, "{what}");
         let text = resp.text().await.unwrap();
-        assert!(text.contains("SlowDown"), "{what}: {text}");
+        assert!(text.contains("ServiceUnavailable"), "{what}: {text}");
     }
 }
 
@@ -2857,4 +2862,184 @@ async fn a_test_server_sees_a_healthy_disk_whatever_the_host_has() {
         metrics.contains("deltaglider_disk_level{path_role=\"spool\"} 0"),
         "{metrics}"
     );
+}
+
+/// A server with `POSTACCESSKEY` credentials that holds two seeded objects
+/// (a large one and a small one), restarted with the disk at `free_percent`.
+async fn refusal_server(free_percent: u8) -> (tempfile::TempDir, TestServer) {
+    let spool = tempfile::TempDir::new().unwrap();
+    let mut server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .env("DGP_SPOOL_DIR", &spool.path().display().to_string())
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1024")
+        .build()
+        .await;
+    for (key, len) in [("src.bin", 8 * 1024), ("src.jpg", 512)] {
+        let (status, body) = put_status(&server, key, len).await;
+        assert_eq!(status, 200, "{key}: {body}");
+    }
+    server
+        .respawn_with_env(&[(
+            "DGP_TEST_DISK_MONITOR_FREE_PERCENT",
+            &free_percent.to_string(),
+        )])
+        .await;
+    (spool, server)
+}
+
+/// A signed browser form POST of `len` bytes to `post/<key>`.
+fn refusal_form_post(server: &TestServer, key: &str, len: usize) -> reqwest::RequestBuilder {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+    let (date, scope) = ("20260507T120000Z", "20260507/us-east-1/s3/aws4_request");
+    let credential = format!("POSTACCESSKEY/{scope}");
+    let policy = json!({
+        "expiration": "2099-01-01T00:00:00.000Z",
+        "conditions": [
+            { "bucket": server.bucket() },
+            ["starts-with", "$key", ""],
+            { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
+            { "x-amz-credential": credential },
+            { "x-amz-date": date },
+            ["content-length-range", 0, 1048576]
+        ]
+    });
+    let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
+    let k = hmac(b"AWS4POSTSECRETKEY123", b"20260507");
+    let k = hmac(&hmac(&hmac(&k, b"us-east-1"), b"s3"), b"aws4_request");
+    let form = reqwest::multipart::Form::new()
+        .text("key", key.to_string())
+        .text("policy", policy_b64.clone())
+        .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
+        .text("x-amz-credential", credential)
+        .text("x-amz-date", date)
+        .text(
+            "x-amz-signature",
+            hex::encode(hmac(&k, policy_b64.as_bytes())),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(vec![7u8; len])
+                .file_name("x.bin")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        );
+    reqwest::Client::new()
+        .post(format!("{}/{}", server.endpoint(), server.bucket()))
+        .multipart(form)
+}
+
+/// The refusal of a full disk is the same on every client surface: 503
+/// `ServiceUnavailable`, the fixed text, `x-deltaglider-reason`, and no path
+/// or free-space figure in the body or the headers. 8% free refuses the
+/// spool; 3% refuses the backend disk too.
+#[tokio::test]
+async fn a_disk_full_refusal_has_a_fixed_text_and_a_reason_on_every_write_verb() {
+    common::expect_server_errors("a full disk refuses the writes that this test tries");
+    let figure = regex_lite::Regex::new(r"\d\s?(B|KiB|MiB|GiB|TiB|bytes)\b").unwrap();
+    for (free_percent, small) in [(8u8, false), (3u8, true)] {
+        let (spool, server) = refusal_server(free_percent).await;
+        let (ep, bucket) = (server.endpoint(), server.bucket().to_string());
+        let http = server.http();
+        // At 8% only a body above the spool threshold is refused; at 3% the
+        // backend gate refuses a small passthrough body too.
+        let (src, len) = if small {
+            ("src.jpg", 512)
+        } else {
+            ("src.bin", 8192)
+        };
+        let upload_id = if small {
+            "x".to_string()
+        } else {
+            let resp = http
+                .post(format!("{ep}/{bucket}/mp.bin?uploads"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+            let text = resp.text().await.unwrap();
+            text.split("<UploadId>")
+                .nth(1)
+                .unwrap()
+                .split('<')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let mut responses = Vec::new();
+        for (verb, req) in [
+            (
+                "PutObject",
+                http.put(format!("{ep}/{bucket}/new.bin"))
+                    .body(vec![7u8; len]),
+            ),
+            (
+                "UploadPart",
+                http.put(format!(
+                    "{ep}/{bucket}/mp.bin?partNumber=1&uploadId={upload_id}"
+                ))
+                .body(vec![7u8; len]),
+            ),
+        ] {
+            responses.push((verb, req.send().await.unwrap()));
+        }
+        // A copy takes no spool at 8% (a small body is copied through
+        // memory); the backend gate of 3% refuses it.
+        if small {
+            let copy = http
+                .put(format!("{ep}/{bucket}/copy.bin"))
+                .header("x-amz-copy-source", format!("/{bucket}/{src}"));
+            responses.push(("CopyObject", copy.send().await.unwrap()));
+        }
+        responses.push((
+            "form POST",
+            refusal_form_post(&server, "post.bin", len)
+                .send()
+                .await
+                .unwrap(),
+        ));
+
+        for (verb, resp) in responses {
+            let what = format!("{verb} at {free_percent}% free");
+            assert_eq!(resp.status().as_u16(), 503, "{what}");
+            let headers = resp.headers().clone();
+            assert_eq!(
+                headers
+                    .get("x-deltaglider-reason")
+                    .and_then(|v| v.to_str().ok()),
+                Some("uploads-paused"),
+                "{what}"
+            );
+            let body = resp.text().await.unwrap();
+            assert!(
+                body.contains("<Code>ServiceUnavailable</Code>"),
+                "{what}: {body}"
+            );
+            assert!(body.contains(UPLOADS_PAUSED_XML), "{what}: {body}");
+            let message = body
+                .split("<Message>")
+                .nth(1)
+                .unwrap()
+                .split("</Message>")
+                .next()
+                .unwrap();
+            assert_eq!(message, UPLOADS_PAUSED_XML, "{what}");
+            let mut all = body.clone();
+            for (name, value) in &headers {
+                if name != "content-type" {
+                    all.push_str(value.to_str().unwrap_or(""));
+                }
+            }
+            assert!(
+                !all.contains(&spool.path().display().to_string()),
+                "{what}: {all}"
+            );
+            assert!(!figure.is_match(&body), "{what}: {body}");
+        }
+    }
 }

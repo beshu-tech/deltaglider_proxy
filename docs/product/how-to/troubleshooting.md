@@ -137,6 +137,7 @@ A `503 SlowDown` comes either from the upstream S3 backend, when it throttles th
 
 The proxy answers `503 ServiceUnavailable` (not `SlowDown`) when the cause is a condition that you must clear first, or a fault inside the proxy:
 
+- **Uploads are paused because the disk is full** ("Uploads are paused because the server's disk is full. Retry later.", with the response header `x-deltaglider-reason: uploads-paused`). The proxy refuses new writes while the disk of the spool directory or of a filesystem backend is nearly full. The text names no path: the proxy log line `[disk] level …` names the directory and the free space. Free space on that disk.
 - **The disk is full** ("The storage backend is out of space"). Free space on the disk of the filesystem backend or of the spool directory. The log line "disk full answered 503" names the cause.
 - **The storage quota of the backend is used up** ("storage cap or quota is used up"). This is the `507`, `QuotaExceeded` or `cap_exceeded` answer of a backend such as Backblaze B2. Raise the cap or free space on the backend.
 - **The delta codec timed out.** Check the load of the host and `DGP_CODEC_*_SECS`.

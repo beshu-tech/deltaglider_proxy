@@ -901,6 +901,76 @@ mod readiness_tests {
         ),
         (
             "src/api/errors.rs",
+            "S3Error::UploadsPaused => \"ServiceUnavailable\"",
+            1,
+            Reach::Plumbing,
+            "the S3 code of the disk-full refusal",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::UploadsPaused => StatusCode::SERVICE_UNAVAILABLE",
+            1,
+            Reach::Plumbing,
+            "the HTTP status of the disk-full refusal",
+        ),
+        (
+            "src/api/errors.rs",
+            "#[error(\"ServiceUnavailable: {}\", crate::disk_watch::UPLOADS_PAUSED_MESSAGE)]",
+            1,
+            Reach::Plumbing,
+            "the fixed text of the disk-full refusal",
+        ),
+        (
+            "src/api/errors.rs",
+            "UploadsPaused,",
+            1,
+            Reach::Plumbing,
+            "the variant of the disk-full refusal",
+        ),
+        (
+            "src/api/errors.rs",
+            "let self_is_paused = matches!(self, S3Error::UploadsPaused);",
+            1,
+            Reach::Plumbing,
+            "the axum answer adds the reason header",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::UploadsPaused => crate::disk_watch::UPLOADS_PAUSED_MESSAGE.to_string(),",
+            1,
+            Reach::Plumbing,
+            "the axum XML text of the disk-full refusal is the fixed sentence",
+        ),
+        (
+            "src/api/errors.rs",
+            "S3Error::UploadsPaused => {",
+            1,
+            Reach::Plumbing,
+            "the s3s bridge adds the reason header",
+        ),
+        (
+            "src/api/errors.rs",
+            "=ServiceUnavailable,",
+            1,
+            Reach::Plumbing,
+            "the s3s code in the disk-full bridge",
+        ),
+        (
+            "src/api/admin/error.rs",
+            "pub(crate) fn uploads_paused() -> Self {",
+            1,
+            Reach::Plumbing,
+            "the admin constructor of the disk-full refusal",
+        ),
+        (
+            "src/api/admin/objects.rs",
+            "Some(_) => Err(AdminError::uploads_paused()),",
+            1,
+            Reach::PerBucket,
+            "a bulk copy or move into a bucket on a critical disk",
+        ),
+        (
+            "src/api/errors.rs",
             "S3Error::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE",
             1,
             Reach::Plumbing,
@@ -1177,10 +1247,10 @@ mod readiness_tests {
         ),
         (
             "src/api/handlers/object_helpers.rs",
-            "return Err(S3Error::SlowDown(message));",
+            "return Err(S3Error::UploadsPaused);",
             1,
             Reach::PerBucket,
-            "the disk of the filesystem backend of one bucket is at level critical",
+            "the disk of the filesystem backend of one bucket is at level critical (a fixed text, a reason header)",
         ),
         (
             "src/maintenance/worker.rs",
@@ -1219,10 +1289,17 @@ mod readiness_tests {
         ),
         (
             "src/deltaglider/engine/mod.rs",
-            "EngineError::Overloaded(msg) => crate::api::S3Error::SlowDown(msg)",
+            "EngineError::Overloaded(Overload::Busy(msg)) => crate::api::S3Error::SlowDown(msg)",
             1,
             Reach::Plumbing,
-            "the engine bridge",
+            "the engine bridge: a codec slot or the spool budget is busy",
+        ),
+        (
+            "src/deltaglider/engine/mod.rs",
+            "EngineError::Overloaded(Overload::DiskFull) => crate::api::S3Error::UploadsPaused",
+            1,
+            Reach::Plumbing,
+            "the engine bridge: the disk gate refuses new writes (a fixed text, a reason header)",
         ),
         (
             "src/deltaglider/engine/resources.rs",
@@ -1376,7 +1453,7 @@ mod readiness_tests {
         }
         assert!(engine.iter().any(|v| v == "Overloaded"));
         regex_lite::Regex::new(&format!(
-            r"\b(SlowDown|ServiceUnavailable|SERVICE_UNAVAILABLE|StorageError::({})|EngineError::({}))\b",
+            r"\b(SlowDown|ServiceUnavailable|SERVICE_UNAVAILABLE|UploadsPaused|uploads_paused|StorageError::({})|EngineError::({}))\b",
             storage.join("|"),
             engine.join("|")
         ))

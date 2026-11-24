@@ -728,7 +728,10 @@ impl SpoolDir {
     /// run to the end.
     pub fn admit_new_write(&self) -> std::io::Result<()> {
         match self.write_refusal() {
-            Some(message) => Err(std::io::Error::new(CONTENDED, message)),
+            Some(_) => Err(std::io::Error::new(
+                CONTENDED,
+                crate::disk_watch::DiskFullRefusal,
+            )),
             None => Ok(()),
         }
     }
