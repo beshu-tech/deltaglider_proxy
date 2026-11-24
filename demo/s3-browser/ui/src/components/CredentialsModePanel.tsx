@@ -104,7 +104,9 @@ interface Props {
 }
 
 export default function CredentialsModePanel({ onSessionExpired }: Props) {
-  const { cardStyle, inputRadius } = useCardStyles();
+  const { cardStyle: baseCardStyle, inputRadius } = useCardStyles();
+  // The column's gap spaces the cards: a card margin on top of it doubled the gap.
+  const cardStyle = { ...baseCardStyle, marginBottom: 0 };
   const colors = useColors();
 
   const {

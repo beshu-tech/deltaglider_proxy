@@ -1650,11 +1650,10 @@ code, kbd, pre, samp, .ant-typography code,
 .dg-backend-card__rule {
   margin-top: 12px;
 }
-/* Below the header everything starts at the title's left edge (icon 32 px
-   + gap 12 px), so the name, the facts and the encryption row share one
-   column. */
+/* ONE left edge, as in every settings card (SectionHeader): the icon and
+   the name share the first line, and the facts and the encryption row
+   start at the card's own edge. */
 .dg-backend-card__body {
-  margin-left: 44px;
   padding-top: 12px;
 }
 .dg-backend-card__facts {
