@@ -326,6 +326,11 @@ async fn backfill_writes_the_missing_listing_facts_of_deltas() {
         assert!(std::time::Instant::now() < deadline, "facts not written");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // Stop the writer first: it writes its facts in the background, and one
+    // that lands after the delete below (there are N + 1 objects, the wait
+    // above ends at N) would be a fact that the job did not write.
+    drop(client);
+    drop(writer);
     for k in facts_under(&raw, bucket, &prefix).await {
         raw.delete_object()
             .bucket(bucket)

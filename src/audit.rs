@@ -93,12 +93,63 @@ fn audit_user(user: &str, actor: Option<String>) -> String {
     }
 }
 
+/// The most bytes of one audit field. An S3 key is at most 1024 bytes; a
+/// request can still NAME a longer one (a 1 MiB key in a DeleteObjects body),
+/// and the whole text went to the log line and into the audit ring.
+pub const AUDIT_FIELD_MAX_BYTES: usize = 2048;
+
 /// Sanitize a value for structured audit log output.
-/// Prevents newline injection and pipe-delimiter confusion.
+/// Prevents newline injection and pipe-delimiter confusion, and cuts a value
+/// over [`AUDIT_FIELD_MAX_BYTES`] (with the number of bytes left out).
 pub fn sanitize(s: &str) -> String {
-    s.replace('\n', "\\n")
+    let (kept, cut) = if s.len() > AUDIT_FIELD_MAX_BYTES {
+        let mut end = AUDIT_FIELD_MAX_BYTES;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        (&s[..end], s.len() - end)
+    } else {
+        (s, 0)
+    };
+    let mut out = kept
+        .replace('\n', "\\n")
         .replace('\r', "\\r")
-        .replace('|', "\\|")
+        .replace('|', "\\|");
+    if cut > 0 {
+        out.push_str(&format!("...(+{cut} bytes)"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::{sanitize, AUDIT_FIELD_MAX_BYTES};
+
+    #[test]
+    fn a_short_value_is_escaped_and_whole() {
+        assert_eq!(sanitize("a|b\nc"), "a\\|b\\nc");
+        let at_limit = "k".repeat(AUDIT_FIELD_MAX_BYTES);
+        assert_eq!(sanitize(&at_limit), at_limit);
+    }
+
+    #[test]
+    fn a_long_value_is_cut_and_says_how_much() {
+        let long = "a".repeat(1 << 20);
+        let out = sanitize(&long);
+        assert!(out.len() < AUDIT_FIELD_MAX_BYTES + 40, "{}", out.len());
+        assert!(out.ends_with(&format!(
+            "...(+{} bytes)",
+            (1 << 20) - AUDIT_FIELD_MAX_BYTES
+        )));
+    }
+
+    #[test]
+    fn the_cut_falls_on_a_character_boundary() {
+        // 3-byte characters: the limit is not a multiple of 3.
+        let long = "\u{20ac}".repeat(1000);
+        let out = sanitize(&long);
+        assert!(out.starts_with('\u{20ac}') && out.contains("...(+"));
+    }
 }
 
 /// Truncated (≤256 char) user-agent from request headers.

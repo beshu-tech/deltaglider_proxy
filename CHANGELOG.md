@@ -16,6 +16,10 @@
 - **A refusal for a full disk says so, names no path and has a reason header (issue #204).** While the disk of the spool directory is at level high or critical, or the disk of a filesystem backend is at level critical, the proxy now answers a new upload with `503 ServiceUnavailable`, not `503 SlowDown`. The text is always "Uploads are paused because the server's disk is full. Retry later.", and the response has the header `x-deltaglider-reason: uploads-paused` (browsers can read it). The old text named the spool directory and the free space, and a user who is not an admin could read it through the bulk copy and move of the file browser. The path and the free space now go to the proxy log only, once when a level changes. The bulk copy and move of the file browser return the same text with `reason: "uploads-paused"` in the JSON error and in each failed item. A client that matched `SlowDown` for this case must match the header or `ServiceUnavailable`. Jobs still wait for the disk, as before.
 - **Heal metadata converts the deltas that the old Python toolchain wrote.** Such a delta names its reference only in the metadata name `dg-ref-key`. The job gives it `dg-ref-path` and `dg-note: delta` and removes `dg-ref-key`. It rewrites only the metadata, with a server-side copy that is conditional on the ETag that it read, and it holds the write lock of the object. A converted delta counts as done, and a delta that is already current counts as skipped. Run Heal metadata on each bucket that holds such deltas: a later release will stop reading `dg-ref-key`.
 
+### Fixed
+
+- **An audit log line is bounded.** Each field of an audit entry is cut at 2048 bytes, and the line says how many bytes it left out. Before, a request that named a very long key (for example a 1 MiB key in a `DeleteObjects` body) wrote the whole key to the log and kept it in the audit list.
+
 ## v2.3.1 — 2026-11-22
 
 ### Added
