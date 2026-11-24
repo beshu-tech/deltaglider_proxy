@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- **The `cookie` crate is 0.18.3 (RUSTSEC-2026-0594).** The HTTP client of the proxy now uses a `cookie` release in which private cookie nonces cannot repeat in a process that forks. The proxy does not use private cookies, so no request was at risk.
 - **An audit log line is bounded.** Each field of an audit entry is cut at 2048 bytes, and the line says how many bytes it left out. Before, a request that named a very long key (for example a 1 MiB key in a `DeleteObjects` body) wrote the whole key to the log and kept it in the audit list.
 
 ## v2.3.1 — 2026-11-22
