@@ -70,7 +70,9 @@ export const BREAKPOINT = { phone: 600, tablet: 769, shell: 900 } as const;
 export const CONTENT_WIDE = 1140;
 
 export function contentColumn(width: number): React.CSSProperties {
-  return { maxWidth: width, margin: '0 auto', padding: CARD_PADDING };
+  // Left-aligned, never centred: every admin page starts at ONE left edge (the
+  // page header's), whatever its width. A narrow page just ends earlier.
+  return { maxWidth: width, margin: 0, padding: CARD_PADDING };
 }
 
 /**

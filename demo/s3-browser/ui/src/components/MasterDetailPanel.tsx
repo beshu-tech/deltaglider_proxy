@@ -111,7 +111,7 @@ export default function MasterDetailPanel<T>({
           // The shared wide content column, like every other admin page.
           width: '100%',
           maxWidth: CONTENT_WIDE,
-          margin: '0 auto',
+          margin: 0,
         } as React.CSSProperties
       }
     >
