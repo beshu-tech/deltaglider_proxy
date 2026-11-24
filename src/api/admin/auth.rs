@@ -1375,6 +1375,19 @@ fn admin_gui_session_ok(state: &AdminState, token: &str, client_ip: Option<IpAdd
         })
 }
 
+/// Whether the request carries a live AdminGui session of an enabled admin.
+/// For a session-light handler that shows an admin more than any other
+/// session. Deny by default: no cookie, a lift session or a lapsed admin is `false`.
+pub(crate) fn request_is_admin_gui(
+    state: &AdminState,
+    headers: &HeaderMap,
+    connect_info: Option<&ConnectInfo<SocketAddr>>,
+) -> bool {
+    let client_ip = request_client_ip(headers, connect_info);
+    extract_session_token(&state.sessions, headers)
+        .is_some_and(|t| admin_gui_session_ok(state, &t, client_ip))
+}
+
 /// Pure: is the principal of an admin session still an admin, judged against
 /// the IAM state only through the gate? While the IAM database is
 /// unconfirmed the rights of an IAM user are not known (not an admin); the

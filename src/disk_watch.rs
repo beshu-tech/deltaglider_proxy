@@ -909,6 +909,13 @@ impl DiskWatch {
         refusal_for_home(&refusals.critical, &refusals.default_backend, home)
     }
 
+    /// The last report of every configured role, by label.
+    pub fn last_reports(&self) -> Vec<RoleReport> {
+        let mut reports: Vec<RoleReport> = self.state.lock().last.values().cloned().collect();
+        reports.sort_by(|a, b| a.label.cmp(&b.label));
+        reports
+    }
+
     /// Is any filesystem backend at level critical?
     pub fn any_backend_critical(&self) -> bool {
         !self.refusals.read().critical.is_empty()

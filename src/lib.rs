@@ -16,6 +16,7 @@ pub mod background;
 pub mod bucket_policy;
 pub mod bucket_usage;
 pub mod budget_share;
+pub mod capacity;
 pub mod cli;
 pub mod config;
 pub mod config_apply;

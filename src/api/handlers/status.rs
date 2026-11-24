@@ -1463,8 +1463,14 @@ mod readiness_tests {
     /// Production code that cannot refuse a client request: the backends
     /// RAISE these errors on every fault (the bridges decide the answer),
     /// the config registry holds help text, and the replication workers run
-    /// in the background (they log a throttled backend and stop a run).
-    const NOT_SCANNED: &[&str] = &["src/storage/", "src/config/registry.rs", "src/replication/"];
+    /// in the background (they log a throttled backend and stop a run), and
+    /// the capacity status only reports a pause (its field `uploads_paused`).
+    const NOT_SCANNED: &[&str] = &[
+        "src/storage/",
+        "src/config/registry.rs",
+        "src/replication/",
+        "src/capacity.rs",
+    ];
 
     /// `(file, trimmed line)` of every site in the production code of
     /// `src/` (minus [`NOT_SCANNED`] and test modules).

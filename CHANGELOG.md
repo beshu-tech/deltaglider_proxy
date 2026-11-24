@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **`GET /_/api/admin/storage/status` says whether the disks can take uploads (issue #204).** Any valid session can read it, and the answer depends on the session. An admin session gets the full status: `state` is one of `checking`, `healthy`, `filling_up`, `large_paused` or `backend_paused`, with `largest_file` in bytes. `filling_up` names the tightest disk (`disk.path`, `disk.free_bytes`). `large_paused` means that the spool refuses new writes: it carries `paused_above` (a body at or under this size still uploads) and the disk. `backend_paused` lists every filesystem backend whose disk is critical (`name`, `path`, `free_bytes`). Any other session, such as a browser session of an IAM user, gets only `largest_file`, `uploads_paused` and `paused_above`, with no path, no backend name and no free-space figure. For `backend_paused` the second view cannot say which bucket is affected, so its `paused_above` is `null`.
+
 ### Changed
 
 - **A refusal for a full disk says so, names no path and has a reason header (issue #204).** While the disk of the spool directory is at level high or critical, or the disk of a filesystem backend is at level critical, the proxy now answers a new upload with `503 ServiceUnavailable`, not `503 SlowDown`. The text is always "Uploads are paused because the server's disk is full. Retry later.", and the response has the header `x-deltaglider-reason: uploads-paused` (browsers can read it). The old text named the spool directory and the free space, and a user who is not an admin could read it through the bulk copy and move of the file browser. The path and the free space now go to the proxy log only, once when a level changes. The bulk copy and move of the file browser return the same text with `reason: "uploads-paused"` in the JSON error and in each failed item. A client that matched `SlowDown` for this case must match the header or `ServiceUnavailable`. Jobs still wait for the disk, as before.

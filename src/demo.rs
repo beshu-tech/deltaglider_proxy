@@ -149,6 +149,9 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/jobs/bucket/:bucket",
             get(admin::maintenance_bucket_status),
         )
+        // Two views behind ONE admin check (`storage_status`): an admin gets
+        // paths and free space, every other session three fields.
+        .route("/_/api/admin/storage/status", get(admin::storage_status))
         .route(
             "/_/api/admin/session/s3-credentials",
             get(admin::get_s3_session_creds)

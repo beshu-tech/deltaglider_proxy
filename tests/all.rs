@@ -196,6 +196,8 @@ mod savings_test;
 mod status_endpoints_test;
 #[path = "storage_resilience_test.rs"]
 mod storage_resilience_test;
+#[path = "storage_status_test.rs"]
+mod storage_status_test;
 #[path = "streaming_copy_test.rs"]
 mod streaming_copy_test;
 #[path = "tls_listener_test.rs"]
