@@ -327,6 +327,24 @@ pub fn log_action(
     }
 }
 
+/// Pure: paces a repeated log line to one per [`USE_LOG_EVERY`].
+#[derive(Debug, Default)]
+struct LogPace(Option<std::time::Instant>);
+
+const USE_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl LogPace {
+    fn due(&mut self, now: std::time::Instant) -> bool {
+        let due = self
+            .0
+            .is_none_or(|last| now.duration_since(last) >= USE_LOG_EVERY);
+        if due {
+            self.0 = Some(now);
+        }
+        due
+    }
+}
+
 /// The spool's view of the disk: the monitor writes it, the spool reads it
 /// before it admits a new reservation.
 ///
@@ -342,6 +360,8 @@ pub struct SpoolGate {
     by_use: Mutex<Option<Thresholds>>,
     /// Is the use of the budget refusing now? (for the once-per-transition log)
     use_refusing: std::sync::atomic::AtomicBool,
+    /// When the use refusal was last logged.
+    use_log: parking_lot::Mutex<LogPace>,
 }
 
 impl SpoolGate {
@@ -372,7 +392,8 @@ impl SpoolGate {
     pub fn note_use_refusal(&self, refused: bool, dir: &Path, used: u64, budget: u64) -> bool {
         let was = self.use_refusing.swap(refused, Ordering::AcqRel);
         let started = refused && !was;
-        if started {
+        // Use near the threshold flips per request: at most one line per interval.
+        if started && self.use_log.lock().due(std::time::Instant::now()) {
             tracing::warn!(
                 "[disk] the spool budget of {} is nearly all reserved: refusing new uploads ({} of {} left)",
                 dir.display(),

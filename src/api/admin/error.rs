@@ -225,10 +225,19 @@ impl IntoResponse for AdminError {
         if let Some(details) = self.atomic_writes.as_ref().filter(|_| !self.scrubbed()) {
             body["atomic_writes"] = details.clone();
         }
-        if let Some(reason) = self.reason.filter(|_| !self.scrubbed()) {
+        let reason = self.reason.filter(|_| !self.scrubbed());
+        if let Some(reason) = reason {
             body["reason"] = reason.into();
         }
-        (self.status, axum::Json(body)).into_response()
+        let mut response = (self.status, axum::Json(body)).into_response();
+        // The same header as the S3 wire, so a client reads one place.
+        if let Some(reason) = reason {
+            response.headers_mut().insert(
+                crate::api::errors::REASON_HEADER,
+                axum::http::HeaderValue::from_static(reason),
+            );
+        }
+        response
     }
 }
 

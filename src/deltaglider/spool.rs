@@ -719,8 +719,8 @@ impl SpoolDir {
     }
 
     /// Admit a NEW write: an op that holds no spool yet. It is refused with
-    /// [`CONTENDED`] (the engine answers a retryable `503 SlowDown`, with the
-    /// message) while the disk of the spool is at level high or critical
+    /// a `DiskFullRefusal` (the engine answers a retryable
+    /// `503 ServiceUnavailable` with `x-deltaglider-reason: uploads-paused`) while the disk of the spool is at level high or critical
     /// (the monitor's verdict), or, where the free space hides the real
     /// limit, while the reserved bytes leave less than the high threshold of
     /// the budget (judged now, from `used / budget`: no `statvfs`, one lock

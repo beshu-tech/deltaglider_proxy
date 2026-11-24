@@ -1342,10 +1342,6 @@ impl CopyError {
         }
     }
 
-    /// The S3 answer of a failed client copy: the answer of the error
-    /// behind it, as the store path gives it; a source that changed under
-    /// the copy is 503 SlowDown (the client retries, and the retry judges
-    /// the new object).
     /// The copy met the disk gate: the destination takes no new write now.
     pub(crate) fn is_uploads_paused(&self) -> bool {
         matches!(
@@ -1354,6 +1350,10 @@ impl CopyError {
         )
     }
 
+    /// The S3 answer of a failed client copy: the answer of the error
+    /// behind it, as the store path gives it; a source that changed under
+    /// the copy is 503 SlowDown (the client retries, and the retry judges
+    /// the new object).
     pub(crate) fn into_s3_error(self) -> crate::api::S3Error {
         if self.class == CopyClass::SourceChanged {
             return crate::api::S3Error::copy_source_changed();

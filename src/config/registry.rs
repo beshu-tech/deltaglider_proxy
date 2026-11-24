@@ -658,7 +658,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_DISK_HIGH_PERCENT",
-        description: "Disk level high: free space below this percent of the disk, or below the largest spool reservation of one upload, whichever is more. The proxy then refuses new spool reservations with 503 SlowDown (default: 10, range 1 to 50)",
+        description: "Disk level high: free space below this percent of the disk, or below the largest spool reservation of one upload, whichever is more. The proxy then refuses new spool reservations with 503 ServiceUnavailable and the header x-deltaglider-reason: uploads-paused (default: 10, range 1 to 50)",
         example: "10",
         category: "Server",
     },
