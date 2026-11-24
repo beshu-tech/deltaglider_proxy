@@ -364,7 +364,7 @@ const BUCKET_POLICY_SHOTS: Shot[] = [
     route: '/_/admin/storage/buckets',
     alt: 'A new settings row is open; callout 3 marks the Bucket name field, callout 4 marks the Backend list, set to aws-dr, callout 5 marks Advanced, and callout 6 marks Real name on backend, set to acme-firmware.',
     // The new row sits below the four buckets: a taller screen shows all of it.
-    viewport: { width: 1040, height: 1000 },
+    viewport: { width: 1040, height: 1100 },
     setup: async (page) => {
       await openDraft(page);
       await backendSelect(page).click();
