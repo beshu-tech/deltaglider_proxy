@@ -56,7 +56,7 @@ export default function StorageCard({ onSessionExpired }: { onSessionExpired?: (
             display: 'flex',
             flexDirection: 'column',
             gap: SPACE.xxs,
-            marginTop: SPACE.xxs,
+            marginTop: SPACE.xs,
             fontSize: TYPE.base,
             color: TEXT_PRIMARY,
             lineHeight: 1.5,
