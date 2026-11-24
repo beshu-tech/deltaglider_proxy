@@ -137,12 +137,29 @@ A `503 SlowDown` comes either from the upstream S3 backend, when it throttles th
 
 The proxy answers `503 ServiceUnavailable` (not `SlowDown`) when the cause is a condition that you must clear first, or a fault inside the proxy:
 
-- **Uploads are paused because the disk is full** ("Uploads are paused because the server's disk is full. Retry later.", with the response header `x-deltaglider-reason: uploads-paused`). The proxy refuses new writes while the disk of the spool directory or of a filesystem backend is nearly full. The text names no path: the proxy warning `[disk] level …` (or `[disk] the spool budget …` where the spool disk size is unknown) names the directory and the free space. Free space on that disk.
+- **Uploads are paused because the disk is full** ("Uploads are paused because the server's disk is full. Retry later.", with the response header `x-deltaglider-reason: uploads-paused`). The proxy refuses new writes while the disk of the spool directory or of a filesystem backend is nearly full. The text names no path: the proxy warning `[disk] level …` (or `[disk] the spool budget …` where the spool disk size is unknown) names the directory and the free space. Free space on that disk, as the next entry describes.
 - **The disk is full** ("The storage backend is out of space"). Free space on the disk of the filesystem backend or of the spool directory. The log line "disk full answered 503" names the cause.
 - **The storage quota of the backend is used up** ("storage cap or quota is used up"). This is the `507`, `QuotaExceeded` or `cap_exceeded` answer of a backend such as Backblaze B2. Raise the cap or free space on the backend.
 - **The delta codec timed out.** Check the load of the host and `DGP_CODEC_*_SECS`.
 
 A `503 ServiceUnavailable` that names a backend is a different case: see [How to diagnose a backend that isn't serving](diagnose-backend-connectivity.md).
+
+## Uploads are paused because the disk is full
+
+The proxy measures the free space of its disks every 30 seconds ([Disk watermarks](../reference/capacity-planning.md#disk-watermarks)). When the disk of the spool directory or the disk of a filesystem backend is nearly full, the proxy refuses new uploads, so that a full disk does not break the uploads that are already running. The refused request gets `503 ServiceUnavailable` with the text "Uploads are paused because the server's disk is full. Retry later." and the header `x-deltaglider-reason: uploads-paused`. The file browser shows "Uploads are paused. The server's disk is full. Try again later." Reads and deletes still work, so you can free space while the pause lasts.
+
+To find the full disk and free space on it:
+
+1. Sign in to the admin UI as an administrator. While a disk is filling up or uploads are paused, every admin page shows a banner with a **Fix it** link. Click **Fix it**, or open **System → System** (`/_/admin/system`).
+2. Read the **Storage** card at the top of the page. Its title says what is wrong, and its text names each full disk and the free space on it:
+   - **The disk is filling up**: the spool disk is at level low, or a filesystem backend disk is at level high. Nothing is refused yet. Uploads pause when the disk is full.
+   - **Large uploads are paused**: the spool disk is at level high or critical, or running requests reserved nearly all of the spool budget. A single upload that is not larger than `DGP_SPOOL_THRESHOLD_BYTES` (16 MiB by default) still passes, because the proxy keeps its body in memory. A new multipart upload of any size is refused, because every part goes to a spool file.
+   - **Uploads are paused**: the disk of a filesystem backend is at level critical. The proxy refuses every write that stores bytes into the buckets of that backend.
+3. Free space on the disk that the card names. Delete objects that you do not need, move the spool directory (`DGP_SPOOL_DIR`) to a larger disk, or make the disk larger. The card has no button that frees space.
+
+Uploads resume by themselves. A level falls one step at each measure after the free space is 2 percentage points above the threshold of the level (`DGP_DISK_RECOVER_POINTS`), so the pause can last up to a minute after you free the space. A pause by the use of the spool budget ends as soon as the running requests release their reservations.
+
+The same status is available to scripts at `GET /_/api/admin/storage/status` ([Admin API](../reference/admin-api.md)). A session of a user who is not an administrator gets only the largest file size and `uploads_paused`.
 
 ## A request returns 503 ServiceUnavailable that names no backend
 

@@ -74,6 +74,7 @@ You manage everything from a web UI on the same port as the S3 API, without extr
 - One Jobs screen: replication, lifecycle, re-encryption, and migrations in one table with per-job runs, failures, progress, pause/resume, and cancel
 - Bucket re-encryption: enable or rotate at-rest encryption, and a durable job rewrites the existing objects. Each rewrite is conditional on the object that the job read, so the job never overwrites a client write, and clients keep writing while it runs. Only a decrypt job on a backend without conditional writes pauses writes (503 SlowDown) on the instance that runs it
 - Event outbox and notifications: durable object mutation events with background webhook delivery, fan-out endpoints, retry backoff, and failed-row requeue, all editable in the GUI. Built-in Slack formatting posts object events to a channel through an Incoming Webhook URL or a bot token, with per-bucket/prefix → channel routing
+- Storage status: the System page says whether the disks can take uploads and what the largest file is, and every admin page shows a banner when a disk is filling up or uploads are paused
 - Monitoring dashboard: live Prometheus metrics for request rates, latencies, cache hit rates, status codes, and auth events
 - Storage analytics: per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
 - Embedded documentation: full-text searchable reference docs with architecture diagrams

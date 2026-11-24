@@ -152,7 +152,7 @@ advanced:
 
 ### `log_level`
 
-Tracing filter string (`tracing-subscriber` syntax). `RUST_LOG` overrides it when set. You can change it at runtime in the admin GUI (the **Logging** card of **System → System**), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Logging card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
+Tracing filter string (`tracing-subscriber` syntax). `RUST_LOG` overrides it when set. You can change it at runtime in the admin GUI (the **Log level** card of **System → System**), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Log level card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
 
 Resolution order: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in the file > the `--verbose` CLI flag (`deltaglider_proxy=trace,tower_http=trace`) > default. A file `log_level` equal to the default counts as not set, so `--verbose` wins over it.
 
@@ -296,6 +296,7 @@ A request over `max_object_size` is refused with HTTP 400 `EntityTooLarge`, as o
 |---|---|
 | **Env var** | `DGP_MAX_OBJECT_SIZE` |
 | **YAML** | `advanced.max_object_size` (a number of bytes, or `auto`) |
+| **Admin UI** | **Change the limit** in the **Storage** card of **System → System**: **Automatic** or **Set a limit** (GiB) |
 | **Default** | `auto` |
 | **Hot-reload** | Yes |
 
@@ -1290,7 +1291,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS` | 120 | How long, in seconds, a request that needs spool space (a large PUT or POST, a copy, a delta GET) waits for spool budget before it fails with `503 SlowDown` |
 | `DGP_DISK_MONITOR_INTERVAL_SECS` | 30 | How often, in seconds, the proxy measures the free space of the spool directory, of the root of every filesystem backend and of the data directory. At least 1. See [Disk watermarks](capacity-planning.md#disk-watermarks) |
 | `DGP_DISK_LOW_PERCENT` | 15 | Disk level low starts when the free space of a disk is below this percent of the disk, or below twice the largest spool reservation of one upload, whichever is more, and never above `DGP_DISK_LOW_MAX_BYTES`. The range is 1 to 50 |
-| `DGP_DISK_HIGH_PERCENT` | 10 | Disk level high starts when the free space is below this percent of the disk, or below the largest spool reservation of one upload, whichever is more, and never above `DGP_DISK_HIGH_MAX_BYTES`. At this level the proxy refuses new spool reservations with `503 SlowDown`. The range is 1 to 50 |
+| `DGP_DISK_HIGH_PERCENT` | 10 | Disk level high starts when the free space is below this percent of the disk, or below the largest spool reservation of one upload, whichever is more, and never above `DGP_DISK_HIGH_MAX_BYTES`. At this level the proxy refuses new spool reservations with `503 ServiceUnavailable` and the header `x-deltaglider-reason: uploads-paused`. The range is 1 to 50 |
 | `DGP_DISK_CRITICAL_PERCENT` | 5 | Disk level critical starts when the free space is below this percent of the disk, or below 1 GiB (at most twice this percent of the disk, so that a disk smaller than 10 GiB is not always at this level), whichever is more, and never above `DGP_DISK_CRITICAL_MAX_BYTES`. At this level the proxy also refuses the writes that store bytes into the buckets of a filesystem backend on that disk (deletes and reads still work). The range is 1 to 50 |
 | `DGP_DISK_RECOVER_POINTS` | 2 | A disk level ends when the free space is this many percentage points of the disk above the entry threshold of the level, and the level then falls by one step at each measure. The range is 1 to 50 |
 | `DGP_DISK_LOW_MAX_BYTES` | 53687091200 (50 GiB) | The most free space, in bytes, at which disk level low starts, whatever `DGP_DISK_LOW_PERCENT` says. 5% of a 10 TiB volume is 512 GiB, which is no reason to warn. `0` turns level low off |

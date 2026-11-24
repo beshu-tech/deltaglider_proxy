@@ -123,6 +123,7 @@ The admin GUI is served at `/_/` on the same port as the S3 API:
 - S3 object browser: browse, upload, download, and delete objects, preview a file on double-click, and bulk copy, move, or ZIP
 - Proxy dashboard: live Prometheus metrics, with 9 headline KPIs first (savings, requests, memory, error rate, cache health), more telemetry in a collapsible "Detailed telemetry" section, and per-bucket savings analytics
 - Configuration: hot-reload settings split across Access, Storage, Integrations, and System sections: multi-backend routing, per-bucket policies, compression tuning, admission control, lifecycle, replication, and webhook/Slack notification delivery
+- Storage status: the System page says whether the disks can take uploads and what the largest file is, and every admin page shows a banner when a disk is filling up or uploads are paused
 - IAM user management: create, edit, and delete users with ABAC permissions, and manage OAuth/OIDC providers and group-mapping rules
 - Audit log: an in-memory ring of recent access events (size via `DGP_AUDIT_RING_SIZE`, default 500)
 - Demo data generator: populate test data for evaluation
