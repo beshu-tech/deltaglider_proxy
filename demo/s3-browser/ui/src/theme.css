@@ -1543,6 +1543,14 @@ code, kbd, pre, samp, .ant-typography code,
 }
 
 /* ───── FormField: YAML-path code chip reveals on hover ───── */
+/* A field is one chunk: the big gap sits under it. In a card of a stacked page
+   the card's padding ends it, so its last field adds none. */
+.dg-field {
+  margin-bottom: 32px;
+}
+.dg-card-stack .dg-field:last-child {
+  margin-bottom: 0;
+}
 .dg-field .dg-yaml-path {
   opacity: 0;
   transition: opacity 120ms ease;

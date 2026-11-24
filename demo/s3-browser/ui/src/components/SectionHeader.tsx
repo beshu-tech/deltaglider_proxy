@@ -15,14 +15,22 @@ export default function SectionHeader({
   icon,
   title,
   description,
+  tone = 'ACCENT_BLUE',
+  children,
 }: {
   icon: React.ReactNode;
   title: React.ReactNode;
   description?: string;
+  /** The accent of the icon chip: a status card names its state with it. */
+  tone?: 'ACCENT_BLUE' | 'ACCENT_GREEN' | 'ACCENT_AMBER' | 'ACCENT_RED';
+  /** Body that shares the title's left edge. With it the header IS the card body: no bottom margin. */
+  children?: React.ReactNode;
 }) {
-  const { ACCENT_BLUE, TEXT_PRIMARY, TEXT_MUTED } = useColors();
+  const colors = useColors();
+  const { TEXT_PRIMARY, TEXT_MUTED } = colors;
+  const ACCENT_BLUE = colors[tone];
   return (
-    <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', marginBottom: 16 }}>
+    <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start', marginBottom: children ? 0 : 16 }}>
       <div
         style={{
           width: 32,
@@ -67,6 +75,7 @@ export default function SectionHeader({
             {description}
           </div>
         )}
+        {children}
       </div>
     </div>
   );

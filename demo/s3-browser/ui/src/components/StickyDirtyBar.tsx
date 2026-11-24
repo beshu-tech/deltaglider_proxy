@@ -86,8 +86,10 @@ export default function StickyDirtyBar({
         // Above the Drawer, below every Modal (see Z_DIRTY_BAR in theme.ts).
         // Inline mode has no positioning, so the high z is harmless there.
         zIndex: Z_DIRTY_BAR,
-        display: 'flex',
-        justifyContent: 'center',
+        // A hidden inline bar is out of the layout: as a zero-height row it
+        // still took one gap of its flex column (a double gap above each card).
+        display: inline && !visible ? 'none' : 'flex',
+        justifyContent: inline ? 'flex-start' : 'center',
         pointerEvents: 'none',
         // Subtle enter/leave: translate + fade, no reflow of siblings.
         opacity: visible ? 1 : 0,

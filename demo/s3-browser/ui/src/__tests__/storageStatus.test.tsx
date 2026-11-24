@@ -2,12 +2,11 @@
  * The Storage card, the admin banner, the plain upload refusals and the
  * pre-check limit: the copy of each state is a contract (issue #204).
  */
-import { screen, waitFor } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import StorageCard from '../components/StorageCard';
 import StorageBanner from '../components/StorageBanner';
-import { ObjectSizeLimitCard } from '../components/advancedPanels';
 import { useUploadLimits } from '../queries/uploadLimits';
 import { queryClient } from '../queries/client';
 import { qk } from '../queries/keys';
@@ -26,12 +25,12 @@ afterEach(() => {
 
 const disk = { path: '/var/lib/dgp', free_bytes: 41 * GB, total_bytes: 500 * GB };
 const cases: [string, object, string[]][] = [
-  ['healthy', { state: 'healthy', largest_file: 37 * GB }, ['Storage is healthy', 'You can upload files up to 37 GB.', 'Change the limit']],
-  ['checking', { state: 'checking', largest_file: 37 * GB }, ['Checking the disk', 'You can upload files up to 37 GB.']],
+  ['healthy', { state: 'healthy', largest_file: 37 * GB }, ['Storage is healthy', 'You can upload files up to 37 GiB.', 'Change the limit']],
+  ['checking', { state: 'checking', largest_file: 37 * GB }, ['Checking the disk', 'You can upload files up to 37 GiB.']],
   [
     'filling_up',
     { state: 'filling_up', largest_file: 37 * GB, disk, measured_secs_ago: 3 },
-    ['The disk is filling up', 'Uploads will pause when /var/lib/dgp is full. It has 41 GB left.', 'Free up space on that disk.'],
+    ['The disk is filling up', 'Uploads will pause when /var/lib/dgp is full. It has 41 GiB left.', 'Free up space on that disk.'],
   ],
   [
     'large_paused',
@@ -80,22 +79,20 @@ describe('the Storage card', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  test('"Change the limit" puts the cursor in the limit editor', async () => {
+  test('"Change the limit" opens the one-field editor inside the card, and Close hides it', async () => {
     const SECTION = '/_/api/admin/config/section/advanced';
     mockFetch()
       .on('GET', STATUS, json(cases[0][1]))
-      .on('GET', SECTION, json({ max_object_size: 100 * 1024 * 1024 }))
+      .on('GET', SECTION, json({}))
       .on('GET', '/_/api/admin/config', json({}));
     const user = userEvent.setup();
-    renderWithQuery(
-      <>
-        <StorageCard />
-        <ObjectSizeLimitCard />
-      </>,
-    );
-    const input = await screen.findByRole('textbox', { name: 'Maximum object size (MiB)' });
+    renderWithQuery(<StorageCard />);
+    expect(screen.queryByRole('radiogroup', { name: 'Largest file' })).not.toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: 'Change the limit' }));
-    expect(input).toHaveFocus();
+    const card = screen.getByTestId('storage-card');
+    expect(await within(card).findByRole('radiogroup', { name: 'Largest file' })).toBeInTheDocument();
+    await user.click(within(card).getByRole('button', { name: 'Close' }));
+    expect(screen.queryByRole('radiogroup', { name: 'Largest file' })).not.toBeInTheDocument();
   });
 });
 
@@ -110,7 +107,7 @@ describe('the admin banner', () => {
     const onFix = vi.fn();
     renderWithQuery(<StorageBanner enabled onFix={onFix} />);
     expect(await screen.findByText(text)).toBeInTheDocument();
-    await userEvent.setup().click(screen.getByRole('button', { name: 'Fix it →' }));
+    await userEvent.setup().click(screen.getByRole('button', { name: /^Fix it →/ }));
     expect(onFix).toHaveBeenCalled();
   });
 
@@ -164,7 +161,7 @@ describe('plain upload refusals', () => {
   test('EntityTooLarge names the limit the status poll read', () => {
     queryClient.setQueryData(qk.storageStatus(), { largest_file: 37 * GB, uploads_paused: false });
     const sdk = Object.assign(new Error('too big'), { name: 'EntityTooLarge', $metadata: { httpStatusCode: 413 } });
-    expect(plainError(sdk, 'x').text).toBe('This file is too large. The limit is 37 GB.');
+    expect(plainError(sdk, 'x').text).toBe('This file is too large. The limit is 37 GiB.');
   });
 });
 

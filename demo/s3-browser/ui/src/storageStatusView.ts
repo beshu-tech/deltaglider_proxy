@@ -6,13 +6,12 @@
 import { formatBytes } from './utils';
 import type { AdminStorageStatus } from './adminApi';
 
-/** A size in plain words: "37 GB", "1.5 GB" (whole numbers from 10 up). */
+/** A size in plain words: "37 GiB", "1.5 GiB" (whole numbers from 10 up). */
 export function sizeWords(bytes: number): string {
   const m = /^([\d.]+) (\w+)$/.exec(formatBytes(bytes));
   if (!m) return formatBytes(bytes);
   const n = Number(m[1]);
-  const value = n >= 10 ? String(Math.round(n)) : String(n);
-  return `${value} ${m[2].replace('iB', 'B')}`;
+  return `${n >= 10 ? Math.round(n) : n} ${m[2]}`;
 }
 
 export type StorageTone = 'ACCENT_GREEN' | 'ACCENT_BLUE' | 'ACCENT_AMBER' | 'ACCENT_RED';
@@ -26,6 +25,8 @@ export interface StorageCardCopy {
   hint?: string;
   /** The "Change the limit" link (healthy only). */
   changeLimit: boolean;
+  /** Disk paths that the lines name, so the card can set them in the code face. */
+  paths: string[];
 }
 
 const RESUME = 'Uploads resume by themselves when space is free.';
@@ -34,9 +35,9 @@ export function storageCardCopy(s: AdminStorageStatus): StorageCardCopy {
   const limit = `You can upload files up to ${sizeWords(s.largest_file)}.`;
   switch (s.state) {
     case 'healthy':
-      return { title: 'Storage is healthy', tone: 'ACCENT_GREEN', lines: [limit], changeLimit: true };
+      return { title: 'Storage is healthy', tone: 'ACCENT_GREEN', lines: [limit], changeLimit: true, paths: [] };
     case 'checking':
-      return { title: 'Checking the disk', tone: 'ACCENT_BLUE', lines: [limit], changeLimit: false };
+      return { title: 'Checking the disk', tone: 'ACCENT_BLUE', lines: [limit], changeLimit: false, paths: [] };
     case 'filling_up':
       return {
         title: 'The disk is filling up',
@@ -44,6 +45,7 @@ export function storageCardCopy(s: AdminStorageStatus): StorageCardCopy {
         lines: [`Uploads will pause when ${s.disk.path} is full. It has ${sizeWords(s.disk.free_bytes)} left.`],
         hint: 'Free up space on that disk.',
         changeLimit: false,
+        paths: [s.disk.path],
       };
     case 'large_paused':
       return {
@@ -54,10 +56,11 @@ export function storageCardCopy(s: AdminStorageStatus): StorageCardCopy {
         ],
         hint: RESUME,
         changeLimit: false,
+        paths: s.disk ? [s.disk.path] : [],
       };
     case 'backend_paused': {
       const lines = s.backends.map((b) => `The disk ${b.path} is full. Uploads to its buckets are paused. Downloads still work.`);
-      return { title: 'Uploads are paused', tone: 'ACCENT_RED', lines, hint: RESUME, changeLimit: false };
+      return { title: 'Uploads are paused', tone: 'ACCENT_RED', lines, hint: RESUME, changeLimit: false, paths: s.backends.map((b) => b.path) };
     }
   }
 }

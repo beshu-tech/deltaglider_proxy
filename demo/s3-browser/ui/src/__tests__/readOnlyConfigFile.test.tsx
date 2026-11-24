@@ -9,7 +9,7 @@ import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, test, vi } from 'vitest';
 import AdminPage from '../components/AdminPage';
-import { ObjectSizeLimitCard } from '../components/advancedPanels';
+import { StorageLimitEditor } from '../components/advancedPanels';
 import { json, mockFetch } from '../test/fetchMock';
 import { renderWithQuery } from '../test/render';
 
@@ -18,7 +18,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 test('a PUT that applied but did not persist says the change is lost at restart', async () => {
   const http = mockFetch();
-  http.on('GET', SECTION, json({ max_object_size: 100 * 1024 * 1024 }));
+  http.on('GET', SECTION, json({ max_object_size: 2 * 1024 * 1024 * 1024 }));
   http.on('GET', '/_/api/admin/config', json({ env_overrides: [], config_file_writable: false }));
   http.on('POST', `${SECTION}/validate`, json({ ok: true, diff: { advanced: { max_object_size: { before: 104857600, after: 262144000 } } } }));
   http.on('PUT', SECTION, json({
@@ -27,9 +27,9 @@ test('a PUT that applied but did not persist says the change is lost at restart'
     warnings: ['Applied section advanced in memory but FAILED to persist'],
   }, 500));
   const user = userEvent.setup();
-  renderWithQuery(<ObjectSizeLimitCard />);
-  const input = await screen.findByRole('textbox', { name: 'Maximum object size (MiB)' });
-  await waitFor(() => expect(input).toHaveValue('100'));
+  renderWithQuery(<StorageLimitEditor />);
+  const input = await screen.findByRole('textbox', { name: 'Limit in GiB' });
+  await waitFor(() => expect(input).toHaveValue('2'));
   await user.clear(input);
   await user.type(input, '250');
   await user.click(screen.getByRole('button', { name: /Review & apply/ }));

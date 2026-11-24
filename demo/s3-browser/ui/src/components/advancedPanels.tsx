@@ -22,7 +22,7 @@
  * through the `requires_restart` flag on the section PUT response —
  * ApplyDialog renders it as a blue banner.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Input, Radio, Switch } from 'antd';
 import {
   CloudServerOutlined,
@@ -33,7 +33,7 @@ import {
 } from '@ant-design/icons';
 import { useAdminConfig, useEnvOverride } from '../queries/config';
 import { useColors } from '../ThemeContext';
-import { SPACE, useCardStyles } from './shared-styles';
+import { SPACE, TYPE, useCardStyles } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
 import type { UseSectionEditorResult } from '../useSectionEditor';
 import { undefinedToNullSubset } from './advancedPayload';
@@ -44,7 +44,9 @@ import ApplyDialog from './ApplyDialog';
 import StickyDirtyBar from './StickyDirtyBar';
 import { ErrorState, LoadingState } from './StatePlaceholders';
 import { CUSTOM_LOG_LEVEL, LOG_LEVEL_PRESETS, logLevelRadio } from './admin/logLevelPresets';
-import { tint } from '../themeVars';
+import { cssVar, tint } from '../themeVars';
+import { sizeWords } from '../storageStatusView';
+import { limitSizeError } from '../limitSize';
 import { derivedLimitRows } from '../derivedLimits';
 
 
@@ -457,74 +459,100 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
 }
 
 // ───────────────────────────────────────────────────────────
-// ObjectSizeLimitCard  (advanced.max_object_size — on the System page)
+// StorageLimitEditor  (advanced.max_object_size — inside the Storage card)
 // ───────────────────────────────────────────────────────────
 
-const MIB = 1024 * 1024;
-
-/** The element id of the editor: the Storage card's "Change the limit" scrolls to it. */
-export const SIZE_LIMIT_ANCHOR = 'storage-size-limit';
-
-/** The largest object any bucket accepts. Global; it sits under the Storage card on the System page. */
-export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
-  const { cardStyle, inputRadius } = useCardStyles();
+const GIB = 1024 * 1024 * 1024;
+/**
+ * The largest file, as ONE choice: Automatic, or a number of GiB. It has no
+ * card of its own: the Storage card shows it under "Change the limit".
+ * `onApplied` runs after a change is live, so the card can read the new limit.
+ */
+export function StorageLimitEditor({ onSessionExpired, onApplied }: PanelProps & { onApplied?: () => void }) {
+  const { inputRadius } = useCardStyles();
+  const { TEXT_PRIMARY, TEXT_MUTED } = useColors();
   const subset = useAdvancedSubset(SIZE_LIMIT_INITIAL, onSessionExpired, 'system/limits');
   const { value, setValue } = subset;
   const form = useFieldValidation();
   const { data: config } = useAdminConfig({ onSessionExpired });
+  // An environment variable that sets the limit wins: the choice is read-only.
+  const env = useEnvOverride('advanced.max_object_size');
+  // The radio the operator picked. A cleared field is still "Set a limit":
+  // the stored value alone (auto) would flip the radio under the cursor.
+  const [picked, setPicked] = useState<'auto' | 'set' | null>(null);
+  // A change is live when an apply ends with nothing left to apply.
+  const wasApplying = useRef(false);
+  useEffect(() => {
+    if (wasApplying.current && !subset.applying && !subset.isDirty) onApplied?.();
+    wasApplying.current = subset.applying;
+  }, [subset.applying, subset.isDirty, onApplied]);
+  // After an apply or a discard the stored value decides again.
+  const wasDirty = useRef(false);
+  useEffect(() => {
+    if (wasDirty.current && !subset.isDirty) setPicked(null);
+    wasDirty.current = subset.isDirty;
+  }, [subset.isDirty]);
   const gate = loadGate(subset);
   if (gate) return gate;
-  // A number is the operator's value. An empty field, or the word `auto`,
-  // is auto: the effective value comes from `GET /config` `limits`.
-  const mb =
-    typeof value.max_object_size === 'number'
-      ? Math.round(value.max_object_size / MIB)
-      : undefined;
+  // A number is the operator's value; anything else (absent, or the word `auto`) is auto.
+  const explicit = typeof value.max_object_size === 'number';
+  const gb = explicit ? Math.round(((value.max_object_size as number) / GIB) * 100) / 100 : undefined;
+  const mode = picked ?? (explicit ? 'set' : 'auto');
   const effective = config?.limits?.max_object_size;
-  const autoPlaceholder = effective
-    ? `auto (${Math.round(effective.bytes / MIB)} MiB)`
-    : 'auto';
-  // Up to 5 TiB, the largest S3 object.
+  const autoSize = effective?.source === 'auto' ? `${sizeWords(effective.bytes)}, ` : '';
   const sizeField = form.number(
     'max_object_size',
-    mb,
-    (n) => setValue({ ...value, max_object_size: n !== undefined ? n * MIB : undefined }),
-    v.optional(v.integer({ min: 1, max: 5 * 1024 * 1024 })),
+    gb,
+    (n) => setValue({ ...value, max_object_size: n !== undefined ? Math.round(n * GIB) : undefined }),
+    limitSizeError,
   );
+  const pick = (next: 'auto' | 'set') => {
+    setPicked(next);
+    if (next === 'auto') {
+      form.reset();
+      setValue({ ...value, max_object_size: undefined });
+    }
+  };
   return (
-    <div id={SIZE_LIMIT_ANCHOR} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: SPACE.sm }}>
+      <Radio.Group
+        aria-label="Largest file"
+        disabled={Boolean(env)}
+        value={mode}
+        onChange={(e) => pick(e.target.value)}
+        style={{ display: 'flex', flexDirection: 'column', gap: SPACE.xs }}
+      >
+        <Radio value="auto">
+          <span style={{ color: TEXT_PRIMARY }}>Automatic</span>
+          <span style={{ color: TEXT_MUTED }}>{` (${autoSize}from the size of your disk)`}</span>
+        </Radio>
+        <Radio value="set">
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: SPACE.xs, color: TEXT_PRIMARY }}>
+            Set a limit
+            <Input
+              aria-label="Limit in GiB"
+              {...sizeField.inputProps}
+              inputMode="decimal"
+              onFocus={() => setPicked('set')}
+              disabled={mode !== 'set' || Boolean(env)}
+              status={sizeField.error ? 'error' : undefined}
+              style={{ width: 120, ...inputRadius }}
+              suffix="GiB"
+            />
+          </span>
+        </Radio>
+      </Radio.Group>
+      {sizeField.error && (
+        <div role="alert" style={{ color: cssVar('ACCENT_RED'), fontSize: TYPE.sm }}>
+          {sizeField.error}
+        </div>
+      )}
+      {env && (
+        <div style={{ color: TEXT_MUTED, fontSize: TYPE.sm }}>
+          Set by the environment variable <code>{env.env}</code>. Change it there.
+        </div>
+      )}
       <AdvancedApplyRail editor={subset} form={form} />
-      <div style={cardStyle}>
-        <SectionHeader
-          icon={<ControlOutlined />}
-          title="Object size limit"
-          description="The largest object that any bucket accepts. The proxy refuses a bigger upload, and the upload page refuses it before the upload starts."
-        />
-        <FormField
-          label="Maximum object size (MiB)"
-          yamlPath="advanced.max_object_size"
-          helpText={
-            effective
-              ? `Applies to every bucket. Leave the field empty for auto. Now ${Math.round(effective.bytes / MIB)} MiB (${
-                  // The detail of an auto value already starts with "auto:".
-                  effective.source === 'auto' ? effective.detail : `${effective.source}: ${effective.detail}`
-                }). The YAML value is in bytes, or the word auto.`
-              : 'Applies to every bucket. Leave the field empty for auto. The YAML value is in bytes, or the word auto.'
-          }
-          defaultPlaceholder="auto"
-          examples={[100, 1024, 5120]}
-          onExampleClick={(x) => setValue({ ...value, max_object_size: Number(x) * MIB })}
-          error={sizeField.error}
-        >
-          <Input
-            aria-label="Maximum object size (MiB)"
-            {...sizeField.inputProps}
-            placeholder={autoPlaceholder}
-            style={{ width: 180, ...inputRadius }}
-            suffix="MiB"
-          />
-        </FormField>
-      </div>
     </div>
   );
 }

@@ -16,7 +16,6 @@ import {
   LimitsPanel,
   ListenerTlsPanel,
   LoggingPanel,
-  ObjectSizeLimitCard,
 } from './advancedPanels';
 import { useQuery } from '@tanstack/react-query';
 import RecoveryPanel from './RecoveryPanel';
@@ -69,9 +68,8 @@ export default function SystemPanel({ onSessionExpired, onExportBackup, onImport
   // ONE column and ONE gap for every card on the page (the cards add no
   // margin or padding of their own).
   return (
-    <div style={column}>
-      <StorageCard />
-      <ObjectSizeLimitCard onSessionExpired={onSessionExpired} />
+    <div className="dg-card-stack" style={column}>
+      <StorageCard onSessionExpired={onSessionExpired} />
       <ListenerTlsPanel onSessionExpired={onSessionExpired} />
       <CachesPanel onSessionExpired={onSessionExpired} />
       <LimitsPanel onSessionExpired={onSessionExpired} />

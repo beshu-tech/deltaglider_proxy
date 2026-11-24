@@ -215,7 +215,7 @@ export default function FormField({
   const containerStyle: CSSProperties = {
     position: 'relative',
     paddingLeft: overrideActive ? 12 : 0,
-    marginBottom: 32,
+    // The gap under a field is `.dg-field` in theme.css (none under the last field of a stacked card).
     transition: 'padding-left 120ms ease',
     ...style,
   };

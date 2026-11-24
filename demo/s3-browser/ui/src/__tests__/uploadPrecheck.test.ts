@@ -1,5 +1,5 @@
-// Browser-review item 14: a 143 MB file over the 100 MB max_object_size
-// uploaded 96 MB before the server refused it. The page checks size and
+// Browser-review item 14: a 143 MiB file over the 100 MiB max_object_size
+// uploaded 96 MiB before the server refused it. The page checks size and
 // remaining quota BEFORE any byte goes out.
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
@@ -19,7 +19,7 @@ test('a file over max_object_size is refused with the limit named', () => {
   assert.deepEqual(r.accepted.map((x) => x.name), ['ok.bin']);
   assert.equal(r.refused.length, 1);
   assert.equal(r.refused[0].file.name, 'big.bin');
-  assert.equal(r.refused[0].reason, 'This file is too large. The limit is 100 MB.');
+  assert.equal(r.refused[0].reason, 'This file is too large. The limit is 100 MiB.');
 });
 
 test('the quota counts the used bytes and the files before it in the batch', () => {

@@ -17,7 +17,8 @@ export default function StorageBanner({ enabled, onFix }: { enabled: boolean; on
   if (!copy) return null;
   return (
     <div
-      role="status"
+      // A pause is urgent; a filling disk is not.
+      role={copy.tone === 'ACCENT_RED' ? 'alert' : 'status'}
       aria-label="Storage"
       style={{
         display: 'flex',
@@ -35,7 +36,7 @@ export default function StorageBanner({ enabled, onFix }: { enabled: boolean; on
         {copy.text}
       </span>
       <Button type="link" size="small" onClick={onFix} style={{ padding: 0, fontWeight: 600 }}>
-        Fix it →
+        Fix it →<span className="sr-only">: open Storage on the System page</span>
       </Button>
     </div>
   );
