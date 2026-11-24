@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.3.2 — 2026-11-24
+
 ### Added
 
 - **A Storage card, an admin banner and plain upload refusals (issue #204).** The **System** page now starts with a **Storage** card. When the disks are fine, it says "Storage is healthy" and the largest file that you can upload. When a disk is filling up, or uploads are paused, it says what is wrong and what to do, with one line for each full backend disk. Every admin page shows a banner with a **Fix it** link to the card while a disk is filling up or uploads are paused, and shows nothing otherwise. The file browser now says "Uploads are paused. The server's disk is full. Try again later." when the proxy refuses an upload or a copy with the reason `uploads-paused`, and "This file is too large. The limit is …" for a file above the limit. The upload page now reads the largest file from the storage status for every signed-in user, so a user who is not an admin gets the size check before the upload starts too.
