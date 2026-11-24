@@ -475,6 +475,15 @@ fn refused_read_error() -> std::io::Error {
     )
 }
 
+/// Why [`SpoolDir::would_refuse`] refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WouldRefuse {
+    /// The monitor's disk level of the spool directory.
+    Level,
+    /// The reserved bytes (live) leave too little of the budget.
+    Use { budget: u64, used: u64 },
+}
+
 /// A byte-budget-gated pool of temp spool bytes.
 #[derive(Clone)]
 pub struct SpoolDir {
@@ -764,6 +773,20 @@ impl SpoolDir {
                 return refusal;
             }
         }
+    }
+
+    /// What a new write would meet now, with NO side effect: the same level
+    /// check as [`Self::write_refusal`], and the same use check computed on
+    /// `used` (cached files count as used: no evictable-bytes figure exists).
+    /// A real write evicts cached files first, so on a node whose cache holds
+    /// the budget this can say `Use` where a write would pass.
+    pub fn would_refuse(&self) -> Option<WouldRefuse> {
+        if self.gate.refusal().is_some() {
+            return Some(WouldRefuse::Level);
+        }
+        let th = self.gate.by_use()?;
+        let (budget, used) = (self.max_bytes(), self.used_bytes());
+        crate::disk_watch::use_refusal(&th, budget, used).map(|_| WouldRefuse::Use { budget, used })
     }
 
     /// Drop one cached file of any evictor; `false` when none is left.
@@ -1875,6 +1898,53 @@ mod tests {
         let _held = spool.try_acquire(40 * MIB).unwrap();
         assert!(spool.write_refusal().is_some());
         assert!(cache.0.lock().is_empty());
+    }
+
+    /// The status poll asks `would_refuse`: it agrees with a real write and
+    /// evicts nothing.
+    #[test]
+    fn would_refuse_agrees_with_write_refusal_and_evicts_nothing() {
+        const MIB: u64 = 1024 * 1024;
+        struct Cache(parking_lot::Mutex<Vec<Spool>>);
+        impl SpoolEvictor for Cache {
+            fn evict_one(&self) -> bool {
+                self.0.lock().pop().is_some()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let spool = SpoolDir::new(dir.path().join("s"), 64 * MIB).unwrap();
+        let mut th = crate::disk_watch::Thresholds::new(
+            &crate::config::tuning::RuntimeTuning::default().disk_monitor,
+            MIB,
+        );
+        th.low_floor = 0;
+        th.high_floor = 32 * MIB;
+        th.critical_floor = 0;
+        spool.gate().set_by_use(Some(th));
+        let files = (0..4)
+            .map(|_| spool.try_acquire(10 * MIB).unwrap())
+            .collect();
+        let cache = Arc::new(Cache(parking_lot::Mutex::new(files)));
+        spool.register_evictor(Arc::downgrade(&cache) as std::sync::Weak<dyn SpoolEvictor>);
+        // By use, judged on `used` (cached files count): refused, nothing dropped.
+        assert_eq!(
+            spool.would_refuse(),
+            Some(WouldRefuse::Use {
+                budget: 64 * MIB,
+                used: 40 * MIB
+            })
+        );
+        assert_eq!(cache.0.lock().len(), 4, "a status read evicts nothing");
+        // By level: refused, nothing dropped, however often it is asked.
+        spool.gate().set(crate::disk_watch::Level::High);
+        for _ in 0..3 {
+            assert_eq!(spool.would_refuse(), Some(WouldRefuse::Level));
+        }
+        assert_eq!(cache.0.lock().len(), 4, "a status read evicts nothing");
+        spool.gate().set(crate::disk_watch::Level::Ok);
+        cache.0.lock().clear();
+        assert_eq!(spool.would_refuse(), None);
+        assert_eq!(spool.write_refusal(), None);
     }
 
     /// A refusal by the disk level drops the cached files once, when the

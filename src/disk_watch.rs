@@ -648,6 +648,8 @@ struct State {
     /// fails keeps it: a failed measure changes nothing (not the level, not
     /// the refusal, not the series).
     last: HashMap<String, RoleReport>,
+    /// When `last` was written.
+    last_at: Option<Instant>,
     gauge_labels: HashSet<String>,
     /// Whether the spool was judged by its use at the last tick that knew:
     /// a measure that fails or times out changes nothing.
@@ -916,6 +918,11 @@ impl DiskWatch {
         reports
     }
 
+    /// Seconds since the last tick wrote the reports; `None` before the first.
+    pub fn last_reports_age_secs(&self) -> Option<u64> {
+        self.state.lock().last_at.map(|t| t.elapsed().as_secs())
+    }
+
     /// Is any filesystem backend at level critical?
     pub fn any_backend_critical(&self) -> bool {
         !self.refusals.read().critical.is_empty()
@@ -1096,6 +1103,7 @@ impl DiskWatch {
             }
             state.gauge_labels = configured.clone();
         }
+        state.last_at = Some(Instant::now());
         state.last = effective
             .into_iter()
             .filter(|r| configured.contains(&r.label))

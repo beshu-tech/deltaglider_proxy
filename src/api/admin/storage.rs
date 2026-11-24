@@ -17,16 +17,19 @@ use axum::Json;
 use super::AdminState;
 use crate::capacity::{capacity_status, CapacityInputs, CapacityStatus};
 
-/// Read the inputs of the decision from the running process.
+/// Read the inputs of the decision from the running process. The spool is
+/// read with `would_refuse`: a poll never evicts cached files.
 fn status_now(state: &AdminState) -> CapacityStatus {
     let engine = state.s3_state.engine.load();
-    let reports = crate::disk_watch::installed()
-        .map(|w| w.last_reports())
-        .unwrap_or_default();
+    let watch = crate::disk_watch::installed();
+    let reports = watch.as_ref().map(|w| w.last_reports()).unwrap_or_default();
+    let spool_dir = engine.spool_dir().dir().display().to_string();
     capacity_status(CapacityInputs {
         reports: &reports,
-        spool_refused: engine.spool_dir().write_refusal().is_some(),
-        spool_threshold: engine.spool_threshold(),
+        monitor_installed: watch.is_some(),
+        reports_age_secs: watch.as_ref().and_then(|w| w.last_reports_age_secs()),
+        spool_refusal: engine.spool_dir().would_refuse(),
+        spool_dir: &spool_dir,
         largest_file: engine.max_object_size(),
     })
 }
