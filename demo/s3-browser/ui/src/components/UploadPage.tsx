@@ -482,7 +482,8 @@ export default function UploadPage({
                       </div>
                       {refusedRow && (
                         <div style={{ ...ui(12, ACCENT_RED), paddingBottom: SPACE.xxs }}>
-                          Cannot be uploaded: {r.reason}.
+                          {/* A reason that is a full sentence stands alone. */}
+                          {r.reason?.endsWith('.') ? r.reason : `Cannot be uploaded: ${r.reason}.`}
                         </div>
                       )}
                       {replaced && !refusedRow && (

@@ -56,7 +56,6 @@ const cases: [string, object, string[]][] = [
       'Uploads are paused',
       'The disk /mnt/a is full. Uploads to its buckets are paused. Downloads still work.',
       'The disk /mnt/b is full. Uploads to its buckets are paused. Downloads still work.',
-      'Large uploads to other buckets are paused too.',
       'Uploads resume by themselves when space is free.',
     ],
   ],

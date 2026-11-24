@@ -57,7 +57,6 @@ export function storageCardCopy(s: AdminStorageStatus): StorageCardCopy {
       };
     case 'backend_paused': {
       const lines = s.backends.map((b) => `The disk ${b.path} is full. Uploads to its buckets are paused. Downloads still work.`);
-      if (s.large_uploads_paused) lines.push('Large uploads to other buckets are paused too.');
       return { title: 'Uploads are paused', tone: 'ACCENT_RED', lines, hint: RESUME, changeLimit: false };
     }
   }
