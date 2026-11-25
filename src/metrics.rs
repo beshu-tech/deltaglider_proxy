@@ -167,6 +167,57 @@ macro_rules! register {
     }};
 }
 
+/// The prometheus process collector (RSS, CPU, fds, threads) without its
+/// `process_start_time_seconds`: our own gauge has that name on every OS.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ProcessStats {
+    inner: Arc<prometheus::process_collector::ProcessCollector>,
+    descs: Vec<prometheus::core::Desc>,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for ProcessStats {
+    fn default() -> Self {
+        use prometheus::core::Collector;
+        let inner = prometheus::process_collector::ProcessCollector::for_self();
+        let descs = inner
+            .desc()
+            .into_iter()
+            .filter(|d| d.fq_name != PROCESS_START_TIME)
+            .cloned()
+            .collect();
+        Self {
+            inner: Arc::new(inner),
+            descs,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl prometheus::core::Collector for ProcessStats {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        self.descs.iter().collect()
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        let mut families = self.inner.collect();
+        families.retain(|f| f.name() != PROCESS_START_TIME);
+        families
+    }
+}
+
+const PROCESS_START_TIME: &str = "process_start_time_seconds";
+
+/// A late registration (the runtime sampler) must not crash a running proxy,
+/// but a refused one is logged: a silent refusal hid the process metrics.
+#[cfg(tokio_unstable)]
+fn register_or_warn(registry: &Registry, c: Box<dyn prometheus::core::Collector>, name: &str) {
+    if let Err(e) = registry.register(c) {
+        tracing::warn!("[metrics] {name} is not exported: {e}");
+    }
+}
+
 impl Metrics {
     pub fn new() -> Self {
         let registry = Registry::new();
@@ -174,7 +225,7 @@ impl Metrics {
         // -- Process & Build --
         let process_start_time_seconds = register!(
             registry,
-            Gauge::new("process_start_time_seconds", "Start time of the process").unwrap()
+            Gauge::new(PROCESS_START_TIME, "Start time of the process").unwrap()
         );
         let build_info = register!(
             registry,
@@ -194,10 +245,7 @@ impl Metrics {
         );
 
         #[cfg(target_os = "linux")]
-        {
-            let pc = prometheus::process_collector::ProcessCollector::for_self();
-            let _ = registry.register(Box::new(pc));
-        }
+        register!(registry, ProcessStats::default());
 
         // -- HTTP Requests --
         let http_requests_total = register!(
@@ -1028,9 +1076,7 @@ pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
 
     let g = |name: &str, help: &str| -> Gauge {
         let gauge = Gauge::new(name, help).unwrap();
-        // Best-effort: a duplicate name would mean a programmer error in a
-        // single-sampler world; ignore rather than crash the proxy.
-        let _ = registry.register(Box::new(gauge.clone()));
+        register_or_warn(registry, Box::new(gauge.clone()), name);
         gauge
     };
 
@@ -1058,7 +1104,11 @@ pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
             "Polls the scheduler force-yielded after exhausting their budget.",
         )
         .unwrap();
-        let _ = registry.register(Box::new(c.clone()));
+        register_or_warn(
+            registry,
+            Box::new(c.clone()),
+            "deltaglider_tokio_budget_forced_yields_total",
+        );
         c
     };
 
@@ -1171,7 +1221,7 @@ impl RangeCounters {
         for r in &ranges {
             vec.with_label_values(&[r.as_str()]);
         }
-        let _ = registry.register(Box::new(vec.clone()));
+        register_or_warn(registry, Box::new(vec.clone()), name);
         let prev = vec![0; ranges.len()];
         Self { vec, ranges, prev }
     }
@@ -1197,6 +1247,31 @@ pub fn spawn_tokio_runtime_metrics_sampler(_metrics: &Arc<Metrics>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source guard: no registration drops its error in silence.
+    #[test]
+    fn no_registration_error_is_ignored() {
+        let ignored = concat!("let _ = registry", ".register(");
+        assert!(!include_str!("metrics.rs").contains(ignored));
+    }
+
+    /// The process collector once clashed with our start-time gauge and was
+    /// dropped in silence, so the scrape had no current RSS.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_scrape_has_the_process_metrics_and_one_start_time() {
+        let families = Metrics::new().registry.gather();
+        let count = |name: &str| families.iter().filter(|f| f.name() == name).count();
+        for name in [
+            "process_resident_memory_bytes",
+            "process_cpu_seconds_total",
+            "process_open_fds",
+            "process_threads",
+        ] {
+            assert_eq!(count(name), 1, "{name} is missing from the scrape");
+        }
+        assert_eq!(count(PROCESS_START_TIME), 1);
+    }
 
     #[test]
     fn build_info_version_label_is_empty_unless_opted_in() {

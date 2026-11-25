@@ -24,7 +24,8 @@ curl -s http://localhost:9000/_/metrics | promtool check metrics
 | `process_start_time_seconds` | Gauge | — | Unix timestamp when the process started |
 | `deltaglider_build_info` | Gauge | `version`, `backend_type` | Always 1. `version` is empty unless `DGP_METRICS_EXPOSE_VERSION=true`, because this endpoint is unauthenticated; the authenticated admin API (`GET /_/api/whoami` with a session) always reports the running version |
 | `process_peak_rss_bytes` | Gauge | — | Peak resident set size (updated on scrape) |
-| `process_*` (Linux only) | various | — | Standard process collector: RSS, CPU seconds, open FDs, virtual memory |
+| `process_resident_memory_bytes` (Linux only) | Gauge | — | The current resident set size of the process. A container's memory chart also counts the page cache of the files that the proxy reads, so this value is the memory of the proxy alone |
+| `process_cpu_seconds_total`, `process_open_fds`, `process_max_fds`, `process_virtual_memory_bytes`, `process_threads` (Linux only) | Counter, Gauge | — | The other values of the standard process collector |
 
 The endpoint is public by default so that any Prometheus can scrape it. Set `DGP_METRICS_BEARER_TOKEN` to require `Authorization: Bearer <token>` (or an admin session, which the dashboard uses); anonymous clients then receive `401` and cannot read the metric set, which changes from release to release. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md).
 

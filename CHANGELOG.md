@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`/_/metrics` exports the process metrics (Linux).** The standard process collector exports a `process_start_time_seconds`, and the proxy has its own metric with that name. The registry refused the whole collector, and the proxy ignored the refusal, so `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_open_fds` and `process_threads` were never exported. The proxy now registers the collector without that one metric. `process_resident_memory_bytes` is the current memory of the proxy alone, while a container memory chart also counts the page cache of the files that the proxy reads.
+
 ## v2.3.2 — 2026-11-24
 
 ### Added
